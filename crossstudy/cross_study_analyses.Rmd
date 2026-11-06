@@ -1,0 +1,1585 @@
+---
+title: "Cross-Study Analyses: Study 1 and Study 2"
+subtitle: "Study x Condition contrasts, responsibility ratings, and individual differences (exploratory)"
+author: "DGK Lab — UCLA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+params:
+  out_dir: "<PROJECT_ROOT>/Analysis/CrossStudy/outputs"
+  tone_file: "<PROJECT_ROOT>/Analysis/CrossStudy/measurement/bot_turn_tone_probes.csv"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE
+)
+# NOTE: options(scipen = ...) is deliberately NOT set. write.csv() honours scipen,
+# and the output CSVs must keep R's default number formatting (e.g. 1.22e-19).
+```
+
+# Overview
+
+This notebook runs every analysis that combines Study 1 (Agreeableness: warm **HighA** vs cold **LowA** persona) and Study 2 (Neuroticism: anxious **HighN** vs calm **LowN** persona). It replaces three standalone scripts, and its computations are copied from them line for line:
+
+| Section | Former script | Output files |
+|---|---|---|
+| 2. Study x Condition interactions | `cross_study_contrast.R` (Part 1) | `cross_study_interactions.csv` |
+| 3. Who is held responsible (liability composites) | `cross_study_contrast.R` (Part 2) | `liability_levels.csv`, `liability_levels_by_condition.csv` |
+| 4. Parallel responsibility items | `responsibility_items.R` | `responsibility_items_tests.csv`, `responsibility_items_by_condition.csv` |
+| 5. Individual differences | `individual_differences.R` | `indiv_diff_grid.csv`, `indiv_diff_pooled.csv`, `indiv_diff_replicated.csv`, `indiv_diff_descriptives.csv` |
+| 6. Exploratory: the two-calculation account | new (post hoc; ports the October 2026 modeling pilot) | `twocalc_*.csv` |
+
+**Everything here is exploratory.** Neither study was designed or preregistered for these comparisons. The two samples were collected at different times; participants were randomized to condition within each study, not to study. Measures, response scales, chat procedure, base persona (Sylva), and liability vignette are the same in both studies.
+
+Inputs are read only from `Study {1,2}/data/processed/` and `Study {1,2}/data/derived/`, plus (section 6 only) one turn-level measurement file, `CrossStudy/measurement/bot_turn_tone_probes.csv` (`params$tone_file`), written by `CrossStudy/measurement/tone_probes.py`. That script only scores each of Sylva's replies; every number reported here is computed in this notebook. Outputs go to `params$out_dir` (default: `CrossStudy/outputs/`). CSVs are written with base `write.csv()` (not `readr::write_csv()`), because that is what the original scripts used: it keeps the quoting and 15-significant-digit number formatting of the verified reference files, so the outputs are byte-identical to them.
+
+```{r precompute, ref.label = knitr::all_labels(compute == TRUE), include = FALSE}
+```
+
+# Plain-language summary
+
+The numbers below are computed by this notebook (the analysis chunks are run once, silently, before this text so that the summary can sit at the top; they run again, visibly, in their own sections and give the same results).
+
+```{r plain-summary, echo = FALSE, results = "asis"}
+# --- Study x Condition ---------------------------------------------------------
+sig_int  <- part1 %>% filter(q_bh < .05)
+liab_int <- part1 %>% filter(outcome %in% c("liab_corp", "liab_chat", "liab_user", "liab_harm"))
+cat("**1. Did the two persona manipulations have different effects?** ",
+    "For each of the 10 outcomes we compared the high-minus-low persona difference in Study 1 ",
+    "(warm minus cold) with the high-minus-low difference in Study 2 (anxious minus calm). ",
+    if (nrow(sig_int) == 0) "No outcome differed reliably between the studies after FDR correction. " else
+      sprintf("%s differed reliably between the studies after FDR correction: %s. ",
+              ifelse(nrow(sig_int) == 1, "One outcome", paste(num_word(nrow(sig_int)), "outcomes")),
+              paste(sprintf("%s (warm vs cold %s, anxious vs calm %s; gap %s points, q = %s, BF10 = %.1f)",
+                            tolower(OUT_LABEL[sig_int$outcome]), sgn2(sig_int$diff_s1), sgn2(sig_int$diff_s2),
+                            f2(sig_int$b_int), fmt_p(sig_int$q_bh, lead = FALSE), sig_int$bf10_int),
+                    collapse = "; ")),
+    sprintf("%s of the four liability outcomes differed between the studies at p < .05 (HC3 p = %s to %s; BF10 = %.2f to %.2f%s).\n\n",
+            ifelse(sum(liab_int$p_hc3 < .05) == 0, "None", num_word(sum(liab_int$p_hc3 < .05))),
+            fmt_p(min(liab_int$p_hc3), lead = FALSE), fmt_p(max(liab_int$p_hc3), lead = FALSE),
+            min(liab_int$bf10_int), max(liab_int$bf10_int),
+            ifelse(max(liab_int$bf10_int) < 1, ", all below 1, i.e. leaning toward no difference", "")),
+    sep = "")
+
+# --- Who is held responsible (composites) ---------------------------------------
+pl <- liab_levels %>% filter(set == "Pooled")
+ord_pooled <- order_parties(pl[1, ])
+all_sig_sets <- liab_levels %>% group_by(set) %>% summarise(all_sig = all(p_holm < .05), .groups = "drop")
+ns_cond <- liab_by_cond %>% filter(p_holm >= .05)
+cat("**2. Who is held responsible for the harm?** ",
+    sprintf("Pooled across both studies (N = %d), participants rated %s (on 1-5). ",
+            pl$n[1], ord_pooled),
+    if (all(all_sig_sets$all_sig)) "Every pairwise gap is significant in Study 1, Study 2, and pooled (Holm-corrected). " else
+      sprintf("Not every gap is significant: %s. ", paste(all_sig_sets$set[!all_sig_sets$all_sig], collapse = ", ")),
+    if (nrow(ns_cond) == 0) "The same pattern holds in all four persona conditions.\n\n" else
+      sprintf("Within the four persona conditions, every gap is significant except %s.\n\n",
+              paste(sprintf("%s in the %s condition (gap %s, Holm p = %s)",
+                            CMP_LABEL[ns_cond$comparison], ns_cond$condition,
+                            f2(ns_cond$mean_diff), fmt_p(ns_cond$p_holm, lead = FALSE)),
+                    collapse = "; ")),
+    sep = "")
+
+# --- Parallel responsibility items ---------------------------------------------
+cat("**3. The three identically worded responsibility items** (company, Sylva, user). ",
+    paste(vapply(1:2, function(s) {
+      tt <- tests[tests$study == s, ]
+      ns <- tt$comparison[tt$p_holm >= .05]
+      sprintf("In Study %d (n = %d), mean responsibility was user %s, company %s, Sylva %s; %s",
+              s, tt$n[1],
+              f2(tt$mean_1[tt$comparison == "user - company"]),
+              f2(tt$mean_1[tt$comparison == "company - sylva"]),
+              f2(tt$mean_2[tt$comparison == "user - sylva"]),
+              if (length(ns) == 0) "all three pairwise gaps are significant (Holm)." else
+                sprintf("all gaps are significant (Holm) except %s.", paste(ns, collapse = ", ")))
+    }, character(1)), collapse = " "),
+    sprintf(" Sylva itself has the lowest mean in %s.\n\n",
+            if (all(cells$sylva < pmin(cells$company, cells$user))) "every condition of both studies"
+            else "some but not all conditions"),
+    sep = "")
+
+# --- Individual differences ----------------------------------------------------
+core_r <- filter(repl, tier == "core")
+rep_core <- filter(core_r, replicated)
+cat("**4. Which participant characteristics predict the outcomes?** ",
+    sprintf("Each of %d core predictors was related to each of %d outcomes within each study, controlling for persona condition (%d tests per study; about %.0f would reach p < .05 by chance). ",
+            sum(PRED$tier == "core"), length(OUTCOMES_ID), nrow(core_r), .05 * nrow(core_r)),
+    sprintf("Study 1 had %d and Study 2 had %d associations at p < .05 (%d and %d survive BH-FDR). ",
+            sum(core_r$p_s1 < .05), sum(core_r$p_s2 < .05), sum(core_r$bh_s1), sum(core_r$bh_s2)),
+    sprintf("%d core associations replicated (same direction, p < .05 in both studies). ", nrow(rep_core)),
+    sprintf("By predictor: %s. ",
+            paste(sprintf("%s (%d)", names(table(rep_core$label)), as.integer(table(rep_core$label))),
+                  collapse = ", ")),
+    sprintf("Participants' own TIPI personality traits replicated %d associations.\n\n",
+            sum(grepl("^tipi_", rep_core$predictor))),
+    sep = "")
+```
+
+**5. The two-calculation account (section 6, exploratory and post hoc).** Section 6 asks whether one account covers the results above: closeness follows a single overall impression of how Sylva treats the user, while responsibility follows a separate, fixed template that bonding does not enter. It has its own plain-language summary at its top.
+
+# 1. Setup
+
+## 1.1 Packages and reproducibility
+
+```{r packages, compute = TRUE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(sandwich)
+  library(lmtest)
+  library(effectsize)
+  library(BayesFactor)
+  library(arrow)
+  library(knitr)
+})
+
+# Reproducibility
+set.seed(42)
+options(mc.cores = 1)
+```
+
+## 1.2 Paths (absolute; defined once)
+
+```{r paths, compute = TRUE}
+ROOT <- "<PROJECT_ROOT>/Analysis"
+
+FILES <- list(
+  `1` = list(comp = file.path(ROOT, "Study 1", "data", "processed", "composite_scores.csv"),
+             anal = file.path(ROOT, "Study 1", "data", "processed", "analytic_data.csv"),
+             chat = file.path(ROOT, "Study 1", "data", "derived", "chat_coding", "chat_participant_features.parquet"),
+             high = "HighA", low = "LowA"),
+  `2` = list(comp = file.path(ROOT, "Study 2", "data", "processed", "composite_scores.csv"),
+             anal = file.path(ROOT, "Study 2", "data", "processed", "analytic_data.csv"),
+             chat = file.path(ROOT, "Study 2", "data", "derived", "chat_coding", "chat_participant_features.parquet"),
+             high = "HighN", low = "LowN")
+)
+S1_FILE <- FILES$`1`$comp
+S2_FILE <- FILES$`2`$comp
+
+OUT_DIR <- params$out_dir
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+cat("Writing outputs to:", OUT_DIR, "\n")
+```
+
+## 1.3 Display helpers
+
+These only format numbers for the tables and text. They are never applied to the values written to CSV.
+
+```{r helpers, compute = TRUE}
+f2  <- function(x) sprintf("%.2f", x)
+sgn2 <- function(x) ifelse(x >= 0, sprintf("+%.2f", x), sprintf("%.2f", x))
+# APA-style p: "< .001" or ".005"; lead = TRUE adds "p = " / "p < "
+fmt_p <- function(p, lead = TRUE) {
+  out <- ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+  if (lead) ifelse(p < .001, paste("p", out), paste("p =", out)) else out
+}
+num_word <- function(n) c("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+                          "Eight", "Nine", "Ten")[n + 1]
+
+OUT_LABEL <- c(psr_total = "Parasocial relationship", ec_total = "Emotional connection",
+               trust_total = "Trust", et_total = "Experience-taking",
+               ma_total = "Moral agency", mp_total = "Moral patiency",
+               liab_corp = "Liability: company", liab_chat = "Liability: chatbot",
+               liab_user = "Liability: user", liab_harm = "Harm severity",
+               pct_emotional_self_disclosure = "Emotional self-disclosure (chat)",
+               pct_bonding_language = "Bonding language (chat)")
+CMP_LABEL <- c(`liab_user - liab_corp` = "user vs company",
+               `liab_user - liab_chat` = "user vs chatbot",
+               `liab_corp - liab_chat` = "company vs chatbot")
+
+# "the user most responsible (M = 3.74), then the company (3.23), then the chatbot (2.88)"
+order_parties <- function(row) {
+  m <- c(user = row$mean_user, company = row$mean_corp, chatbot = row$mean_chat)
+  m <- sort(m, decreasing = TRUE)
+  sprintf("the %s most responsible (M = %s), then the %s (%s), then the %s (%s)",
+          names(m)[1], f2(m[1]), names(m)[2], f2(m[2]), names(m)[3], f2(m[3]))
+}
+```
+
+# 2. Study x Condition interactions
+
+## 2.1 What this asks
+
+Study 1 varied the chatbot's warmth; Study 2 varied its anxiety. Each study reports its own high-vs-low effect. Here we ask whether **the high-vs-low difference in Study 1 is larger or smaller than the high-vs-low difference in Study 2**. For example, did warmth (Study 1) and anxiety (Study 2) move parasocial bonding by different amounts, and is that gap between the two studies itself reliable?
+
+This is not a randomized test of "warm vs anxious". No participant could have been assigned to either study, so the interaction shows that the two manipulations had different effects, not which feature of the personas caused the difference.
+
+## 2.2 Model
+
+For each of 10 outcomes (all on 1-5 scales), both studies are stacked (N = `r nrow(s1)` + `r nrow(s2)` = `r nrow(dat)`) and fit with OLS:
+
+$$y = b_0 + b_1\,\text{cond} + b_2\,\text{study} + b_3\,(\text{cond}\times\text{study}) + e$$
+
+| variable | +0.5 | -0.5 |
+|---|---|---|
+| `cond`  | high-trait persona (warm in Study 1, anxious in Study 2) | low-trait persona |
+| `study` | Study 1 | Study 2 |
+
+With this coding, $b_3$ = (High - Low in Study 1) - (High - Low in Study 2), in scale points.
+
+- Inference on $b_3$: HC3 robust SEs, t on the residual df; BH-FDR across the 10 interactions; the classical-SE p is kept for reference.
+- Hedges' g per study (`effectsize::hedges_g(high, low)`, as in the per-study pipelines) and a z test of g(Study 1) - g(Study 2), SE = sqrt(V1 + V2), with V = J^2 [(n1+n2)/(n1 n2) + d^2 / (2(n1+n2))] (Borenstein et al., 2009).
+- Bayes factor for the interaction: `lmBF(y ~ cond + study + cond:study)` / `lmBF(y ~ cond + study)`, with cond and study entered as two-level factors (default fixed-effect prior), seed 42. The Monte Carlo error proportion is reported.
+
+## 2.3 Load and stack
+
+```{r cs-load, compute = TRUE}
+OUTCOMES_CS <- c("psr_total", "ec_total", "trust_total", "et_total", "ma_total",
+                 "mp_total", "liab_corp", "liab_chat", "liab_user", "liab_harm")
+LIAB3 <- c("liab_user", "liab_corp", "liab_chat")
+
+# sona_id is read as character so leading zeros are kept (not used analytically).
+read_study <- function(path, study_label, high, low) {
+  d <- read.csv(path, colClasses = c(sona_id = "character"))
+  miss <- setdiff(c("condition_label", OUTCOMES_CS), names(d))
+  if (length(miss)) stop("Missing columns in ", path, ": ", paste(miss, collapse = ", "))
+  stopifnot(all(d$condition_label %in% c(high, low)))
+  d %>%
+    transmute(study_label = study_label,
+              condition_label,
+              high_trait = condition_label == high,
+              across(all_of(OUTCOMES_CS)))
+}
+
+s1 <- read_study(S1_FILE, "Study 1", high = "HighA", low = "LowA")
+s2 <- read_study(S2_FILE, "Study 2", high = "HighN", low = "LowN")
+
+cat(sprintf("Study 1: N = %d (HighA = %d, LowA = %d)\n",
+            nrow(s1), sum(s1$high_trait), sum(!s1$high_trait)))
+cat(sprintf("Study 2: N = %d (HighN = %d, LowN = %d)\n",
+            nrow(s2), sum(s2$high_trait), sum(!s2$high_trait)))
+cat("Missing values on outcomes:",
+    sum(is.na(s1[OUTCOMES_CS])) + sum(is.na(s2[OUTCOMES_CS])), "\n")
+
+# Effect coding:
+#   cond  = +0.5 high-trait persona (warm in Study 1, anxious in Study 2), -0.5 low
+#   study = +0.5 Study 1, -0.5 Study 2
+dat <- bind_rows(s1, s2) %>%
+  mutate(cond  = ifelse(high_trait, 0.5, -0.5),
+         study = ifelse(study_label == "Study 1", 0.5, -0.5),
+         # factor versions for the Bayes factor (ANOVA-style default priors)
+         cond_f  = factor(ifelse(high_trait, "high", "low"), levels = c("low", "high")),
+         study_f = factor(study_label))
+```
+
+## 2.4 Helpers: Hedges' g with its sampling variance
+
+```{r cs-helpers, compute = TRUE}
+# Hedges' J (exact gamma form) for df = n1 + n2 - 2
+hedges_J <- function(df) exp(lgamma(df / 2) - log(sqrt(df / 2)) - lgamma((df - 1) / 2))
+
+# Hedges' g per study plus its sampling variance.
+# g comes from effectsize::hedges_g(high, low) exactly as in the pipeline.
+# Variance (Borenstein et al., 2009): V_d = (n1+n2)/(n1*n2) + d^2 / (2(n1+n2)),
+# V_g = J^2 * V_d, with d = g / J.
+g_with_var <- function(high, low) {
+  es  <- effectsize::hedges_g(high, low, paired = FALSE, ci = 0.95, verbose = FALSE)
+  n1  <- length(high); n2 <- length(low)
+  J   <- hedges_J(n1 + n2 - 2)
+  g   <- es$Hedges_g
+  d   <- g / J
+  v_g <- J^2 * ((n1 + n2) / (n1 * n2) + d^2 / (2 * (n1 + n2)))
+  list(g = g, lo = es$CI_low, hi = es$CI_high, var = v_g)
+}
+```
+
+## 2.5 Fit the 10 interaction models
+
+The seed is reset immediately before this loop so that the Bayes factors (which use Monte Carlo integration) are reproducible no matter what ran earlier.
+
+```{r cs-part1, compute = TRUE}
+set.seed(42)
+part1 <- lapply(OUTCOMES_CS, function(y) {
+  f   <- reformulate(c("cond * study"), response = y)
+  fit <- lm(f, data = dat)
+  dfr <- df.residual(fit)
+
+  # HC3 robust inference on the interaction
+  V_hc3 <- sandwich::vcovHC(fit, type = "HC3")
+  b     <- unname(coef(fit)["cond:study"])
+  se    <- sqrt(V_hc3["cond:study", "cond:study"])
+  tval  <- b / se
+  p_hc3 <- 2 * pt(abs(tval), dfr, lower.tail = FALSE)
+  crit  <- qt(0.975, dfr)
+
+  # Classical (homoscedastic) p for reference
+  p_cls <- summary(fit)$coefficients["cond:study", "Pr(>|t|)"]
+
+  # Cell means and the two simple differences (raw scale points)
+  m <- function(st, hi) mean(dat[[y]][dat$study_label == st & dat$high_trait == hi])
+  diff1 <- m("Study 1", TRUE) - m("Study 1", FALSE)
+  diff2 <- m("Study 2", TRUE) - m("Study 2", FALSE)
+
+  # Hedges' g per study and z test of the difference
+  g1 <- with(s1, g_with_var(get(y)[high_trait], get(y)[!high_trait]))
+  g2 <- with(s2, g_with_var(get(y)[high_trait], get(y)[!high_trait]))
+  gd    <- g1$g - g2$g
+  se_gd <- sqrt(g1$var + g2$var)
+  z     <- gd / se_gd
+  p_z   <- 2 * pnorm(abs(z), lower.tail = FALSE)
+
+  # Bayes factor: full 2x2 model vs additive model, default priors
+  bdat <- data.frame(y = dat[[y]], cond_f = dat$cond_f, study_f = dat$study_f)
+  bf_full <- BayesFactor::lmBF(y ~ cond_f + study_f + cond_f:study_f, data = bdat,
+                               progress = FALSE)
+  bf_add  <- BayesFactor::lmBF(y ~ cond_f + study_f, data = bdat, progress = FALSE)
+  bf_int  <- bf_full / bf_add
+  bf10    <- exp(bf_int@bayesFactor$bf)
+  bf_err  <- bf_int@bayesFactor$error
+
+  data.frame(
+    outcome = y,
+    n_s1_high = sum(s1$high_trait), n_s1_low = sum(!s1$high_trait),
+    n_s2_high = sum(s2$high_trait), n_s2_low = sum(!s2$high_trait),
+    mean_s1_high = m("Study 1", TRUE), mean_s1_low = m("Study 1", FALSE),
+    mean_s2_high = m("Study 2", TRUE), mean_s2_low = m("Study 2", FALSE),
+    diff_s1 = diff1, diff_s2 = diff2,
+    b_int = b, se_hc3 = se, ci_lo = b - crit * se, ci_hi = b + crit * se,
+    t = tval, df = dfr, p_hc3 = p_hc3, p_classical = p_cls,
+    g_s1 = g1$g, g_s1_lo = g1$lo, g_s1_hi = g1$hi,
+    g_s2 = g2$g, g_s2_lo = g2$lo, g_s2_hi = g2$hi,
+    g_diff = gd, g_diff_se = se_gd,
+    g_diff_lo = gd - qnorm(0.975) * se_gd, g_diff_hi = gd + qnorm(0.975) * se_gd,
+    z = z, p_z = p_z,
+    bf10_int = bf10, bf_error_prop = bf_err,
+    stringsAsFactors = FALSE
+  )
+})
+part1 <- bind_rows(part1) %>%
+  mutate(q_bh   = p.adjust(p_hc3, method = "BH"),
+         q_bh_z = p.adjust(p_z,   method = "BH")) %>%
+  relocate(q_bh, .after = p_hc3)
+```
+
+## 2.6 Results
+
+```{r cs-part1-table}
+part1 %>%
+  transmute(Outcome = OUT_LABEL[outcome],
+            `S1 diff (warm - cold)` = f2(diff_s1), `S2 diff (anxious - calm)` = f2(diff_s2),
+            `b [95% CI]` = sprintf("%s [%s, %s]", f2(b_int), f2(ci_lo), f2(ci_hi)),
+            t = f2(t), p = fmt_p(p_hc3, FALSE), q = fmt_p(q_bh, FALSE),
+            `p (classical)` = fmt_p(p_classical, FALSE),
+            BF10 = f2(bf10_int),
+            g1 = f2(g_s1), g2 = f2(g_s2),
+            `Δg [95% CI]` = sprintf("%s [%s, %s]", f2(g_diff), f2(g_diff_lo), f2(g_diff_hi)),
+            `p (z)` = fmt_p(p_z, FALSE)) %>%
+  kable(caption = sprintf("Study x Condition interaction by outcome. Diff = high-trait minus low-trait persona (scale points). b = Study 1 diff - Study 2 diff. HC3 SEs, df = %d. q = BH-FDR across %d outcomes.",
+                          part1$df[1], nrow(part1)),
+        align = "lrrrrrrrrrrrr")
+```
+
+```{r cs-part1-text, echo = FALSE, results = "asis"}
+sig_p <- part1 %>% filter(p_hc3 < .05)
+sig_q <- part1 %>% filter(q_bh < .05)
+ns_rows <- part1 %>% filter(p_hc3 >= .05)
+cat(sprintf("**Interpretation.** %d of %d interactions are significant at p < .05 (HC3), and %d survive BH-FDR correction. ",
+            nrow(sig_p), nrow(part1), nrow(sig_q)))
+if (nrow(sig_q) > 0) {
+  cat(paste(sprintf("For %s, the Study 1 persona difference was %s points and the Study 2 difference was %s, a gap of b = %s, 95%% CI [%s, %s], t(%d) = %s, %s, q = %s, BF10 = %s (Hedges' g %s in Study 1 vs %s in Study 2).",
+                    tolower(OUT_LABEL[sig_q$outcome]), sgn2(sig_q$diff_s1), sgn2(sig_q$diff_s2),
+                    f2(sig_q$b_int), f2(sig_q$ci_lo), f2(sig_q$ci_hi), sig_q$df, f2(sig_q$t),
+                    fmt_p(sig_q$p_hc3), fmt_p(sig_q$q_bh, FALSE), f2(sig_q$bf10_int),
+                    f2(sig_q$g_s1), f2(sig_q$g_s2)),
+            collapse = " "), " ")
+}
+if (nrow(ns_rows) > 0)
+  cat(sprintf("The %d outcomes with p >= .05 (%s) show no reliable difference between studies (p = %s to %s; BF10 = %s to %s). ",
+              nrow(ns_rows), paste(tolower(OUT_LABEL[ns_rows$outcome]), collapse = ", "),
+              fmt_p(min(ns_rows$p_hc3), FALSE), fmt_p(max(ns_rows$p_hc3), FALSE),
+              f2(min(ns_rows$bf10_int)), f2(max(ns_rows$bf10_int))))
+sig_z <- part1$outcome[part1$p_z < .05]
+cat(sprintf("The standardized comparison (z test of g1 - g2) gives %d outcome(s) at p < .05 (%s)%s. ",
+            length(sig_z), if (length(sig_z)) paste(OUT_LABEL[sig_z], collapse = ", ") else "none",
+            if (setequal(sig_z, sig_p$outcome)) ", the same set as the HC3 interaction test" else
+              ", a different set from the HC3 interaction test"))
+cat(sprintf("The largest absolute gap between classical and HC3 p values is %.3f. ",
+            max(abs(part1$p_classical - part1$p_hc3))))
+cat(sprintf("Bayes-factor Monte Carlo error is at most %.1f%%.\n",
+            100 * max(part1$bf_error_prop)))
+```
+
+## 2.7 Write
+
+```{r cs-part1-write}
+write.csv(part1, file.path(OUT_DIR, "cross_study_interactions.csv"), row.names = FALSE)
+```
+
+# 3. Who is held responsible? Liability composites (within person)
+
+## 3.1 What this asks
+
+Every participant rated the user (`liab_user`), the company (`liab_corp`), and the chatbot (`liab_chat`), all on 1-5. So we can ask, within person, whom participants hold most responsible for the harm in the vignette, and whether that order is the same across studies and persona conditions.
+
+## 3.2 Model
+
+For each set (Study 1, Study 2, pooled, and each of the four study x condition cells) and each pair (user vs company, user vs chatbot, company vs chatbot): mean paired difference with 95% CI, paired t test, $d_z$ = mean difference / SD of the differences, and Holm correction across the three pairs within the set.
+
+## 3.3 Code
+
+```{r cs-part2, compute = TRUE}
+PAIRS <- list(c("liab_user", "liab_corp"),
+              c("liab_user", "liab_chat"),
+              c("liab_corp", "liab_chat"))
+
+paired_block <- function(d, set_label, cond_label = "all") {
+  means <- sapply(LIAB3, function(v) mean(d[[v]]))
+  sds   <- sapply(LIAB3, function(v) sd(d[[v]]))
+  out <- lapply(PAIRS, function(pr) {
+    a <- d[[pr[1]]]; b <- d[[pr[2]]]
+    dd <- a - b
+    tt <- t.test(a, b, paired = TRUE)
+    data.frame(
+      set = set_label, condition = cond_label, n = nrow(d),
+      mean_user = means["liab_user"], sd_user = sds["liab_user"],
+      mean_corp = means["liab_corp"], sd_corp = sds["liab_corp"],
+      mean_chat = means["liab_chat"], sd_chat = sds["liab_chat"],
+      comparison = paste(pr[1], "-", pr[2]),
+      mean_diff = mean(dd), sd_diff = sd(dd),
+      ci_lo = tt$conf.int[1], ci_hi = tt$conf.int[2],
+      t = unname(tt$statistic), df = unname(tt$parameter), p = tt$p.value,
+      dz = mean(dd) / sd(dd),
+      stringsAsFactors = FALSE, row.names = NULL
+    )
+  })
+  bind_rows(out) %>% mutate(p_holm = p.adjust(p, method = "holm"))
+}
+
+liab_levels <- bind_rows(
+  paired_block(s1,  "Study 1"),
+  paired_block(s2,  "Study 2"),
+  paired_block(dat, "Pooled")
+)
+
+liab_by_cond <- bind_rows(lapply(list(s1, s2), function(d) {
+  bind_rows(lapply(sort(unique(d$condition_label)), function(cl) {
+    paired_block(d[d$condition_label == cl, ], unique(d$study_label), cl)
+  }))
+}))
+```
+
+## 3.4 Results
+
+```{r cs-part2-tables}
+fmt_liab <- function(x) x %>%
+  transmute(Set = set, Condition = condition, n,
+            `M user` = f2(mean_user), `M company` = f2(mean_corp), `M chatbot` = f2(mean_chat),
+            Comparison = CMP_LABEL[comparison],
+            Diff = f2(mean_diff),
+            `95% CI` = sprintf("[%s, %s]", f2(ci_lo), f2(ci_hi)),
+            t = f2(t), df, dz = f2(dz),
+            `p (Holm)` = fmt_p(p_holm, FALSE))
+
+kable(fmt_liab(liab_levels), caption = "Responsibility ratings by study and pooled (paired t, Holm across 3 pairs).")
+kable(fmt_liab(liab_by_cond), caption = "Responsibility ratings by study x condition cell.")
+```
+
+```{r cs-part2-text, echo = FALSE, results = "asis"}
+cat("**Interpretation.** ")
+for (st in c("Study 1", "Study 2", "Pooled")) {
+  x <- liab_levels %>% filter(set == st)
+  cat(sprintf("%s (n = %d): participants held %s; %s. ",
+              st, x$n[1], order_parties(x[1, ]),
+              if (all(x$p_holm < .05)) sprintf("all three gaps are significant (Holm p %s, dz = %s to %s)",
+                                               ifelse(max(x$p_holm) < .001, "< .001", paste("≤", fmt_p(max(x$p_holm), FALSE))),
+                                               f2(min(x$dz)), f2(max(x$dz)))
+              else sprintf("not significant: %s", paste(CMP_LABEL[x$comparison[x$p_holm >= .05]], collapse = ", "))))
+}
+ns_c <- liab_by_cond %>% filter(p_holm >= .05)
+cat(if (nrow(ns_c) == 0) "In every one of the four persona conditions, all three gaps are significant.\n" else
+  sprintf("Across the four persona conditions, every gap is significant except %s.\n",
+          paste(sprintf("%s under %s (n = %d): diff = %s, 95%% CI [%s, %s], t(%d) = %s, dz = %s, Holm p = %s",
+                        CMP_LABEL[ns_c$comparison], ns_c$condition, ns_c$n, f2(ns_c$mean_diff),
+                        f2(ns_c$ci_lo), f2(ns_c$ci_hi), ns_c$df, f2(ns_c$t), f2(ns_c$dz),
+                        fmt_p(ns_c$p_holm, FALSE)), collapse = "; ")))
+```
+
+## 3.5 Write
+
+```{r cs-part2-write}
+write.csv(liab_levels, file.path(OUT_DIR, "liability_levels.csv"), row.names = FALSE)
+write.csv(liab_by_cond, file.path(OUT_DIR, "liability_levels_by_condition.csv"), row.names = FALSE)
+```
+
+# 4. Parallel responsibility items
+
+## 4.1 What this asks
+
+Three liability items use identical wording for each party (1 = Not at all, 3 = Moderately, 5 = Extremely):
+
+- `liab_1` "To what extent is the company that created Sylva responsible for this outcome?"
+- `liab_6` "To what extent is Sylva itself responsible for this outcome?"
+- `liab_9` "To what extent is the user responsible for this outcome?"
+
+Because the wording is parallel, these single items give the cleanest within-person comparison of the three parties. Wording was checked against `experiment.js` (`buildLiability`, `liab_1`..`liab_12`); it is identical in Studies 1 and 2.
+
+## 4.2 Model
+
+Per study: paired t tests for user vs company, user vs Sylva, company vs Sylva; $d_z$ = mean difference / SD of differences; Holm correction across the three pairs within a study. Cell means by condition are reported descriptively.
+
+## 4.3 Code
+
+```{r resp-items, compute = TRUE}
+items <- c(company = "liab_1", sylva = "liab_6", user = "liab_9")
+pairs <- list(c("user", "company"), c("user", "sylva"), c("company", "sylva"))
+
+tests <- list(); cells <- list()
+for (s in 1:2) {
+  d <- read.csv(FILES[[as.character(s)]]$anal)
+  stopifnot(all(items %in% names(d)), !anyNA(d[, items]))
+  res <- do.call(rbind, lapply(pairs, function(p) {
+    x <- d[[items[[p[1]]]]]; y <- d[[items[[p[2]]]]]
+    t <- t.test(x, y, paired = TRUE)
+    data.frame(study = s, n = nrow(d), comparison = paste(p[1], "-", p[2]),
+               mean_1 = mean(x), mean_2 = mean(y), diff = unname(t$estimate),
+               ci_lo = t$conf.int[1], ci_hi = t$conf.int[2], t = unname(t$statistic),
+               df = unname(t$parameter), p = t$p.value, dz = mean(x - y) / sd(x - y))
+  }))
+  res$p_holm <- p.adjust(res$p, method = "holm")
+  tests[[s]] <- res
+  cells[[s]] <- do.call(rbind, lapply(split(d, d$condition_label), function(e)
+    data.frame(study = s, condition = e$condition_label[1], n = nrow(e),
+               company = mean(e$liab_1), sylva = mean(e$liab_6), user = mean(e$liab_9))))
+}
+tests <- do.call(rbind, tests); cells <- do.call(rbind, cells)
+```
+
+## 4.4 Results
+
+```{r resp-items-tables}
+tests %>%
+  transmute(Study = study, n, Comparison = comparison,
+            `M first` = f2(mean_1), `M second` = f2(mean_2), Diff = f2(diff),
+            `95% CI` = sprintf("[%s, %s]", f2(ci_lo), f2(ci_hi)),
+            t = f2(t), df, dz = f2(dz),
+            p = fmt_p(p, FALSE), `p (Holm)` = fmt_p(p_holm, FALSE)) %>%
+  kable(caption = "Parallel responsibility items: paired comparisons (Holm across 3 pairs within study).",
+        row.names = FALSE)
+
+cells %>%
+  transmute(Study = study, Condition = condition, n,
+            Company = f2(company), Sylva = f2(sylva), User = f2(user)) %>%
+  kable(caption = "Parallel responsibility items: cell means by condition (1-5).", row.names = FALSE)
+```
+
+```{r resp-items-text, echo = FALSE, results = "asis"}
+cat("**Interpretation.** ")
+for (s in 1:2) {
+  tt <- tests[tests$study == s, ]
+  sig <- tt$p_holm < .05
+  cat(sprintf("In Study %d (n = %d), %s. ", s, tt$n[1],
+              paste(sprintf("%s: diff = %s, 95%% CI [%s, %s], t(%d) = %s, dz = %s, Holm p = %s%s",
+                            tt$comparison, f2(tt$diff), f2(tt$ci_lo), f2(tt$ci_hi), tt$df, f2(tt$t),
+                            f2(tt$dz), fmt_p(tt$p_holm, FALSE), ifelse(sig, "", " (not significant)")),
+                    collapse = "; ")))
+}
+cat(sprintf("Sylva's mean is the lowest of the three parties in %s.\n",
+            if (all(cells$sylva < pmin(cells$company, cells$user))) "every condition of both studies"
+            else "some but not all conditions"))
+```
+
+## 4.5 Write
+
+```{r resp-items-write}
+write.csv(tests, file.path(OUT_DIR, "responsibility_items_tests.csv"), row.names = FALSE)
+write.csv(cells, file.path(OUT_DIR, "responsibility_items_by_condition.csv"), row.names = FALSE)
+```
+
+# 5. Individual differences: who bonds, who holds whom responsible
+
+## 5.1 What this asks
+
+Setting the persona manipulation aside, which **participant** characteristics (own personality, distress, AI attitudes, chatbot and AI experience, free-speech attitudes, politics, religiosity, age) predict bonding, moral agency and patiency, liability judgments, and how people talk in the chat? Which of these associations appear in **both** independent samples?
+
+**Timing.** Page order in `buildAll()` of `Study {1,2}/experiment/experiment.js` (lines 378-395, identical in both studies): **pre-chat** TIPI-Self, GAAIS, PHQ-4, then the story and the chat; **post-chat** the liability vignette, open-ended items, and demographics (AI-tool frequency, free speech, chatbot experience, social media, tech comfort and trust, politics, religiosity, age). Post-chat predictors are meant to be stable characteristics, but they were measured after the manipulation and are not protected from it the way the pre-chat measures are.
+
+## 5.2 Model
+
+Per study, per predictor x outcome (OLS, complete cases):
+
+$$z(\text{outcome}) = b_0 + \beta\, z(\text{predictor}) + b_2\,\text{cond} + e, \qquad \text{cond} = +0.5 \text{ high-trait}, -0.5 \text{ low-trait}$$
+
+- $\beta$: standardized slope, adjusted for condition, with 95% CI, t, p, n; partial r = t / sqrt(t^2 + df) (the predictor-outcome correlation after both are residualized on condition; checked below against a direct computation); HC3-robust p as a robustness column.
+- BH-FDR q within each study across the **core** grid (14 predictors x 12 outcomes = 168 tests). Secondary predictors are reported without q.
+
+**Pooled** (both studies stacked): $z_s(\text{outcome}) \sim z_s(\text{predictor}) + \text{study} + \text{cond}_{s1} + \text{cond}_{s2}$, where $z_s$ is z-scored within study (complete cases of that pair) and $\text{cond}_{s1}$, $\text{cond}_{s2}$ are study-specific effect codes (+/-0.5 in their own study, 0 in the other). BH across the 168 core tests. Heterogeneity: add $z_s(\text{predictor}) \times \text{study}$ (study +/-0.5); `het_b` = beta(S1) - beta(S2), `het_p` its p.
+
+**Replicated** = same sign of beta and p < .05 in both studies.
+
+## 5.3 Variable sets
+
+```{r id-vars, compute = TRUE}
+# Predictor table: column, label, tier (core = in the BH family), timing.
+PRED <- tibble::tribble(
+  ~predictor,             ~label,                              ~tier,       ~timing,
+  "tipi_self_extra",      "TIPI-Self Extraversion",            "core",      "pre-chat",
+  "tipi_self_agree",      "TIPI-Self Agreeableness",           "core",      "pre-chat",
+  "tipi_self_consc",      "TIPI-Self Conscientiousness",       "core",      "pre-chat",
+  "tipi_self_emostab",    "TIPI-Self Emotional Stability",     "core",      "pre-chat",
+  "tipi_self_open",       "TIPI-Self Openness",                "core",      "pre-chat",
+  "phq4_total",           "PHQ-4 total (distress, 0-12)",      "core",      "pre-chat",
+  "gaais_pos",            "GAAIS positive AI attitudes",       "core",      "pre-chat",
+  "gaais_neg",            "GAAIS negative AI attitudes",       "core",      "pre-chat",
+  "d_chatbot_experience", "Prior chatbot experience (1-5)",    "core",      "post-chat",
+  "d_ai_freq",            "AI-tool use frequency (1-5)",       "core",      "post-chat",
+  "free_speech_avg",      "Free-speech attitudes (1-7)",       "core",      "post-chat",
+  "d_politics_mod",       "Politics (1 lib - 7 cons)",         "core",      "post-chat",
+  "d_religiosity_mod",    "Religiosity (1-5)",                 "core",      "post-chat",
+  "d_age_mod",            "Age",                               "core",      "post-chat",
+  # secondary: reported, not in the BH family
+  "phq4_anx",             "PHQ-4 anxiety (0-6)",               "secondary", "pre-chat",
+  "phq4_dep",             "PHQ-4 depression (0-6)",            "secondary", "pre-chat",
+  "d_tech_trust",         "Trust in technology (1-6)",         "secondary", "post-chat",
+  "d_tech_comfort",       "Comfort with technology (1-5)",     "secondary", "post-chat",
+  "d_social_media",       "Social media use (1-5)",            "secondary", "post-chat",
+  "legal_expertise",      "Legal expertise composite",         "secondary", "post-chat"
+)
+FROM_ANALYTIC <- c("d_ai_freq", "d_tech_trust", "d_tech_comfort", "d_social_media")
+
+OUTCOMES_ID <- c("psr_total", "ec_total", "trust_total", "et_total", "ma_total",
+                 "mp_total", "liab_corp", "liab_chat", "liab_user", "liab_harm",
+                 "pct_emotional_self_disclosure", "pct_bonding_language")
+CHAT_OUT <- c("pct_emotional_self_disclosure", "pct_bonding_language")
+```
+
+## 5.4 Load and join
+
+The composite and analytic CSVs carry `sona_id` with leading zeros (`012345678`); the Study 2 parquet stores it as an integer (`1234567`). Leading zeros are stripped on every side before joining, and the code stops unless every participant joins 1:1 across the three files and the condition labels agree between the R and NLP halves. (Study 1 also has an older `Chat_Encoding_Claude/` copy with N = 130; the top-level file, N = 131, is the current pipeline output and is used.)
+
+```{r id-load, compute = TRUE}
+norm_id <- function(x) {
+  x <- if (is.numeric(x)) format(x, scientific = FALSE, trim = TRUE) else as.character(x)
+  sub("^0+(?=.)", "", trimws(x), perl = TRUE)
+}
+
+load_study <- function(s) {
+  f    <- FILES[[s]]
+  comp <- read.csv(f$comp, colClasses = c(sona_id = "character"))
+  anal <- read.csv(f$anal, colClasses = c(sona_id = "character"))
+  chat <- as.data.frame(read_parquet(f$chat))
+
+  comp$id <- norm_id(comp$sona_id)
+  anal$id <- norm_id(anal$sona_id)
+  chat$id <- norm_id(chat$sona_id)
+  stopifnot(!anyDuplicated(comp$id), !anyDuplicated(anal$id), !anyDuplicated(chat$id))
+
+  # every composite participant must be present in both other files, and vice versa
+  for (nm in c("anal", "chat")) {
+    other <- get(nm)$id
+    if (!setequal(comp$id, other))
+      stop("Study ", s, ": ID mismatch between composite_scores and ", nm, ": ",
+           paste(c(setdiff(comp$id, other), setdiff(other, comp$id)), collapse = ", "))
+  }
+
+  d <- comp %>%
+    left_join(anal[, c("id", FROM_ANALYTIC)], by = "id") %>%
+    left_join(chat[, c("id", "condition_label", CHAT_OUT)] %>%
+                rename(condition_chat = condition_label), by = "id")
+  stopifnot(nrow(d) == nrow(comp))
+  # condition labels must agree between the R and NLP halves
+  stopifnot(all(d$condition_label == d$condition_chat))
+  stopifnot(all(d$condition_label %in% c(f$high, f$low)))
+
+  miss <- setdiff(c(PRED$predictor, OUTCOMES_ID), names(d))
+  if (length(miss)) stop("Study ", s, " missing columns: ", paste(miss, collapse = ", "))
+
+  # Cleaning rules (the *_mod columns already implement them; re-asserted here)
+  stopifnot(all(is.na(d$d_politics_mod)    | d$d_politics_mod    %in% 1:7))
+  stopifnot(all(is.na(d$d_religiosity_mod) | d$d_religiosity_mod %in% 1:5))
+  stopifnot(all(is.na(d$d_age_mod) | (d$d_age_mod >= 16 & d$d_age_mod <= 100)))
+
+  d$study <- as.integer(s)
+  d$cond  <- ifelse(d$condition_label == f$high, 0.5, -0.5)  # effect coded
+  cat(sprintf("Study %s: N = %d (%s %d, %s %d); all IDs joined across 3 files\n",
+              s, nrow(d), f$high, sum(d$cond > 0), f$low, sum(d$cond < 0)))
+  d[, c("id", "study", "condition_label", "cond", PRED$predictor, OUTCOMES_ID)]
+}
+
+DAT <- lapply(c("1", "2"), load_study)
+names(DAT) <- c("1", "2")
+
+zs <- function(x) (x - mean(x)) / sd(x)
+```
+
+## 5.5 Per-study models
+
+```{r id-grid, compute = TRUE}
+fit_one <- function(d, x, y) {
+  cc <- d[complete.cases(d[, c(x, y, "cond")]), ]
+  n  <- nrow(cc)
+  if (n < 10 || sd(cc[[x]]) == 0) return(NULL)
+  dd <- data.frame(y = zs(cc[[y]]), x = zs(cc[[x]]), cond = cc$cond)
+  m  <- lm(y ~ x + cond, data = dd)
+  ct <- summary(m)$coefficients["x", ]
+  ci <- confint(m)["x", ]
+  df <- m$df.residual
+  hc <- sqrt(diag(vcovHC(m, type = "HC3")))["x"]
+  data.frame(n = n, beta = ct[["Estimate"]], se = ct[["Std. Error"]],
+             ci_lo = ci[[1]], ci_hi = ci[[2]], t = ct[["t value"]], df = df,
+             p = ct[["Pr(>|t|)"]],
+             partial_r = ct[["t value"]] / sqrt(ct[["t value"]]^2 + df),
+             p_hc3 = 2 * pt(abs(ct[["Estimate"]] / hc), df, lower.tail = FALSE))
+}
+
+grid <- list()
+for (s in names(DAT)) for (x in PRED$predictor) for (y in OUTCOMES_ID) {
+  r <- fit_one(DAT[[s]], x, y)
+  if (!is.null(r)) grid[[length(grid) + 1]] <- cbind(study = as.integer(s), predictor = x, outcome = y, r)
+}
+grid <- bind_rows(grid) %>% left_join(PRED, by = "predictor")
+grid$q_bh <- NA_real_
+for (s in 1:2) {                       # BH within study, core predictors only
+  k <- grid$study == s & grid$tier == "core"
+  grid$q_bh[k] <- p.adjust(grid$p[k], "BH")
+}
+
+# sanity: partial r from t equals the residual-on-condition correlation
+local({
+  d  <- DAT[["1"]]; cc <- d[complete.cases(d[, c("gaais_pos", "psr_total")]), ]
+  r1 <- cor(resid(lm(gaais_pos ~ cond, cc)), resid(lm(psr_total ~ cond, cc)))
+  r2 <- grid$partial_r[grid$study == 1 & grid$predictor == "gaais_pos" & grid$outcome == "psr_total"]
+  stopifnot(abs(r1 - r2) < 1e-10)
+})
+cat("Per-study rows:", nrow(grid), "; partial-r check passed\n")
+```
+
+## 5.6 Pooled model and heterogeneity
+
+```{r id-pooled, compute = TRUE}
+fit_pooled <- function(x, y) {
+  parts <- lapply(names(DAT), function(s) {
+    d  <- DAT[[s]]
+    cc <- d[complete.cases(d[, c(x, y, "cond")]), ]
+    if (nrow(cc) < 10 || sd(cc[[x]]) == 0) return(NULL)
+    data.frame(y = zs(cc[[y]]), x = zs(cc[[x]]), study = cc$study, cond = cc$cond)
+  })
+  if (any(vapply(parts, is.null, TRUE))) return(NULL)
+  dd <- bind_rows(parts) %>%
+    mutate(study_e = ifelse(study == 1, 0.5, -0.5),
+           cond_s1 = ifelse(study == 1, cond, 0),
+           cond_s2 = ifelse(study == 2, cond, 0))
+  m  <- lm(y ~ x + study_e + cond_s1 + cond_s2, data = dd)
+  mh <- lm(y ~ x * study_e + cond_s1 + cond_s2, data = dd)
+  ct <- summary(m)$coefficients["x", ]
+  ci <- confint(m)["x", ]
+  data.frame(n = nrow(dd), beta = ct[["Estimate"]], se = ct[["Std. Error"]],
+             ci_lo = ci[[1]], ci_hi = ci[[2]], t = ct[["t value"]],
+             df = m$df.residual, p = ct[["Pr(>|t|)"]],
+             partial_r = ct[["t value"]] / sqrt(ct[["t value"]]^2 + m$df.residual),
+             het_b = summary(mh)$coefficients["x:study_e", "Estimate"],  # beta_S1 - beta_S2
+             het_p = summary(mh)$coefficients["x:study_e", "Pr(>|t|)"])
+}
+
+pooled <- list()
+for (x in PRED$predictor) for (y in OUTCOMES_ID) {
+  r <- fit_pooled(x, y)
+  if (!is.null(r)) pooled[[length(pooled) + 1]] <- cbind(predictor = x, outcome = y, r)
+}
+pooled <- bind_rows(pooled) %>% left_join(PRED, by = "predictor")
+pooled$q_bh <- NA_real_
+pooled$q_bh[pooled$tier == "core"] <- p.adjust(pooled$p[pooled$tier == "core"], "BH")
+```
+
+## 5.7 Replication table and descriptives
+
+```{r id-repl, compute = TRUE}
+wide <- function(s) {
+  grid %>% filter(study == s) %>%
+    select(predictor, outcome, beta, ci_lo, ci_hi, p, q_bh, n) %>%
+    rename_with(~ paste0(.x, "_s", s), -c(predictor, outcome))
+}
+repl <- PRED %>% select(predictor, label, tier, timing) %>%
+  tidyr::crossing(outcome = OUTCOMES_ID) %>%
+  inner_join(wide(1), by = c("predictor", "outcome")) %>%
+  inner_join(wide(2), by = c("predictor", "outcome")) %>%
+  inner_join(pooled %>% select(predictor, outcome, beta_pooled = beta, ci_lo_pooled = ci_lo,
+                               ci_hi_pooled = ci_hi, p_pooled = p, q_pooled = q_bh,
+                               het_p), by = c("predictor", "outcome")) %>%
+  mutate(same_sign        = sign(beta_s1) == sign(beta_s2),
+         replicated       = same_sign & p_s1 < .05 & p_s2 < .05,
+         bh_s1            = !is.na(q_bh_s1) & q_bh_s1 < .05,
+         bh_s2            = !is.na(q_bh_s2) & q_bh_s2 < .05,
+         bh_pooled        = !is.na(q_pooled) & q_pooled < .05,
+         sig_one_study    = xor(p_s1 < .05, p_s2 < .05),
+         outcome_type     = ifelse(outcome %in% CHAT_OUT, "chat behavior", "questionnaire")) %>%
+  arrange(desc(replicated), p_pooled)
+
+desc <- bind_rows(lapply(names(DAT), function(s) {
+  d <- DAT[[s]]
+  bind_rows(lapply(seq_len(nrow(PRED)), function(i) {
+    v <- d[[PRED$predictor[i]]]
+    data.frame(study = as.integer(s), predictor = PRED$predictor[i], label = PRED$label[i],
+               tier = PRED$tier[i], timing = PRED$timing[i],
+               n = sum(!is.na(v)), n_missing = sum(is.na(v)),
+               M = mean(v, na.rm = TRUE), SD = sd(v, na.rm = TRUE),
+               min = min(v, na.rm = TRUE), max = max(v, na.rm = TRUE),
+               r_with_cond = cor(v, d$cond, use = "complete.obs"))  # randomization check
+  }))
+}))
+```
+
+## 5.8 Results
+
+```{r id-desc-table}
+desc %>%
+  transmute(Study = study, Predictor = label, Tier = tier, Timing = timing,
+            n, Missing = n_missing, M = f2(M), SD = f2(SD), Min = min, Max = max,
+            `r with condition` = f2(r_with_cond)) %>%
+  kable(caption = "Predictor descriptives by study. r with condition is a randomization check.",
+        row.names = FALSE)
+```
+
+```{r id-tables}
+show_tab <- function(df, caption) {
+  df %>%
+    transmute(Predictor = label, Outcome = OUT_LABEL[outcome],
+              `β S1` = f2(beta_s1), `p S1` = fmt_p(p_s1, FALSE), `q S1` = fmt_p(q_bh_s1, FALSE),
+              `β S2` = f2(beta_s2), `p S2` = fmt_p(p_s2, FALSE), `q S2` = fmt_p(q_bh_s2, FALSE),
+              `β pooled` = f2(beta_pooled), `p pooled` = fmt_p(p_pooled, FALSE),
+              `q pooled` = fmt_p(q_pooled, FALSE), `het p` = fmt_p(het_p, FALSE)) %>%
+    kable(caption = caption, row.names = FALSE)
+}
+show_tab(filter(repl, replicated),
+         "Replicated associations: same sign and p < .05 in both studies (secondary predictors have no q).")
+show_tab(filter(repl, tier == "core", bh_pooled),
+         "Core associations surviving BH-FDR in the pooled analysis.")
+```
+
+```{r id-text, echo = FALSE, results = "asis"}
+core <- filter(repl, tier == "core")
+rc   <- filter(core, replicated)
+rs   <- filter(repl, replicated, tier == "secondary")
+pb_nr <- filter(core, bh_pooled, !replicated)
+cat(sprintf("**Interpretation.** The core grid has %d tests per study; about %.1f would reach p < .05 by chance. Observed: Study 1 %d, Study 2 %d. Surviving BH-FDR: Study 1 %d, Study 2 %d, pooled %d; %d cells survive BH in both studies. ",
+            nrow(core), .05 * nrow(core), sum(core$p_s1 < .05), sum(core$p_s2 < .05),
+            sum(core$bh_s1), sum(core$bh_s2), sum(core$bh_pooled), sum(core$bh_s1 & core$bh_s2)))
+cat(sprintf("%d core and %d secondary associations replicated (same sign, p < .05 in both studies). ",
+            nrow(rc), nrow(rs)))
+if (nrow(rc) > 0)
+  cat(sprintf("The replicated core associations are: %s. ",
+              paste(sprintf("%s → %s (β = %s / %s)", rc$label, tolower(OUT_LABEL[rc$outcome]),
+                            f2(rc$beta_s1), f2(rc$beta_s2)), collapse = "; ")))
+if (nrow(pb_nr) > 0)
+  cat(sprintf("Significant in the pooled analysis after BH but not replicated in both studies: %s. ",
+              paste(sprintf("%s → %s (pooled β = %s, q = %s)", pb_nr$label, tolower(OUT_LABEL[pb_nr$outcome]),
+                            f2(pb_nr$beta_pooled), fmt_p(pb_nr$q_pooled, FALSE)), collapse = "; ")))
+het_rep <- filter(rc, het_p < .05)
+if (nrow(het_rep) > 0)
+  cat(sprintf("Among replicated associations, the size differed between studies (het p < .05) for %s. ",
+              paste(sprintf("%s → %s (β %s vs %s, het p = %s)", het_rep$label, tolower(OUT_LABEL[het_rep$outcome]),
+                            f2(het_rep$beta_s1), f2(het_rep$beta_s2), fmt_p(het_rep$het_p, FALSE)),
+                    collapse = "; ")))
+cat(sprintf("The largest absolute correlation between any predictor and condition (randomization check) is %s. ",
+            f2(max(abs(desc$r_with_cond), na.rm = TRUE))))
+g_hc <- filter(grid, p < .05, p_hc3 >= .05)
+cat(sprintf("%d per-study associations at p < .05 lose significance under HC3 (see `p_hc3` in `indiv_diff_grid.csv`).\n",
+            nrow(g_hc)))
+```
+
+## 5.9 Write
+
+Doubles are rounded to 6 significant digits before writing, as in the original script.
+
+```{r id-write}
+rnd <- function(df) mutate(df, across(where(is.double), ~ signif(.x, 6)))
+write.csv(rnd(grid   %>% select(study, predictor, label, tier, timing, outcome, everything())),
+          file.path(OUT_DIR, "indiv_diff_grid.csv"), row.names = FALSE)
+write.csv(rnd(pooled %>% select(predictor, label, tier, timing, outcome, everything())),
+          file.path(OUT_DIR, "indiv_diff_pooled.csv"), row.names = FALSE)
+write.csv(rnd(repl),   file.path(OUT_DIR, "indiv_diff_replicated.csv"),   row.names = FALSE)
+write.csv(rnd(desc),   file.path(OUT_DIR, "indiv_diff_descriptives.csv"), row.names = FALSE)
+```
+
+# 6. Exploratory: the two-calculation account
+
+**Status: exploratory and post hoc.** None of the analyses in this section were preregistered. Study 1 was not preregistered; Study 2 was, but its preregistration does not cover these models. They were developed after seeing the data (modeling pilot, October 2026) and are ported here so that every number comes from this notebook. The primary results remain the unadjusted estimates in sections 2-4 (themselves exploratory cross-study comparisons); this section only adds post hoc adjustments and descriptions.
+
+**The account in one paragraph (a hypothesis this section examines, not a finding).** The account proposes that participants make two separate calculations. (1) **Closeness:** during the chat they take in how Sylva treats them, warm and accommodating or cool and resistant; this is summarised in one overall good/bad impression of Sylva, and bonding (parasocial relationship, emotional connection) goes with that impression. The causal order among tone, impression and bonding cannot be identified with these data. (2) **Responsibility:** responsibility for the harm in the vignette follows a fixed pattern (the user and the company are held responsible, Sylva much less so, and responsibility assigned to Sylva moves with that assigned to the company), which persona, impression and bonding are expected to barely reach. The numbers that bear on each part are in the summary below and in 6.1-6.5.
+
+**Measurement.** Sylva's replies were scored by three text classifiers ("probes") in `CrossStudy/measurement/tone_probes.py`: **W** = expressed warmth and **R** = resistance or disagreement (trained on Study 1's LLM consensus codes), **A** = anxious or aversive affect (trained on Study 2's codes). Each is a ridge-logistic model on the sentence embeddings (all-mpnet-base-v2) that the study pipelines already store, and gives each reply a 0-1 score. Within the training study each reply is scored out of fold (5 folds, grouped by participant, so a participant's replies are never scored by a model that saw them); the other study is scored by the model trained on the whole training study. Probe accuracy (AUC) is in `CrossStudy/measurement/probe_validation.csv`. These AUCs are a measurement diagnostic produced by the scoring script and are not reported results; any AUC cited in the paper must be recomputed here. This notebook averages the scores over each participant's replies.
+
+```{r tc-plain-summary, echo = FALSE, results = "asis"}
+.r <- function(dv, adj, spec = "within-study slope") tc_int %>% filter(outcome == dv, adjuster == adj, spec == !!spec)
+.b <- .r("psr_total", "none", "none"); .g <- .r("psr_total", "G"); .gh <- .r("psr_total", "G_halo"); .gt <- .r("psr_total", "Ghat")
+.pl <- tc_int %>% filter(outcome == "psr_total", type == "placebo rating")
+.tr <- .r("psr_total", "trust_total")
+.x  <- tc_xs %>% filter(outcome == "psr_total", probe == "W", mode == "within-condition")
+.tm <- function(cl, v) tone_cells$mean[tone_cells$condition_label == cl & tone_cells$measure == v]
+.td <- function(s, v) tone_diffs[tone_diffs$study == s & tone_diffs$measure == v, ]
+.ag <- tc_agency %>% filter(sample == "pooled", model == "ma_cap")
+.bi <- tc_bond %>% filter(sample == "pooled")
+.cs <- tc_partycor %>% filter(source == "model (party intercepts)", pair == "company-sylva")
+.ps <- tc_profile %>% filter(test != "items only")
+.ds <- tc_distress %>% filter(sample == "pooled", model == "alone")
+.db <- tc_distress %>% filter(sample == "pooled", model == "both subscales")
+.sig <- function(p, yes, no) ifelse(p < .05, yes, no)
+.xr <- tc_xs %>% filter(outcome == "psr_total", probe == "R", mode == "within-condition")
+.trust_stronger <- min(.tr$r_adjuster_outcome_s1, .tr$r_adjuster_outcome_s2) >
+  max(.g$r_adjuster_outcome_s1, .g$r_adjuster_outcome_s2)
+.ag2 <- tc_agency %>% filter(sample == "pooled", model == "ma_cap + mp_total")
+.im  <- function(pt) tc_ident$mean[tc_ident$party == pt]
+.anx <- .ds[.ds$predictor == "phq4_anx", ]; .dep <- .ds[.ds$predictor == "phq4_dep", ]
+.dba <- .db[.db$predictor == "phq4_anx", ]; .dbd <- .db[.db$predictor == "phq4_dep", ]
+.esd <- function(p) .sig(p, "went with more emotional self-disclosure in the chat", "did not reliably go with emotional self-disclosure in the chat")
+cat("**Section 6 in plain language.** ",
+    sprintf("*How Sylva treated people.* The warm persona's replies %s than the cold persona's (warmth score %s vs %s on 0-1, %s). The anxious and calm personas %s in warmth (%s vs %s, %s); %s in anxious content (%s vs %s, %s). ",
+            .sig(.td(1, "W")$p, "read as warmer", "did not read reliably warmer"),
+            f2(.tm("HighA", "W")), f2(.tm("LowA", "W")), fmt_p(.td(1, "W")$p),
+            .sig(.td(2, "W")$p, "also differed", "did not differ reliably"),
+            f2(.tm("HighN", "W")), f2(.tm("LowN", "W")), fmt_p(.td(2, "W")$p),
+            .sig(.td(2, "A")$p, "they differed", "they did not differ reliably"),
+            f2(.tm("HighN", "A")), f2(.tm("LowN", "A")), fmt_p(.td(2, "A")$p)),
+    sprintf("*Closeness.* The warm-vs-cold effect on parasocial bonding was larger than the anxious-vs-calm effect by %s points (%s). Holding constant the participant's overall impression of Sylva (the average of the five personality ratings they gave her), that gap became %s (%s); with the impression measured without the manipulated trait, %s (%s); and with an impression predicted only from Sylva's replies, %s (%s). Moral agency, moral patiency and experience-taking left it at %s to %s; trust, which correlates with bonding %s than the impression does, reduced it to %s (%s), %.0f%% of the unadjusted gap. ",
+            f2(.b$b), fmt_p(.b$p), f2(.g$b), fmt_p(.g$p), f2(.gh$b), fmt_p(.gh$p), f2(.gt$b), fmt_p(.gt$p),
+            f2(min(.pl$b[.pl$adjuster != "trust_total"])), f2(max(.pl$b[.pl$adjuster != "trust_total"])),
+            ifelse(.trust_stronger, "more strongly", "about as strongly or less"),
+            f2(.tr$b), fmt_p(.tr$p), 100 * .tr$b / .b$b),
+    sprintf("A warmth slope estimated only in Study 2 predicts a Study 1 bonding effect of %s points (95%% CI [%s, %s]); the observed effect was %s [%s, %s] (predicted minus observed %s, 95%% CI [%s, %s]; %s). A resistance score predicts %s [%s, %s], so warmth cannot be told apart from low resistance. ",
+            f2(.x$pred), f2(.x$pred_lo), f2(.x$pred_hi), f2(.x$obs), f2(.x$obs_lo), f2(.x$obs_hi),
+            f2(.x$diff), f2(.x$diff_lo), f2(.x$diff_hi),
+            ifelse(.x$diff_lo < 0 & .x$diff_hi > 0,
+                   sprintf("the interval includes zero but spans about +/- %s points, so the data also allow predictions well away from the observed effect", f2((.x$diff_hi - .x$diff_lo) / 2)),
+                   "the prediction differs reliably from the observed effect"),
+            f2(.xr$pred), f2(.xr$pred_lo), f2(.xr$pred_hi)),
+    "This is adjustment, not mediation: the impression was rated after the chat, and the tone scores come from a conversation the participant co-produces, so these results are consistent with the account but show neither that tone or impression causes bonding nor which way the association runs.\n\n",
+    sprintf("*Responsibility.* On the identically worded items, participants rated the responsibility of the user at M = %s, the company at %s and Sylva at %s%s. The pattern across all ten party-specific items %s between studies (%s) and %s between persona conditions (%s). ",
+            f2(.im("user")), f2(.im("company")), f2(.im("sylva")),
+            ifelse(min(.im("user"), .im("company")) > .im("sylva"), ", so the user and the company were held more responsible than Sylva", ""),
+            .sig(.ps$p[1], "differed", "did not differ reliably"),
+            sprintf("chi2(%d) = %s, %s", .ps$df[1], f2(.ps$chisq[1]), fmt_p(.ps$p[1])),
+            .sig(.ps$p[2], "differed", "did not differ reliably"),
+            sprintf("chi2(%d) = %s, %s", .ps$df[2], f2(.ps$chisq[2]), fmt_p(.ps$p[2]))),
+    sprintf("Seeing more of a mind in Sylva %s holding her responsible (beta = %s, %s, BF10 = %s; with patiency controlled, BF10 = %s%s). %s (BF01 = %s; values above 1 favour no added effect). Responsibility assigned to Sylva moved with responsibility assigned to the company (r = %s).\n\n",
+            .sig(.ag$p, "predicted", "did not reliably predict"),
+            f2(.ag$b), fmt_p(.ag$p), f2(.ag$BF10), f2(.ag2$BF10),
+            ifelse(max(.ag$BF10, .ag2$BF10) < 3, "; both Bayes factors are below 3, so the evidence for this link is weak", ""),
+            ifelse(.bi$BF01 > 3, "Bonding added nothing beyond perceived mind",
+                   ifelse(.bi$BF01 < 1/3, "Bonding added to perceived mind",
+                          "The data do not clearly say whether bonding adds to perceived mind")),
+            sprintf("%.1f", .bi$BF01), f2(.cs$r)),
+    sprintf("*Distress.* Pre-chat anxiety %s (b = %s, %s), and pre-chat depression %s (b = %s, %s; per scale point, in 10%%-of-turns units). The two subscales correlate %s to %s; entered together in the pooled data, %s (anxiety %s; depression %s)%s.\n",
+            .esd(.anx$p), f2(.anx$b), fmt_p(.anx$p), .esd(.dep$p), f2(.dep$b), fmt_p(.dep$p),
+            f2(min(tc_phq_desc$r_anx_dep)), f2(max(tc_phq_desc$r_anx_dep)),
+            ifelse(.dba$p > .05 & .dbd$p > .05, "neither is reliable on its own",
+                   ifelse(.dba$p < .05 & .dbd$p < .05, "both remain reliable", "only one remains reliable")),
+            fmt_p(.dba$p), fmt_p(.dbd$p),
+            ifelse(.dba$p > .05 & .dbd$p > .05, ", so these data cannot say whether it is anxiety or depression", "")),
+    sep = "")
+```
+
+## 6.0 Setup and person-level table
+
+Section 6 sets its own seed (here, and again before the cross-validation and bootstrap chunks), so its results do not depend on sections 2-5. Sections 2-5 are unaffected by section 6 because the `packages` chunk calls set.seed(42) at the start of the visible run, after the silent precompute pass.
+
+```{r tc-setup, compute = TRUE}
+set.seed(42)
+TRAITS <- c("extra", "agree", "consc", "emostab", "open")
+
+# Turn-level tone probes (measurement only; written by CrossStudy/measurement/tone_probes.py)
+tone <- read.csv(params$tone_file, colClasses = c(sona_id = "character"))
+tone$id <- norm_id(tone$sona_id)
+stopifnot(!anyDuplicated(tone[, c("study", "id", "turn_idx")]),
+          !anyNA(tone[, c("W", "R", "A", "n_words")]))
+# person means over Sylva's replies; L = mean log words per reply (as in the pilot)
+tone_p <- tone %>%
+  group_by(study, id) %>%
+  summarise(W = mean(W), R = mean(R), A = mean(A), L = mean(log(pmax(n_words, 1))),
+            words = mean(n_words), n_bot = n(), .groups = "drop")
+
+tc_load <- function(s) {
+  f  <- FILES[[as.character(s)]]
+  a  <- read.csv(f$anal, colClasses = c(sona_id = "character"))
+  ch <- as.data.frame(read_parquet(f$chat))
+  a$id <- norm_id(a$sona_id); ch$id <- norm_id(ch$sona_id)
+  stopifnot(!anyDuplicated(a$id), setequal(a$id, ch$id))
+  keep <- c("id", "condition_label", "psr_total", "ec_total", "trust_total", "et_total",
+            "ma_total", "mp_total", paste0("tipi_bot_", TRAITS), paste0("liab_", 1:10),
+            paste0("ma_", 1:8), "phq4_total", "phq4_anx", "phq4_dep")
+  d <- a[, keep] %>%
+    left_join(ch[, c("id", "pct_emotional_self_disclosure", "mean_user_words_per_turn")], by = "id")
+  stopifnot(all(d$condition_label %in% c(f$high, f$low)))
+  d$study <- s
+  d$high  <- as.integer(d$condition_label == f$high)
+  d
+}
+
+TC <- bind_rows(lapply(1:2, tc_load)) %>%
+  inner_join(tone_p, by = c("study", "id"))
+stopifnot(nrow(TC) == nrow(s1) + nrow(s2))     # every participant has scored replies
+
+TC <- TC %>%
+  mutate(cell    = factor(paste0("S", study, " ", condition_label),
+                          levels = c("S1 HighA", "S1 LowA", "S2 HighN", "S2 LowN")),
+         cond    = high - 0.5,                          # +0.5 warm / anxious, -0.5 cold / calm
+         study_c = ifelse(study == 1, 0.5, -0.5),       # +0.5 Study 1, -0.5 Study 2
+         G       = (tipi_bot_extra + tipi_bot_agree + tipi_bot_consc + tipi_bot_emostab + tipi_bot_open) / 5,
+         # G_halo: impression without the manipulated trait (agreeableness in S1, emotional stability in S2)
+         G_halo  = ifelse(study == 1,
+                          (tipi_bot_extra + tipi_bot_consc + tipi_bot_emostab + tipi_bot_open) / 4,
+                          (tipi_bot_extra + tipi_bot_agree + tipi_bot_consc + tipi_bot_open) / 4),
+         # agency without ma_5 / ma_8 (which already ask about responsibility or blame)
+         ma_cap  = (ma_1 + ma_2 + ma_3 + ma_4 + ma_6 + ma_7) / 6,
+         ESD     = 10 * pct_emotional_self_disclosure,  # units: 10% of the user's turns
+         logUW   = log(mean_user_words_per_turn)) %>%
+  arrange(study, cell, id)
+
+# HC3 inference for one coefficient, t on the residual df (as in section 2)
+tc_hc3 <- function(fit, term) {
+  V  <- sandwich::vcovHC(fit, type = "HC3")
+  b  <- unname(coef(fit)[term]); se <- sqrt(V[term, term]); df <- df.residual(fit)
+  data.frame(b = b, se = se, lo = b - qt(.975, df) * se, hi = b + qt(.975, df) * se,
+             t = b / se, df = df, p = 2 * pt(-abs(b / se), df))
+}
+cat(sprintf("Section 6 table: N = %d (%s); %d bot replies scored.\n", nrow(TC),
+            paste(sprintf("%s %d", levels(TC$cell), as.integer(table(TC$cell))), collapse = ", "),
+            sum(TC$n_bot)))
+```
+
+## 6.1 How Sylva treated people: expressed tone and length by cell
+
+**What this asks.** Did the personas change how Sylva's replies read? This is a manipulation check on what participants actually saw, not on the persona prompt.
+
+**Model.** Person means of W, R and A (0-1), words per reply, and mean log words per reply, by study x condition cell, with t-based 95% CIs. Within each study, high minus low persona with a Welch t test.
+
+```{r tc-tone, compute = TRUE}
+TONE_VARS <- c(W = "Expressed warmth W (0-1)", R = "Resistance R (0-1)",
+               A = "Anxious/aversive affect A (0-1)", words = "Words per reply",
+               L = "Mean log words per reply")
+tone_cells <- bind_rows(lapply(names(TONE_VARS), function(v)
+  TC %>% group_by(study, condition_label, cell) %>%
+    summarise(measure = v, n = n(), mean = mean(.data[[v]]), sd = sd(.data[[v]]), .groups = "drop"))) %>%
+  mutate(ci_lo = mean - qt(.975, n - 1) * sd / sqrt(n),
+         ci_hi = mean + qt(.975, n - 1) * sd / sqrt(n)) %>%
+  arrange(match(measure, names(TONE_VARS)), cell) %>%
+  select(measure, study, condition_label, n, mean, sd, ci_lo, ci_hi)
+
+tone_diffs <- bind_rows(lapply(names(TONE_VARS), function(v) bind_rows(lapply(1:2, function(s) {
+  d <- TC[TC$study == s, ]
+  tt <- t.test(d[[v]][d$high == 1], d[[v]][d$high == 0])
+  data.frame(measure = v, study = s, contrast = ifelse(s == 1, "HighA - LowA", "HighN - LowN"),
+             diff = unname(tt$estimate[1] - tt$estimate[2]), ci_lo = tt$conf.int[1], ci_hi = tt$conf.int[2],
+             t = unname(tt$statistic), df = unname(tt$parameter), p = tt$p.value)
+}))))
+```
+
+```{r tc-tone-table}
+tone_cells %>%
+  transmute(Measure = TONE_VARS[measure], Cell = paste0("S", study, " ", condition_label), n,
+            M = ifelse(measure == "words", sprintf("%.1f", mean), sprintf("%.3f", mean)),
+            `95% CI` = ifelse(measure == "words", sprintf("[%.1f, %.1f]", ci_lo, ci_hi),
+                              sprintf("[%.3f, %.3f]", ci_lo, ci_hi))) %>%
+  kable(caption = "Expressed tone and length of Sylva's replies: person means by cell (exploratory).",
+        row.names = FALSE)
+tone_diffs %>%
+  transmute(Measure = TONE_VARS[measure], Study = study, Contrast = contrast,
+            Diff = ifelse(measure == "words", sprintf("%.1f", diff), sprintf("%.3f", diff)),
+            `95% CI` = ifelse(measure == "words", sprintf("[%.1f, %.1f]", ci_lo, ci_hi),
+                              sprintf("[%.3f, %.3f]", ci_lo, ci_hi)),
+            t = f2(t), df = sprintf("%.1f", df), p = fmt_p(p, FALSE)) %>%
+  kable(caption = "High minus low persona within study (Welch t).", row.names = FALSE)
+```
+
+```{r tc-tone-text, echo = FALSE, results = "asis"}
+.d <- function(s, v) tone_diffs[tone_diffs$study == s & tone_diffs$measure == v, ]
+.m <- function(cl, v) tone_cells$mean[tone_cells$condition_label == cl & tone_cells$measure == v]
+cat(sprintf("**Interpretation.** In Study 1 the warm persona's replies scored higher on warmth (%.3f vs %.3f; diff %s, 95%% CI [%s, %s], %s) and lower on resistance (%.3f vs %.3f, %s). ",
+            .m("HighA", "W"), .m("LowA", "W"), f2(.d(1, "W")$diff), f2(.d(1, "W")$ci_lo), f2(.d(1, "W")$ci_hi), fmt_p(.d(1, "W")$p),
+            .m("HighA", "R"), .m("LowA", "R"), fmt_p(.d(1, "R")$p)),
+    sprintf("In Study 2 the anxious and calm personas %s in warmth (%.3f vs %.3f; diff %s [%s, %s], %s) and %s in anxious/aversive affect (%.3f vs %.3f, %s). ",
+            ifelse(.d(2, "W")$p < .05, "differed", "did not differ reliably"), .m("HighN", "W"), .m("LowN", "W"), f2(.d(2, "W")$diff), f2(.d(2, "W")$ci_lo), f2(.d(2, "W")$ci_hi), fmt_p(.d(2, "W")$p),
+            ifelse(.d(2, "A")$p < .05, "differed", "did not differ reliably"), .m("HighN", "A"), .m("LowN", "A"), fmt_p(.d(2, "A")$p)),
+    sprintf("Reply length %s by persona in Study 1 (%.1f vs %.1f words, %s) and %s in Study 2 (%.1f vs %.1f, %s). W and R are strongly negatively correlated across participants (r = %s), so warmth and low resistance cannot be told apart here.\n",
+            ifelse(.d(1, "words")$p < .05, "differed", "did not differ reliably"),
+            .m("HighA", "words"), .m("LowA", "words"), fmt_p(.d(1, "words")$p),
+            ifelse(.d(2, "words")$p < .05, "differed", "did not differ reliably"), .m("HighN", "words"), .m("LowN", "words"), fmt_p(.d(2, "words")$p),
+            f2(cor(TC$W, TC$R))))
+```
+
+## 6.2 Closeness: the Study x Condition interaction with and without the overall impression
+
+**What this asks.** Section 2 found that the warm-vs-cold effect on bonding was larger than the anxious-vs-calm effect. If bonding follows one overall impression of Sylva, then comparing people with the same impression should remove that gap, while other post-chat ratings (placebos) should not.
+
+**Model.** For PSR and EC, $y = b_0 + b_1\,\text{cond} + b_2\,\text{study} + b_3\,(\text{cond}\times\text{study}) + b_4\,v_c + b_5\,(v_c\times\text{study}) + e$, coded as in section 2, so $b_3$ is the interaction (Study 1 high-low minus Study 2 high-low). $v_c$ is the adjuster centred within study; its slope may differ by study. The baseline row omits $v$. For W and R a second row ("main effect") enters $v$ without the $\times$ study term, as in the pilot's tone lane. HC3 SEs, t on the residual df.
+
+Adjusters:
+
+- **G**: overall impression, mean of the five TIPI-Bot trait ratings (1-7).
+- **G_halo**: G without the manipulated trait (agreeableness in Study 1, emotional stability in Study 2). This definition was chosen after the pilot saw that G over-predicted Study 2.
+- **G leave-one-out**: G without each trait in turn.
+- **Text-predicted G (Ghat)**: G predicted from Sylva's replies only (W, A, length L, plus a study intercept), out of fold: 10 folds, assigned once at random with the section seed (42). A participant's own ratings are never used to predict their Ghat. The fold split differs from the pilot's (Python KFold, random_state = 100), so this row differs from the pilot (pilot reference values, not results: PSR -0.04, p = .90; EC 0.19). How much the split matters is computed here: across `r GHAT_REP` other random fold splits (seed `r GHAT_REP_SEED`), the PSR interaction adjusted for text-predicted G ranged from `r f2(min(ghat_rep[, "psr"]))` to `r f2(max(ghat_rep[, "psr"]))` (EC: `r f2(min(ghat_rep[, "ec"]))` to `r f2(max(ghat_rep[, "ec"]))`; out-of-fold R^2 `r f2(min(ghat_rep[, "r2"]))` to `r f2(max(ghat_rep[, "r2"]))`). The per-split values are in `twocalc_ghat_fold_sensitivity.csv`; the primary Ghat row in the table below uses the seed-42 split only.
+- **Placebo ratings**: moral agency, moral patiency, experience-taking (`et_total`; the pilot brief calls it "empathy"), and trust.
+- **Tone probes**: W and R.
+
+This is **adjustment, not mediation**. All adjusters except Ghat, W and R were rated after the chat, alongside bonding, so a shrinking interaction is consistent with the account but does not identify a causal path, and a non-significant adjusted interaction is not evidence that it is zero. Ghat, W and R are not ratings, but they come from Sylva's replies within a conversation the participant co-produces (in the pilot, what users wrote explained most of the within-condition variation in W, and turn-to-turn influence ran in both directions), so adjusting for them does not identify the direction of the association either.
+
+```{r tc-int, compute = TRUE}
+# out-of-fold text-predicted impression
+set.seed(42)
+tc_folds <- sample(rep(1:10, length.out = nrow(TC)))
+TC$Ghat <- NA_real_
+for (k in 1:10) {
+  tr <- tc_folds != k
+  fk <- lm(G ~ factor(study) + W + A + L, data = TC[tr, ])
+  TC$Ghat[!tr] <- predict(fk, newdata = TC[!tr, ])
+}
+ghat_r2 <- 1 - sum((TC$G - TC$Ghat)^2) / sum((TC$G - mean(TC$G))^2)
+
+for (tr_name in TRAITS) {                # leave-one-trait-out impressions
+  keep <- setdiff(TRAITS, tr_name)
+  TC[[paste0("G_no_", tr_name)]] <- rowMeans(TC[, paste0("tipi_bot_", keep)])
+}
+
+ADJ <- tibble::tribble(
+  ~adjuster,          ~label,                                         ~type,
+  "none",             "None (unadjusted, as in section 2)",           "baseline",
+  "G",                "Overall impression G",                         "impression",
+  "G_halo",           "G without the manipulated trait (G_halo)",     "impression",
+  "Ghat",             "Text-predicted G (out of fold)",               "impression (text only)",
+  "G_no_extra",       "G without extraversion",                       "impression, leave one out",
+  "G_no_agree",       "G without agreeableness",                      "impression, leave one out",
+  "G_no_consc",       "G without conscientiousness",                  "impression, leave one out",
+  "G_no_emostab",     "G without emotional stability",                "impression, leave one out",
+  "G_no_open",        "G without openness",                           "impression, leave one out",
+  "ma_total",         "Moral agency",                                 "placebo rating",
+  "mp_total",         "Moral patiency",                               "placebo rating",
+  "et_total",         "Experience-taking ('empathy' in the brief)",   "placebo rating",
+  "trust_total",      "Trust",                                        "placebo rating",
+  "W",                "Expressed warmth W",                           "tone probe",
+  "R",                "Resistance R",                                 "tone probe"
+)
+
+tc_int <- bind_rows(lapply(c("psr_total", "ec_total"), function(dv) {
+  bind_rows(lapply(seq_len(nrow(ADJ)), function(i) {
+    v <- ADJ$adjuster[i]
+    specs <- if (v == "none") "none" else if (v %in% c("W", "R")) c("within-study slope", "main effect") else "within-study slope"
+    bind_rows(lapply(specs, function(sp) {
+      d <- TC; d$y <- d[[dv]]
+      if (v != "none") d$vc <- d[[v]] - ave(d[[v]], d$study)
+      f <- switch(sp, "none" = y ~ cond * study_c,
+                  "within-study slope" = y ~ cond * study_c + vc * study_c,
+                  "main effect" = y ~ cond * study_c + vc)
+      fit <- lm(f, data = d)
+      r_s <- if (v == "none") c(NA, NA) else sapply(1:2, function(s) cor(d[[v]][d$study == s], d$y[d$study == s]))
+      cbind(data.frame(outcome = dv, adjuster = v, label = ADJ$label[i], type = ADJ$type[i], spec = sp,
+                       n = nobs(fit)),
+            tc_hc3(fit, "cond:study_c"),
+            data.frame(r_adjuster_outcome_s1 = r_s[1], r_adjuster_outcome_s2 = r_s[2]))
+    }))
+  }))
+}))
+
+# Fold-split sensitivity of the Ghat row: 20 other random 10-fold splits (own seed, 2026).
+# Run after tc_int is built; the RNG state is restored afterwards so nothing downstream changes.
+GHAT_REP <- 20; GHAT_REP_SEED <- 2026
+.rng_saved <- get(".Random.seed", envir = globalenv())
+set.seed(GHAT_REP_SEED)
+ghat_rep <- t(sapply(seq_len(GHAT_REP), function(r) {
+  f  <- sample(rep(1:10, length.out = nrow(TC)))
+  stopifnot(!identical(f, tc_folds))
+  gh <- numeric(nrow(TC))
+  for (k in 1:10) {
+    tr <- f != k
+    gh[!tr] <- predict(lm(G ~ factor(study) + W + A + L, data = TC[tr, ]), newdata = TC[!tr, ])
+  }
+  d <- TC; d$vc <- gh - ave(gh, d$study)
+  c(r2  = 1 - sum((TC$G - gh)^2) / sum((TC$G - mean(TC$G))^2),
+    psr = unname(coef(lm(psr_total ~ cond * study_c + vc * study_c, data = d))[["cond:study_c"]]),
+    ec  = unname(coef(lm(ec_total  ~ cond * study_c + vc * study_c, data = d))[["cond:study_c"]]))
+}))
+assign(".Random.seed", .rng_saved, envir = globalenv())
+```
+
+```{r tc-int-table}
+tc_int %>%
+  transmute(Outcome = OUT_LABEL[outcome], Adjuster = label, Type = type, Spec = spec,
+            `Interaction b [95% CI]` = sprintf("%s [%s, %s]", f2(b), f2(lo), f2(hi)),
+            t = f2(t), p = fmt_p(p, FALSE),
+            `r with outcome (S1 / S2)` = ifelse(is.na(r_adjuster_outcome_s1), "",
+                                                sprintf("%s / %s", f2(r_adjuster_outcome_s1), f2(r_adjuster_outcome_s2)))) %>%
+  kable(caption = sprintf("Study x Condition interaction (b = S1 high-low minus S2 high-low) before and after adjustment. HC3, df = %d (baseline). Exploratory, post hoc.",
+                          tc_int$df[1]), row.names = FALSE)
+```
+
+```{r tc-int-text, echo = FALSE, results = "asis"}
+for (dv in c("psr_total", "ec_total")) {
+  x  <- tc_int %>% filter(outcome == dv)
+  g  <- function(a, sp = "within-study slope") x[x$adjuster == a & x$spec == sp, ]
+  lo <- x %>% filter(type == "impression, leave one out")
+  pl <- x %>% filter(type == "placebo rating")
+  cat(sprintf("**%s.** Unadjusted interaction b = %s [%s, %s], %s. Adjusted for G: %s [%s, %s], %s; for G_halo: %s [%s, %s], %s; for text-predicted G: %s [%s, %s], %s. Leaving any one trait out of G gives %s to %s. Placebo ratings give %s (%s). Tone probes: W %s (%s), main-effect spec %s (%s); R %s (%s), main-effect spec %s (%s).\n\n",
+              OUT_LABEL[dv],
+              f2(g("none", "none")$b), f2(g("none", "none")$lo), f2(g("none", "none")$hi), fmt_p(g("none", "none")$p),
+              f2(g("G")$b), f2(g("G")$lo), f2(g("G")$hi), fmt_p(g("G")$p),
+              f2(g("G_halo")$b), f2(g("G_halo")$lo), f2(g("G_halo")$hi), fmt_p(g("G_halo")$p),
+              f2(g("Ghat")$b), f2(g("Ghat")$lo), f2(g("Ghat")$hi), fmt_p(g("Ghat")$p),
+              f2(min(lo$b)), f2(max(lo$b)),
+              paste(sprintf("%s %s", tolower(pl$label), f2(pl$b)), collapse = ", "),
+              paste(fmt_p(pl$p), collapse = ", "),
+              f2(g("W")$b), fmt_p(g("W")$p), f2(g("W", "main effect")$b), fmt_p(g("W", "main effect")$p),
+              f2(g("R")$b), fmt_p(g("R")$p), f2(g("R", "main effect")$b), fmt_p(g("R", "main effect")$p)))
+}
+.ri <- function(a) tc_int %>% filter(outcome == "psr_total", adjuster == a, spec == "within-study slope")
+cat(sprintf("Text-predicted G is only a partial proxy for rated G (out-of-fold R^2 = %s), so its row is the least exposed to shared-method bias but also the noisiest. For PSR, trust correlates with the outcome %s than G does (r = %s / %s in Studies 1 / 2, vs %s / %s for G), yet adjusting for trust leaves an interaction of %s, while adjusting for G leaves %s. So the shrinkage is not simply a matter of adjusting for whatever correlates most with bonding.\n",
+            f2(ghat_r2), ifelse(min(.ri("trust_total")$r_adjuster_outcome_s1, .ri("trust_total")$r_adjuster_outcome_s2) >
+                                  max(.ri("G")$r_adjuster_outcome_s1, .ri("G")$r_adjuster_outcome_s2), "more strongly", "about as strongly or less"),
+            f2(.ri("trust_total")$r_adjuster_outcome_s1), f2(.ri("trust_total")$r_adjuster_outcome_s2),
+            f2(.ri("G")$r_adjuster_outcome_s1), f2(.ri("G")$r_adjuster_outcome_s2),
+            f2(.ri("trust_total")$b), f2(.ri("G")$b)))
+```
+
+## 6.3 Cross-study prediction from expressed warmth
+
+**What this asks.** If bonding follows how warmly Sylva treats people, a warmth-to-bonding slope learned in one study should predict the size of the persona effect in the other. Study 2 is the useful training study: its personas barely differ in warmth, so its slope comes from person-to-person variation, not from the manipulation. That variation is co-produced: warmer, more engaged users also tend to receive warmer replies, and turn-to-turn influence runs in both directions (in the pilot), so the slope is an association, not an effect of Sylva's tone, and a successful prediction is consistent with the account without showing that tone causes bonding. The reverse direction (Study 1 slope applied to Study 2's tiny warmth gap) cannot discriminate between models and is not shown.
+
+**Model.** In Study 2, regress the outcome on W controlling for condition (`y ~ high + W`, the primary "within-condition" estimate) and, for comparison with the pilot brief, without the condition control ("pooled"). Multiply the slope by Study 1's warm-minus-cold gap in W to get the predicted Study 1 effect, and compare it with the observed Study 1 effect. 95% percentile CIs from B = 2000 bootstrap resamples, drawn within condition in each study independently (seed 42; the same resamples for every row). R (resistance) is shown as an alternative probe. Point estimates reproduce the pilot exactly; the percentile CIs use different random draws (pilot: numpy, seed 20261001), so their limits differ by up to about .03 (pilot: predicted [0.23, 0.94] within-condition, [0.23, 0.95] pooled; gap [-0.45, 0.48]).
+
+```{r tc-xs, compute = TRUE}
+set.seed(42)
+TC1 <- TC[TC$study == 1, ]; TC2 <- TC[TC$study == 2, ]
+B_XS <- 2000
+strat_idx <- function(h) unlist(lapply(split(seq_along(h), h), function(i) i[sample.int(length(i), length(i), replace = TRUE)]),
+                                use.names = FALSE)
+IDX2 <- replicate(B_XS, strat_idx(TC2$high), simplify = FALSE)
+IDX1 <- replicate(B_XS, strat_idx(TC1$high), simplify = FALSE)
+
+xs_one <- function(dv, v, mode, i2, i1) {
+  d2 <- TC2[i2, ]; d1 <- TC1[i1, ]
+  X <- if (mode == "within-condition") cbind(1, d2$high, d2[[v]]) else cbind(1, d2[[v]])
+  slope <- .lm.fit(X, d2[[dv]])$coefficients[ncol(X)]
+  h <- d1$high == 1
+  gap <- mean(d1[[v]][h]) - mean(d1[[v]][!h])
+  obs <- mean(d1[[dv]][h]) - mean(d1[[dv]][!h])
+  c(slope = slope, gap = gap, pred = slope * gap, obs = obs)
+}
+q95 <- function(x) quantile(x, c(.025, .975), names = FALSE)
+
+tc_xs <- bind_rows(lapply(c("psr_total", "ec_total"), function(dv)
+  bind_rows(lapply(c("W", "R"), function(v)
+    bind_rows(lapply(c("within-condition", "pooled"), function(mode) {
+      est <- xs_one(dv, v, mode, seq_len(nrow(TC2)), seq_len(nrow(TC1)))
+      bs  <- t(vapply(seq_len(B_XS), function(b) xs_one(dv, v, mode, IDX2[[b]], IDX1[[b]]), numeric(4)))
+      dd  <- bs[, "pred"] - bs[, "obs"]
+      data.frame(outcome = dv, probe = v, mode = mode, train = "Study 2", test = "Study 1", B = B_XS,
+                 slope = est[["slope"]], slope_lo = q95(bs[, "slope"])[1], slope_hi = q95(bs[, "slope"])[2],
+                 s1_gap = est[["gap"]],
+                 pred = est[["pred"]], pred_lo = q95(bs[, "pred"])[1], pred_hi = q95(bs[, "pred"])[2],
+                 obs = est[["obs"]], obs_lo = q95(bs[, "obs"])[1], obs_hi = q95(bs[, "obs"])[2],
+                 diff = est[["pred"]] - est[["obs"]], diff_lo = q95(dd)[1], diff_hi = q95(dd)[2],
+                 p_diff_2s = 2 * min(mean(dd > 0), mean(dd < 0)))
+    }))))))
+```
+
+```{r tc-xs-table}
+tc_xs %>%
+  transmute(Outcome = OUT_LABEL[outcome], Probe = probe, `S2 slope` = mode,
+            `Slope [95% CI]` = sprintf("%s [%s, %s]", f2(slope), f2(slope_lo), f2(slope_hi)),
+            `S1 gap` = sprintf("%.3f", s1_gap),
+            `Predicted S1 effect` = sprintf("%s [%s, %s]", f2(pred), f2(pred_lo), f2(pred_hi)),
+            `Observed S1 effect` = sprintf("%s [%s, %s]", f2(obs), f2(obs_lo), f2(obs_hi)),
+            `Predicted - observed` = sprintf("%s [%s, %s]", f2(diff), f2(diff_lo), f2(diff_hi))) %>%
+  kable(caption = "Study 2 slope x Study 1 tone gap = predicted Study 1 persona effect (raw scale points). Stratified bootstrap, B = 2000, seed 42. Exploratory, post hoc.",
+        row.names = FALSE)
+```
+
+```{r tc-xs-text, echo = FALSE, results = "asis"}
+.w <- tc_xs %>% filter(outcome == "psr_total", probe == "W", mode == "within-condition")
+.wp <- tc_xs %>% filter(outcome == "psr_total", probe == "W", mode == "pooled")
+.rr <- tc_xs %>% filter(outcome == "psr_total", probe == "R", mode == "within-condition")
+cat(sprintf("**Interpretation.** Within Study 2, one unit of W goes with %s PSR points (controlling condition). Study 1's warm persona raised W by %.3f, so the Study 2 slope predicts a Study 1 PSR effect of %s [%s, %s]; the observed effect was %s [%s, %s] (predicted minus observed %s [%s, %s]). Without the condition control the prediction is %s [%s, %s]. The CI on the gap is wide (about +/- %s points), so the match is consistent with the account but also with predictions quite far from it. The Study 2 slope is a within-condition association in a co-produced conversation, not a causal effect. Resistance R predicts %s [%s, %s]; the two probes cannot be told apart.\n",
+            f2(.w$slope), .w$s1_gap, f2(.w$pred), f2(.w$pred_lo), f2(.w$pred_hi), f2(.w$obs), f2(.w$obs_lo), f2(.w$obs_hi),
+            f2(.w$diff), f2(.w$diff_lo), f2(.w$diff_hi), f2(.wp$pred), f2(.wp$pred_lo), f2(.wp$pred_hi),
+            f2((.w$diff_hi - .w$diff_lo) / 2), f2(.rr$pred), f2(.rr$pred_lo), f2(.rr$pred_hi)))
+```
+
+## 6.4 Responsibility: is it a separate, fixed template?
+
+**What this asks.** Is responsibility for the harm worked out on its own track? If so, the pattern of responsibility across parties should be the same in every study and persona cell, perceived mind should predict Sylva's responsibility only weakly, bonding should add nothing, and responsibility assigned to Sylva should travel with responsibility assigned to the company.
+
+**Model.**
+
+- **Item means**: the 10 party-specific liability items (company `liab_1`-`liab_5`, Sylva `liab_6`-`liab_8`, user `liab_9`-`liab_10`; 1-5) by cell, with t-based 95% CIs. `liab_1`, `liab_6`, `liab_9` share the same wording ("To what extent is ... responsible for this outcome?"); within-person $d_z$ for company - Sylva and user - Sylva on those items.
+- **Profile stability**: linear mixed model on the 10 items stacked within person, item means fixed and party-specific random person intercepts, `y ~ 0 + item + (0 + party | person)` (ML, bobyqa). Likelihood-ratio tests add item x study (10 df), then item x condition and item x condition x study (20 df). Study and condition effect coded +/-0.5.
+- **Party correlations**: correlations among the three party intercepts from the same model (REML), plus plain Pearson correlations of each person's party means.
+- **Agency**: Sylva's responsibility (`liab_6`) on perceived agency (moral agency without `ma_5`/`ma_8`, which already ask about responsibility; "ma_cap"), all variables z-scored within the sample, pooled models include study. Standardized beta with HC3 p, and the JZS Bayes factor BF10 for the agency term (`BayesFactor::lmBF`, default prior), alone and with patiency.
+- **Bonding increment**: adding PSR + EC + trust to agency + patiency (+ study): BF01 (> 1 favours no added effect), change in R^2, F-test p.
+- **Bonding -> agency**: standardized slope of agency on PSR, per study (HC3).
+
+```{r tc-resp, compute = TRUE}
+PARTY_ITEMS <- tibble::tribble(
+  ~item,     ~party,    ~role,
+  "liab_1",  "company", "responsible",
+  "liab_2",  "company", "blameworthy",
+  "liab_3",  "company", "wrong design",
+  "liab_4",  "company", "should compensate",
+  "liab_5",  "company", "negligent",
+  "liab_6",  "sylva",   "responsible",
+  "liab_7",  "sylva",   "causal contribution",
+  "liab_8",  "sylva",   "should recognize",
+  "liab_9",  "user",    "responsible",
+  "liab_10", "user",    "should know")
+
+LL <- bind_rows(lapply(seq_len(nrow(PARTY_ITEMS)), function(i)
+  data.frame(pid = paste(TC$study, TC$id, sep = "_"), study = TC$study, condition_label = TC$condition_label,
+             cell = TC$cell, study_c = TC$study_c, cond = TC$cond,
+             item = PARTY_ITEMS$item[i], party = PARTY_ITEMS$party[i], role = PARTY_ITEMS$role[i],
+             y = TC[[PARTY_ITEMS$item[i]]])))
+LL$item  <- factor(LL$item, levels = PARTY_ITEMS$item)
+LL$party <- factor(LL$party, levels = c("company", "sylva", "user"))
+
+tc_items <- LL %>%
+  group_by(item, party, role, cell, study, condition_label) %>%
+  summarise(n = n(), mean = mean(y), sd = sd(y), .groups = "drop") %>%
+  bind_rows(LL %>% group_by(item, party, role) %>%
+              summarise(cell = "Pooled", study = NA_integer_, condition_label = "all",
+                        n = n(), mean = mean(y), sd = sd(y), .groups = "drop")) %>%
+  mutate(ci_lo = mean - qt(.975, n - 1) * sd / sqrt(n), ci_hi = mean + qt(.975, n - 1) * sd / sqrt(n),
+         cell = as.character(cell)) %>%
+  arrange(item, factor(cell, levels = c(levels(TC$cell), "Pooled")))
+
+# identical-wording items, pooled: means and within-person dz
+tc_ident <- data.frame(party = c("company", "sylva", "user"), item = c("liab_1", "liab_6", "liab_9"),
+                       mean = c(mean(TC$liab_1), mean(TC$liab_6), mean(TC$liab_9)))
+tc_ident_dz <- data.frame(contrast = c("company - sylva (liab_1 - liab_6)", "user - sylva (liab_9 - liab_6)",
+                                       "user - company (liab_9 - liab_1)"),
+                          diff = c(mean(TC$liab_1 - TC$liab_6), mean(TC$liab_9 - TC$liab_6), mean(TC$liab_9 - TC$liab_1)),
+                          dz = c(mean(TC$liab_1 - TC$liab_6) / sd(TC$liab_1 - TC$liab_6),
+                                 mean(TC$liab_9 - TC$liab_6) / sd(TC$liab_9 - TC$liab_6),
+                                 mean(TC$liab_9 - TC$liab_1) / sd(TC$liab_9 - TC$liab_1)))
+sylva_lowest_all_cells <- with(TC %>% group_by(cell) %>%
+                                 summarise(c = mean(liab_1), s = mean(liab_6), u = mean(liab_9), .groups = "drop"),
+                               all(s < pmin(c, u)))
+
+# profile stability (ML) and party-intercept correlations (REML)
+ctl <- lme4::lmerControl(optimizer = "bobyqa")
+m_items <- lme4::lmer(y ~ 0 + item + (0 + party | pid), data = LL, REML = FALSE, control = ctl)
+m_study <- lme4::lmer(y ~ 0 + item + item:study_c + (0 + party | pid), data = LL, REML = FALSE, control = ctl)
+m_cond  <- lme4::lmer(y ~ 0 + item + item:study_c + item:cond + item:cond:study_c + (0 + party | pid),
+                      data = LL, REML = FALSE, control = ctl)
+cmp <- anova(m_items, m_study, m_cond)
+tc_profile <- data.frame(test = c("items only", "+ item x study", "+ item x condition (and x study)"),
+                         npar = cmp$npar, AIC = cmp$AIC, BIC = cmp$BIC, logLik = cmp$logLik,
+                         chisq = cmp$Chisq, df = cmp$Df, p = cmp$`Pr(>Chisq)`)
+
+m_reml <- lme4::lmer(y ~ 0 + item + (0 + party | pid), data = LL, REML = TRUE, control = ctl)
+re_cor <- attr(lme4::VarCorr(m_reml)$pid, "correlation")
+pm <- data.frame(company = rowMeans(TC[, paste0("liab_", 1:5)]), sylva = rowMeans(TC[, paste0("liab_", 6:8)]),
+                 user = rowMeans(TC[, paste0("liab_", 9:10)]))
+tc_partycor <- bind_rows(lapply(list(c("company", "sylva"), c("company", "user"), c("sylva", "user")), function(p)
+  data.frame(pair = paste(p, collapse = "-"),
+             source = c("model (party intercepts)", "raw party means"),
+             r = c(re_cor[paste0("party", p[1]), paste0("party", p[2])], cor(pm[[p[1]]], pm[[p[2]]])))))
+
+# agency -> Sylva responsibility, and the bonding increment
+ZV <- c("liab_6", "ma_cap", "mp_total", "psr_total", "ec_total", "trust_total")
+zsamp <- function(d) { for (v in ZV) d[[v]] <- as.numeric(scale(d[[v]])); d }
+SAMPLES <- list(S1 = zsamp(TC[TC$study == 1, ]), S2 = zsamp(TC[TC$study == 2, ]), pooled = zsamp(TC))
+bf_ratio <- function(rhs_full, rhs_red, d) {
+  full <- lmBF(reformulate(rhs_full, "liab_6"), data = d, progress = FALSE)
+  if (length(rhs_red) == 0) return(extractBF(full)$bf)
+  extractBF(full / lmBF(reformulate(rhs_red, "liab_6"), data = d, progress = FALSE))$bf
+}
+tc_agency <- bind_rows(lapply(names(SAMPLES), function(s) {
+  d <- as.data.frame(SAMPLES[[s]][, c(ZV, "study_c")])
+  st <- if (s == "pooled") "study_c" else character(0)
+  bind_rows(lapply(list(c("ma_cap"), c("ma_cap", "mp_total")), function(x) {
+    fit <- lm(reformulate(c(x, st), "liab_6"), data = d)
+    cbind(data.frame(sample = s, outcome = "liab_6", model = paste(x, collapse = " + "), term = "ma_cap", n = nobs(fit)),
+          tc_hc3(fit, "ma_cap"),
+          data.frame(R2 = summary(fit)$r.squared, BF10 = bf_ratio(c(x, st), c(setdiff(x, "ma_cap"), st), d)))
+  }))
+}))
+tc_bond <- bind_rows(lapply(names(SAMPLES), function(s) {
+  d <- as.data.frame(SAMPLES[[s]][, c(ZV, "study_c")])
+  base <- c("ma_cap", "mp_total", if (s == "pooled") "study_c")
+  add  <- c("psr_total", "ec_total", "trust_total")
+  m0 <- lm(reformulate(base, "liab_6"), d); m1 <- lm(reformulate(c(base, add), "liab_6"), d)
+  data.frame(sample = s, outcome = "liab_6", base = paste(base, collapse = " + "), added = paste(add, collapse = " + "),
+             n = nobs(m1), dR2 = summary(m1)$r.squared - summary(m0)$r.squared,
+             F_p = anova(m0, m1)$`Pr(>F)`[2], BF01 = 1 / bf_ratio(c(base, add), base, d))
+}))
+tc_bond_agency <- bind_rows(lapply(c("S1", "S2"), function(s) {
+  d <- SAMPLES[[s]]
+  cbind(data.frame(sample = s, outcome = "ma_cap", predictor = "psr_total"), tc_hc3(lm(ma_cap ~ psr_total, d), "psr_total"))
+}))
+```
+
+```{r tc-resp-tables}
+tc_items %>% filter(cell != "Pooled") %>%
+  mutate(v = sprintf("%s [%s, %s]", f2(mean), f2(ci_lo), f2(ci_hi))) %>%
+  select(item, party, role, cell, v) %>%
+  tidyr::pivot_wider(names_from = cell, values_from = v) %>%
+  left_join(tc_items %>% filter(cell == "Pooled") %>% transmute(item, Pooled = f2(mean)), by = "item") %>%
+  rename(Item = item, Party = party, Content = role) %>%
+  kable(caption = "Party-specific liability items (1-5): mean [95% CI] by cell. Exploratory.", row.names = FALSE)
+
+tc_profile %>%
+  transmute(Model = test, AIC = sprintf("%.1f", AIC), BIC = sprintf("%.1f", BIC),
+            `chi2` = ifelse(is.na(chisq), "", f2(chisq)), df = ifelse(is.na(df), "", as.character(df)),
+            p = ifelse(is.na(p), "", fmt_p(p, FALSE))) %>%
+  kable(caption = "Does the item profile change by study or condition? Likelihood-ratio tests (ML).", row.names = FALSE)
+
+bind_rows(
+  tc_agency %>% transmute(Sample = sample, Test = paste("agency -> Sylva responsible |", model),
+                          Estimate = sprintf("beta = %s [%s, %s]", f2(b), f2(lo), f2(hi)), p = fmt_p(p, FALSE),
+                          `Bayes factor` = sprintf("BF10 = %.2f", BF10)),
+  tc_bond %>% transmute(Sample = sample, Test = "add PSR + EC + trust to agency + patiency",
+                        Estimate = sprintf("dR2 = %.3f", dR2), p = fmt_p(F_p, FALSE),
+                        `Bayes factor` = sprintf("BF01 = %.1f", BF01)),
+  tc_bond_agency %>% transmute(Sample = sample, Test = "PSR -> agency",
+                               Estimate = sprintf("beta = %s [%s, %s]", f2(b), f2(lo), f2(hi)), p = fmt_p(p, FALSE),
+                               `Bayes factor` = "")) %>%
+  kable(caption = "Perceived agency, bonding and Sylva's responsibility (liab_6), standardized; HC3 p; JZS Bayes factors.",
+        row.names = FALSE)
+
+tc_partycor %>% transmute(Pair = pair, Source = source, r = f2(r)) %>%
+  kable(caption = "Correlations between the responsibility ratings of the three parties (person level).", row.names = FALSE)
+```
+
+```{r tc-resp-text, echo = FALSE, results = "asis"}
+.a  <- tc_agency %>% filter(sample == "pooled")
+.bb <- tc_bond
+.pc <- function(p, src = "model (party intercepts)") tc_partycor$r[tc_partycor$pair == p & tc_partycor$source == src]
+cat(sprintf("**Interpretation.** On the identically worded items (pooled N = %d), the user (M = %s) and the company (%s) were held more responsible than Sylva (%s); company - Sylva dz = %s, user - Sylva dz = %s. Sylva is lowest in %s. ",
+            nrow(TC), f2(tc_ident$mean[3]), f2(tc_ident$mean[1]), f2(tc_ident$mean[2]),
+            f2(tc_ident_dz$dz[1]), f2(tc_ident_dz$dz[2]),
+            if (sylva_lowest_all_cells) "all four cells" else "only some cells"),
+    sprintf("The ten-item profile did not differ by study (chi2(%d) = %s, %s) or by condition (chi2(%d) = %s, %s). ",
+            tc_profile$df[2], f2(tc_profile$chisq[2]), fmt_p(tc_profile$p[2]),
+            tc_profile$df[3], f2(tc_profile$chisq[3]), fmt_p(tc_profile$p[3])),
+    sprintf("Perceived agency predicted Sylva's responsibility weakly (pooled beta = %s, %s, BF10 = %s; with patiency controlled beta = %s, BF10 = %s). Adding bonding (PSR, EC, trust) to agency and patiency added little (pooled dR2 = %.3f, BF01 = %.1f; Study 1 BF01 = %.1f, Study 2 BF01 = %.1f), even though PSR strongly predicts perceived agency (beta = %s and %s). ",
+            f2(.a$b[.a$model == "ma_cap"]), fmt_p(.a$p[.a$model == "ma_cap"]), f2(.a$BF10[.a$model == "ma_cap"]),
+            f2(.a$b[.a$model != "ma_cap"]), f2(.a$BF10[.a$model != "ma_cap"]),
+            .bb$dR2[.bb$sample == "pooled"], .bb$BF01[.bb$sample == "pooled"],
+            .bb$BF01[.bb$sample == "S1"], .bb$BF01[.bb$sample == "S2"],
+            f2(tc_bond_agency$b[1]), f2(tc_bond_agency$b[2])),
+    sprintf("Responsibility assigned to Sylva moved with responsibility assigned to the company (party-intercept r = %s; raw party means r = %s), and responsibility assigned to the user was nearly unrelated to both (r = %s with the company, %s with Sylva). The company-Sylva correlation has rival explanations (adjacent item blocks, a general tendency to hold 'the AI side' responsible, unequal item counts), so it describes the template rather than explaining it.\n",
+            f2(.pc("company-sylva")), f2(.pc("company-sylva", "raw party means")), f2(.pc("company-user")), f2(.pc("sylva-user"))))
+```
+
+## 6.5 Distress and disclosure
+
+**What this asks.** Do participants who arrive more distressed disclose more emotion in the chat, and is that anxiety, depression, or both? (PHQ-4, taken before the chat: two anxiety items, GAD-2, and two depression items, PHQ-2; each subscale 0-6.)
+
+**Model.** Emotional self-disclosure (ESD) = share of the user's turns coded as emotional self-disclosure, in units of 10% of turns. OLS: $\text{ESD} = b_0 + b\,\text{distress} + b_2\,\text{cond} + b_3\,\text{study} + b_4 \log(\text{user words per turn}) + e$, pooled (with study) and per study, for the total score and each subscale alone, then both subscales together. Classical SEs (as in the pilot), with HC3 p as a robustness column.
+
+```{r tc-distress, compute = TRUE}
+tc_phq_desc <- TC %>% group_by(study) %>%
+  summarise(n = n(), anx_M = mean(phq4_anx), anx_SD = sd(phq4_anx), dep_M = mean(phq4_dep), dep_SD = sd(phq4_dep),
+            total_M = mean(phq4_total), total_SD = sd(phq4_total), r_anx_dep = cor(phq4_anx, phq4_dep), .groups = "drop")
+
+dis_fit <- function(d, preds, pooled) {
+  fit <- lm(reformulate(c(preds, "cond", if (pooled) "factor(study)", "logUW"), "ESD"), data = d)
+  V3  <- sandwich::vcovHC(fit, type = "HC3"); ct <- summary(fit)$coefficients
+  bind_rows(lapply(preds, function(x)
+    data.frame(predictor = x, b = ct[x, 1], se = ct[x, 2], t = ct[x, 3], df = df.residual(fit), p = ct[x, 4],
+               p_hc3 = 2 * pt(-abs(ct[x, 1] / sqrt(V3[x, x])), df.residual(fit)), n = nobs(fit))))
+}
+tc_distress <- bind_rows(
+  bind_rows(lapply(c("pooled", "S1", "S2"), function(s) {
+    d <- if (s == "pooled") TC else TC[TC$study == as.integer(sub("S", "", s)), ]
+    bind_rows(lapply(c("phq4_total", "phq4_anx", "phq4_dep"), function(x)
+      cbind(data.frame(sample = s, model = "alone"), dis_fit(d, x, s == "pooled"))),
+      cbind(data.frame(sample = s, model = "both subscales"), dis_fit(d, c("phq4_anx", "phq4_dep"), s == "pooled")))
+  })))
+```
+
+```{r tc-distress-tables}
+tc_phq_desc %>%
+  transmute(Study = study, n, `Anxiety M (SD)` = sprintf("%s (%s)", f2(anx_M), f2(anx_SD)),
+            `Depression M (SD)` = sprintf("%s (%s)", f2(dep_M), f2(dep_SD)),
+            `Total M (SD)` = sprintf("%s (%s)", f2(total_M), f2(total_SD)), `r(anxiety, depression)` = f2(r_anx_dep)) %>%
+  kable(caption = "PHQ-4 subscales (pre-chat).", row.names = FALSE)
+tc_distress %>%
+  transmute(Sample = sample, Model = model, Predictor = predictor, b = sprintf("%.3f", b), SE = sprintf("%.3f", se),
+            t = f2(t), df, p = fmt_p(p, FALSE), `p (HC3)` = fmt_p(p_hc3, FALSE)) %>%
+  kable(caption = "Distress -> emotional self-disclosure (10%-of-turns units), controlling condition, study (pooled) and user message length.",
+        row.names = FALSE)
+```
+
+```{r tc-distress-text, echo = FALSE, results = "asis"}
+.p <- function(s, m, x) tc_distress[tc_distress$sample == s & tc_distress$model == m & tc_distress$predictor == x, ]
+cat(sprintf("**Interpretation.** Pooled, each PHQ-4 point went with more emotional self-disclosure: total b = %.3f (%s), anxiety alone b = %.3f (%s), depression alone b = %.3f (%s); the per-study estimates have the same sign (anxiety %.3f and %.3f, depression %.3f and %.3f). Entered together, neither subscale is reliable on its own (anxiety b = %.3f, %s; depression b = %.3f, %s), because they correlate %s (Study 1) and %s (Study 2). Within single studies the unique subscale differs (Study 1: depression b = %.3f, %s, anxiety %s; Study 2: anxiety b = %.3f, %s, depression %s), which is what two short, highly correlated scales split by sampling noise would produce. With 2 + 2 items, depression cannot be separated from anxiety in these data.\n",
+            .p("pooled", "alone", "phq4_total")$b, fmt_p(.p("pooled", "alone", "phq4_total")$p),
+            .p("pooled", "alone", "phq4_anx")$b, fmt_p(.p("pooled", "alone", "phq4_anx")$p),
+            .p("pooled", "alone", "phq4_dep")$b, fmt_p(.p("pooled", "alone", "phq4_dep")$p),
+            .p("S1", "alone", "phq4_anx")$b, .p("S2", "alone", "phq4_anx")$b,
+            .p("S1", "alone", "phq4_dep")$b, .p("S2", "alone", "phq4_dep")$b,
+            .p("pooled", "both subscales", "phq4_anx")$b, fmt_p(.p("pooled", "both subscales", "phq4_anx")$p),
+            .p("pooled", "both subscales", "phq4_dep")$b, fmt_p(.p("pooled", "both subscales", "phq4_dep")$p),
+            f2(tc_phq_desc$r_anx_dep[1]), f2(tc_phq_desc$r_anx_dep[2]),
+            .p("S1", "both subscales", "phq4_dep")$b, fmt_p(.p("S1", "both subscales", "phq4_dep")$p),
+            fmt_p(.p("S1", "both subscales", "phq4_anx")$p),
+            .p("S2", "both subscales", "phq4_anx")$b, fmt_p(.p("S2", "both subscales", "phq4_anx")$p),
+            fmt_p(.p("S2", "both subscales", "phq4_dep")$p)))
+```
+
+## 6.6 Write
+
+```{r tc-write}
+write.csv(tone_cells,     file.path(OUT_DIR, "twocalc_tone_by_cell.csv"),          row.names = FALSE)
+write.csv(tone_diffs,     file.path(OUT_DIR, "twocalc_tone_condition_diffs.csv"),  row.names = FALSE)
+write.csv(tc_int,         file.path(OUT_DIR, "twocalc_interaction_adjusted.csv"),  row.names = FALSE)
+write.csv(tc_xs,          file.path(OUT_DIR, "twocalc_crossstudy_prediction.csv"), row.names = FALSE)
+write.csv(tc_items,       file.path(OUT_DIR, "twocalc_liability_item_means.csv"),  row.names = FALSE)
+write.csv(bind_rows(tc_ident %>% mutate(dz = NA_real_),
+                    tc_ident_dz %>% transmute(party = contrast, item = "paired contrast", mean = diff, dz)),
+          file.path(OUT_DIR, "twocalc_identical_items.csv"), row.names = FALSE)
+write.csv(data.frame(quantity = "out-of-fold R2, G predicted from W, A, L + study",
+                     folds = 10, seed = 42, n = nrow(TC), value = ghat_r2),
+          file.path(OUT_DIR, "twocalc_text_impression_fit.csv"), row.names = FALSE)
+# fold-split sensitivity of the Ghat row (own file, so the primary outputs above are unchanged)
+write.csv(data.frame(split = seq_len(GHAT_REP), seed = GHAT_REP_SEED, folds = 10, n = nrow(TC),
+                     oof_r2 = ghat_rep[, "r2"],
+                     psr_interaction_b_adj_ghat = ghat_rep[, "psr"],
+                     ec_interaction_b_adj_ghat  = ghat_rep[, "ec"]),
+          file.path(OUT_DIR, "twocalc_ghat_fold_sensitivity.csv"), row.names = FALSE)
+write.csv(tc_profile,     file.path(OUT_DIR, "twocalc_profile_tests.csv"),         row.names = FALSE)
+write.csv(bind_rows(tc_agency %>% mutate(test = "agency -> liab_6"),
+                    tc_bond_agency %>% mutate(test = "psr -> agency", model = "psr_total", term = "psr_total")),
+          file.path(OUT_DIR, "twocalc_agency_paths.csv"), row.names = FALSE)
+write.csv(tc_bond,        file.path(OUT_DIR, "twocalc_bonding_increment.csv"),     row.names = FALSE)
+write.csv(tc_partycor,    file.path(OUT_DIR, "twocalc_party_correlations.csv"),    row.names = FALSE)
+write.csv(tc_phq_desc,    file.path(OUT_DIR, "twocalc_phq4_descriptives.csv"),     row.names = FALSE)
+write.csv(tc_distress,    file.path(OUT_DIR, "twocalc_distress_disclosure.csv"),   row.names = FALSE)
+```
+
+# 7. Files written
+
+```{r files-written}
+written <- c("cross_study_interactions.csv", "liability_levels.csv", "liability_levels_by_condition.csv",
+             "responsibility_items_tests.csv", "responsibility_items_by_condition.csv",
+             "indiv_diff_grid.csv", "indiv_diff_pooled.csv", "indiv_diff_replicated.csv",
+             "indiv_diff_descriptives.csv")
+fi <- file.info(file.path(OUT_DIR, written))
+kable(data.frame(file = written, bytes = fi$size,
+                 md5 = unname(tools::md5sum(file.path(OUT_DIR, written)))),
+      caption = paste("Outputs in", OUT_DIR), row.names = FALSE)
+written_tc <- sort(list.files(OUT_DIR, pattern = "^twocalc_.*\\.csv$"))
+kable(data.frame(file = written_tc, bytes = file.info(file.path(OUT_DIR, written_tc))$size,
+                 md5 = unname(tools::md5sum(file.path(OUT_DIR, written_tc)))),
+      caption = "Section 6 outputs (exploratory, post hoc)", row.names = FALSE)
+```
+
+# 8. Session info
+
+```{r session}
+sessionInfo()
+```
+
+---
+
+*End of cross-study notebook.*

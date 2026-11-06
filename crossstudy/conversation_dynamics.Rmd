@@ -1,0 +1,632 @@
+---
+title: "Conversation Dynamics: Studies 1 and 2"
+subtitle: "How the chats moved over 10 minutes, and which conversation features went with the end-of-study ratings (exploratory, correlational)"
+author: "DGK Lab — UCLA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+params:
+  out_dir: "<PROJECT_ROOT>/Analysis/CrossStudy/outputs_dynamics"
+  tone_file: "<PROJECT_ROOT>/Analysis/CrossStudy/measurement/bot_turn_tone_probes.csv"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE,
+                      fig.width = 13, fig.height = 5.5, dpi = 96)
+# options(scipen = ...) is deliberately NOT set: write.csv() honours it.
+```
+
+# Overview
+
+After the talk, people asked to see **how the conversations moved** and **how that related to the ratings participants then gave**. This notebook answers both questions for Study 1 (Agreeableness: warm **HighA** vs cold **LowA** Sylva) and Study 2 (Neuroticism: anxious **HighN** vs calm **LowN** Sylva).
+
+<div style="border-left: 4px solid #404040; padding: 0.5em 1em; background: #f2f2f2;">
+**The key limit.** In Studies 1 and 2, the ratings (bonding, trust, mind perception, responsibility) were collected **once, after the chat**. So these data can show how the *conversations* changed over the 10 minutes, and how features of a conversation relate to the *end* ratings. They cannot show how the *ratings* changed during the chat. Study 3's in-chat closeness probes are designed to answer that.
+</div>
+
+**Status.** Everything here is **exploratory and correlational**. None of it was preregistered. The conversation is co-produced by the participant and Sylva, and the ratings come after it, so no association below can be read as an effect of the conversation on the ratings (or the reverse).
+
+**Inputs (read only).**
+
+- `Study {1,2}/data/derived/chat_turns_long.parquet`: one row per message (role, turn index, words, elapsed seconds). The message text column is **never loaded**.
+- `Study {1,2}/data/derived/chat_coding/chat_consensus_wide.parquet`: LLM-consensus codes per message (0/1).
+- `CrossStudy/measurement/bot_turn_tone_probes.csv`: per-reply tone scores W (warmth), R (resistance) and A (anxious affect), 0-1, shared across studies (written by `measurement/tone_probes.py`; measurement only).
+- `Study {1,2}/data/processed/composite_scores.csv`: the end-of-study ratings.
+
+**Privacy.** No message text is read, printed or written. Every output is a summary statistic over many messages and participants.
+
+Every number in the text is computed when the file renders.
+
+```{r precompute, ref.label = knitr::all_labels(compute == TRUE), include = FALSE}
+```
+
+# Plain-language summary
+
+```{r plain-summary, echo = FALSE, results = "asis"}
+cat(summary_text, sep = "")
+```
+
+# 1. Setup
+
+```{r packages, compute = TRUE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(arrow)
+  library(sandwich)
+  library(ggplot2)
+  library(knitr)
+})
+set.seed(42)   # nothing here is random; set for safety
+```
+
+```{r paths, compute = TRUE}
+ROOT <- "<PROJECT_ROOT>/Analysis"
+STUDY <- list(
+  `1` = list(dir = file.path(ROOT, "Study 1"), high = "HighA", low = "LowA",
+             high_lab = "Warm", low_lab = "Cold"),
+  `2` = list(dir = file.path(ROOT, "Study 2"), high = "HighN", low = "LowN",
+             high_lab = "Anxious", low_lab = "Calm"))
+OUT_DIR <- params$out_dir
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+cat("Writing outputs to:", OUT_DIR, "\n")
+```
+
+```{r helpers, compute = TRUE}
+norm_id <- function(x) sub("^0+", "", trimws(as.character(x)))
+f1 <- function(x) sprintf("%.1f", x)
+f2 <- function(x) sprintf("%.2f", x)
+sgn1 <- function(x) ifelse(x >= 0, sprintf("+%.1f", x), sprintf("%.1f", x))
+sgn2 <- function(x) ifelse(x >= 0, sprintf("+%.2f", x), sprintf("%.2f", x))
+fmt_p <- function(p, lead = TRUE) {
+  out <- ifelse(p < .001, "< .001", sub("^0", "", sprintf("%.3f", p)))
+  if (lead) ifelse(p < .001, paste("p", out), paste("p =", out)) else out
+}
+mean_ci <- function(x) {
+  x <- x[!is.na(x)]; n <- length(x); m <- mean(x); se <- sd(x) / sqrt(n)
+  data.frame(mean = m, ci_lo = m - qt(.975, n - 1) * se, ci_hi = m + qt(.975, n - 1) * se, n = n)
+}
+hc3_p <- function(fit, term) {
+  V <- sandwich::vcovHC(fit, type = "HC3")
+  t <- coef(fit)[term] / sqrt(V[term, term])
+  unname(2 * pt(-abs(t), df.residual(fit)))
+}
+zs <- function(x) as.numeric(scale(x))
+fmt_q <- function(q) sub("^p", "q", fmt_p(q))
+
+OUTCOMES <- c(psr_total = "Parasocial bond", ec_total = "Emotional connection",
+              trust_total = "Trust", ma_total = "Moral agency", mp_total = "Moral patiency",
+              liab_corp = "Liability: company", liab_chat = "Liability: Sylva",
+              liab_user = "Liability: user", liab_harm = "Harm severity")
+```
+
+**Talk figure style.** Grayscale; labels 16 pt or larger. Study 1 = black circles, Study 2 = gray squares. High-trait persona (warm, anxious) = dark fill `#404040`, solid line; low-trait persona (cold, calm) = light fill `#C4C4C4` with an outline, dashed line. Figures are written as PNG (300 dpi) and SVG.
+
+```{r theme, compute = TRUE}
+CELL_LEV <- c("Study 1 Warm", "Study 1 Cold", "Study 2 Anxious", "Study 2 Calm")
+CELL_SHAPE <- c(21, 21, 22, 22); CELL_FILL <- c("#404040", "#C4C4C4", "#404040", "#C4C4C4")
+CELL_COL <- c("black", "black", "#7F7F7F", "#7F7F7F"); CELL_LT <- c("solid", "22", "solid", "22")
+names(CELL_SHAPE) <- names(CELL_FILL) <- names(CELL_COL) <- names(CELL_LT) <- CELL_LEV
+
+theme_talk <- function() {
+  theme_classic(base_size = 18) +
+    theme(axis.text = element_text(size = 16, colour = "black"),
+          axis.title = element_text(size = 18), strip.text = element_text(size = 18, face = "bold"),
+          strip.background = element_blank(), legend.text = element_text(size = 16),
+          legend.title = element_blank(), legend.position = "bottom",
+          legend.key.width = unit(2.2, "lines"), plot.title = element_text(size = 20, face = "bold"),
+          plot.caption = element_text(size = 16, hjust = 0, colour = "#404040"),
+          panel.grid.major.y = element_line(colour = "#E6E6E6", linewidth = 0.4))
+}
+scale_cells <- function() list(
+  scale_shape_manual(values = CELL_SHAPE, drop = TRUE),
+  scale_fill_manual(values = CELL_FILL, drop = TRUE),
+  scale_colour_manual(values = CELL_COL, drop = TRUE),
+  scale_linetype_manual(values = CELL_LT, drop = TRUE))
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(OUT_DIR, paste0(name, ".png")), p, width = w, height = h, dpi = 300,
+         device = ragg::agg_png, bg = "white")
+  ggsave(file.path(OUT_DIR, paste0(name, ".svg")), p, width = w, height = h,
+         device = svglite::svglite, bg = "white")
+  invisible(p)
+}
+```
+
+# 2. Load and join
+
+**Time axis.** Every chat ran for about 10 minutes. The turn file's `elapsed_ms` column is in **seconds** from Sylva's opening message (its maximum is just under 600; checked below). Each message is placed in one of five 2-minute blocks (0-2, 2-4, 4-6, 6-8, 8-10 min). Using clock time rather than turn number puts conversations of different lengths on one axis. (The earlier F13 talk figure split each conversation into halves by turn count instead; the two splits answer the same question.)
+
+```{r load, compute = TRUE}
+BOT_CODES  <- list(`1` = c("expressed_warmth", "resistance_or_disagreement", "mirroring_user_emotion"),
+                   `2` = c("expressed_anxiety", "calm_stability", "mirroring_user_emotion"))
+USER_CODES <- c("emotional_self_disclosure", "bonding_language", "challenging_sylva")
+TURN_COLS  <- c("sona_id", "condition_label", "turn_idx", "role", "n_words", "elapsed_ms")  # no text
+
+tone <- read.csv(params$tone_file, colClasses = c(sona_id = "character"))
+tone$id <- norm_id(tone$sona_id)
+
+load_study <- function(s) {
+  S  <- STUDY[[as.character(s)]]
+  tl <- as.data.frame(read_parquet(file.path(S$dir, "data/derived/chat_turns_long.parquet"),
+                                   col_select = all_of(TURN_COLS)))
+  cw <- as.data.frame(read_parquet(file.path(S$dir, "data/derived/chat_coding/chat_consensus_wide.parquet")))
+  cs <- read.csv(file.path(S$dir, "data/processed/composite_scores.csv"), colClasses = c(sona_id = "character"))
+  tl$id <- norm_id(tl$sona_id); cw$id <- norm_id(cw$sona_id); cs$id <- norm_id(cs$sona_id)
+  stopifnot(!anyDuplicated(cs$id), !anyDuplicated(tl[, c("id", "turn_idx")]),
+            setequal(unique(tl$id), cs$id), setequal(unique(cw$id), cs$id),
+            max(tl$elapsed_ms) < 600, min(tl$elapsed_ms) >= 0)
+  turns <- tl %>%
+    left_join(cw[, c("id", "turn_idx", "role_normalized", BOT_CODES[[as.character(s)]], USER_CODES)],
+              by = c("id", "turn_idx")) %>%
+    left_join(cs[, c("id", "condition_label")] %>% rename(cond_cs = condition_label), by = "id")
+  stopifnot(all(turns$condition_label == turns$cond_cs),
+            all((turns$role == "assistant") == (turns$role_normalized == "bot")))
+  ts <- tone[tone$study == s, c("id", "turn_idx", "W", "R", "A")]
+  bot <- turns %>% filter(role == "assistant") %>% left_join(ts, by = c("id", "turn_idx"))
+  stopifnot(nrow(bot) == nrow(ts), !anyNA(bot[, c("W", "R", "A", BOT_CODES[[as.character(s)]])]))
+  usr <- turns %>% filter(role == "user")
+  stopifnot(!anyNA(usr[, USER_CODES]))
+  lab <- function(cl) paste("Study", s, ifelse(cl == S$high, S$high_lab, S$low_lab))
+  fin <- function(d) d %>% select(-any_of(c("sona_id", "cond_cs"))) %>% mutate(study = s, high = as.integer(condition_label == S$high),
+                                  cell = factor(lab(condition_label), levels = CELL_LEV),
+                                  minute = elapsed_ms / 60,
+                                  block = pmin(floor(elapsed_ms / 120), 4) + 1)
+  list(bot = fin(bot), usr = fin(usr),
+       rat = cs[, c("id", "condition_label", names(OUTCOMES))] %>%
+         mutate(study = s, high = as.integer(condition_label == S$high),
+                cell = factor(lab(condition_label), levels = CELL_LEV)))
+}
+L   <- lapply(1:2, load_study)
+BOT <- bind_rows(lapply(L, `[[`, "bot")); USR <- bind_rows(lapply(L, `[[`, "usr"))
+RAT <- bind_rows(lapply(L, `[[`, "rat"))
+BLOCK_LAB <- c("0-2", "2-4", "4-6", "6-8", "8-10")
+
+n_tab <- RAT %>% count(cell, name = "participants") %>%
+  left_join(BOT %>% count(cell, name = "Sylva_replies"), by = "cell") %>%
+  left_join(USR %>% count(cell, name = "user_messages"), by = "cell")
+kable(n_tab, caption = "Participants and messages by cell")
+cat(sprintf("Max elapsed time: %.1f s. Participants with no Sylva reply in a 2-min block: %d of %d person-blocks.\n",
+            max(BOT$elapsed_ms),
+            nrow(RAT) * 5 - nrow(distinct(BOT, study, id, block)), nrow(RAT) * 5))
+```
+
+# 3. How the conversations moved
+
+## 3.1 What this asks
+
+Within each persona, did Sylva's tone and the participant's behavior change from the start to the end of the 10-minute chat?
+
+**Measures, per message.**
+
+- Sylva's replies: tone probes W (warmth), R (resistance) and A (anxious affect), each 0-1; the LLM-consensus codes for the manipulated trait (Study 1: expressed warmth, resistance or disagreement; Study 2: expressed anxiety, calm stability) and for mirroring the user's emotion (both studies); words per reply.
+- Participants' messages: LLM-consensus codes for emotional self-disclosure, bonding language and challenging Sylva; words per message.
+
+## 3.2 Model
+
+- **Block means.** For each participant, the mean of a measure within each 2-minute block; then the mean across participants within cell, with a t-based 95% CI. Binary codes are shown as percentages.
+- **Change over the chat.** For each participant, an OLS slope of the measure on elapsed time, scaled so that it equals the **fitted change from minute 0 to minute 10** (percentage points for codes; probe units for W, R and A; words for length). Within each cell, a one-sample t test of the mean change against 0 (dz = mean / SD). Within each study, the high-minus-low persona difference in change (Welch t). BH-FDR across all change tests in this section. A participant contributes a slope only when they have at least three messages of that type.
+
+```{r traj, compute = TRUE}
+MEAS <- bind_rows(
+  data.frame(var = c("W", "R", "A"), side = "bot", study = NA, pct = FALSE,
+             label = c("Warmth (W)", "Resistance (R)", "Anxious affect (A)")),
+  data.frame(var = "n_words", side = "bot", study = NA, pct = FALSE, label = "Sylva: words per reply"),
+  data.frame(var = c("expressed_warmth", "resistance_or_disagreement"), side = "bot", study = 1, pct = TRUE,
+             label = c("% replies coded warm", "% replies coded resistant")),
+  data.frame(var = c("expressed_anxiety", "calm_stability"), side = "bot", study = 2, pct = TRUE,
+             label = c("% replies coded anxious", "% replies coded calm")),
+  data.frame(var = "mirroring_user_emotion", side = "bot", study = NA, pct = TRUE,
+             label = "% replies mirroring user emotion"),
+  data.frame(var = USER_CODES, side = "user", study = NA, pct = TRUE,
+             label = c("Emotional self-disclosure", "Bonding language", "Challenging Sylva")),
+  data.frame(var = "n_words", side = "user", study = NA, pct = FALSE, label = "User: words per message"))
+MEAS$key <- paste(MEAS$side, MEAS$var, sep = ":")
+
+long_meas <- function(m) {
+  d <- if (m$side == "bot") BOT else USR
+  if (!is.na(m$study)) d <- d[d$study == m$study, ]
+  d$value <- d[[m$var]] * ifelse(m$pct, 100, 1)
+  d[, c("study", "id", "cell", "high", "block", "minute", "value")]
+}
+
+block_means <- bind_rows(lapply(seq_len(nrow(MEAS)), function(i) {
+  m <- MEAS[i, ]
+  long_meas(m) %>% group_by(study, cell, id, block) %>% summarise(v = mean(value), .groups = "drop") %>%
+    group_by(study, cell, block) %>% group_modify(~ mean_ci(.x$v)) %>% ungroup() %>%
+    mutate(key = m$key, side = m$side, measure = m$var, label = m$label, block_label = BLOCK_LAB[block])
+}))
+
+person_slopes <- bind_rows(lapply(seq_len(nrow(MEAS)), function(i) {
+  m <- MEAS[i, ]
+  long_meas(m) %>% group_by(study, cell, high, id) %>%
+    summarise(n_msg = n(),
+              change = if (n() >= 3 && var(minute) > 0) unname(coef(lm(value ~ I(minute / 10)))[2]) else NA_real_,
+              level = mean(value), .groups = "drop") %>%
+    mutate(key = m$key, side = m$side, measure = m$var, label = m$label)
+}))
+
+traj_within <- person_slopes %>% filter(!is.na(change)) %>%
+  group_by(key, side, measure, label, study, cell) %>%
+  summarise(n = n(), mean_level = mean(level), mean_change_0_to_10min = mean(change),
+            sd_change = sd(change),
+            ci_lo = mean(change) - qt(.975, n() - 1) * sd(change) / sqrt(n()),
+            ci_hi = mean(change) + qt(.975, n() - 1) * sd(change) / sqrt(n()),
+            t = mean(change) / (sd(change) / sqrt(n())), df = n() - 1,
+            p = 2 * pt(-abs(t), df), dz = mean(change) / sd(change),
+            pct_declined = 100 * mean(change < 0), .groups = "drop") %>%
+  mutate(test = "change within cell (one-sample t)", contrast = as.character(cell))
+
+traj_between <- person_slopes %>% filter(!is.na(change)) %>%
+  group_by(key, side, measure, label, study) %>%
+  group_modify(~ {
+    hi <- .x$change[.x$high == 1]; lo <- .x$change[.x$high == 0]
+    tt <- t.test(hi, lo, var.equal = FALSE)
+    data.frame(n = length(hi) + length(lo), mean_change_0_to_10min = mean(hi) - mean(lo),
+               ci_lo = tt$conf.int[1], ci_hi = tt$conf.int[2], t = unname(tt$statistic),
+               df = unname(tt$parameter), p = tt$p.value)
+  }) %>% ungroup() %>%
+  mutate(test = "high minus low persona, difference in change (Welch)",
+         contrast = ifelse(study == 1, "Warm - Cold", "Anxious - Calm"))
+
+traj_tests <- bind_rows(traj_within, traj_between) %>%
+  mutate(q_bh = p.adjust(p, "BH"), status = "exploratory") %>%
+  select(test, side, measure, label, study, contrast, n, mean_level, mean_change_0_to_10min,
+         sd_change, ci_lo, ci_hi, t, df, p, q_bh, dz, pct_declined, status) %>%
+  arrange(side, measure, study, test, contrast)
+
+bm <- function(k, cl, b) block_means$mean[block_means$key == k & block_means$cell == cl & block_means$block == b]
+tw <- function(k, cl) traj_within[traj_within$key == k & traj_within$cell == cl, ]
+tb <- function(k, s) traj_between[traj_between$key == k & traj_between$study == s, ]
+```
+
+## 3.3 Results
+
+```{r traj-show}
+kable(traj_tests %>% filter(test != "high minus low persona, difference in change (Welch)") %>%
+        transmute(measure = label, cell = contrast, n, level = f2(mean_level),
+                  change_0_10 = sgn2(mean_change_0_to_10min),
+                  CI = sprintf("[%s, %s]", f2(ci_lo), f2(ci_hi)), dz = f2(dz),
+                  p = fmt_p(p, FALSE), q = fmt_p(q_bh, FALSE), `% declined` = f1(pct_declined)),
+      caption = "Change from minute 0 to 10, within cell (exploratory)")
+kable(traj_tests %>% filter(test == "high minus low persona, difference in change (Welch)") %>%
+        transmute(measure = label, contrast, diff_change = sgn2(mean_change_0_to_10min),
+                  CI = sprintf("[%s, %s]", f2(ci_lo), f2(ci_hi)), t = f2(t), df = f1(df),
+                  p = fmt_p(p, FALSE), q = fmt_p(q_bh, FALSE)),
+      caption = "Does the change differ between personas? (exploratory)")
+```
+
+## 3.4 Figures
+
+```{r fig-traj, compute = TRUE}
+pd <- position_dodge(width = 0.35)
+traj_plot <- function(keys, ncol = length(keys), ylab = NULL, facet_lab = NULL) {
+  d <- block_means %>% filter(key %in% keys) %>%
+    mutate(panel = factor(if (is.null(facet_lab)) label else facet_lab[key],
+                          levels = unique(if (is.null(facet_lab)) MEAS$label[match(keys, MEAS$key)] else facet_lab[keys])),
+           x = 2 * block - 1)
+  ggplot(d, aes(x, mean, group = cell, shape = cell, fill = cell, colour = cell, linetype = cell)) +
+    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0, position = pd, linewidth = 0.6, linetype = "solid") +
+    geom_line(position = pd, linewidth = 1) +
+    geom_point(position = pd, size = 3.6, stroke = 1.1) +
+    facet_wrap(~ panel, ncol = ncol, scales = "free_y") +
+    scale_x_continuous(breaks = c(1, 3, 5, 7, 9), labels = BLOCK_LAB) +
+    scale_cells() + labs(x = "Minute of the chat", y = ylab) + theme_talk()
+}
+
+fig1 <- traj_plot(c("bot:W", "bot:R", "bot:A"), ylab = "Mean probe score (0-1)") +
+  labs(title = "Sylva's tone over the 10-minute chat",
+       caption = "Per-reply tone probes; participant means within 2-min blocks, 95% CIs. Exploratory.")
+save_fig(fig1, "fig_dyn1_sylva_tone", 15, 6.5)
+
+fig2_dat <- c("bot:expressed_warmth", "bot:resistance_or_disagreement",
+              "bot:expressed_anxiety", "bot:calm_stability")
+fig2 <- traj_plot(fig2_dat, ncol = 4, ylab = "% of Sylva's replies") +
+  labs(title = "The manipulated trait over the chat (LLM-coded)",
+       caption = "Study 1: warm vs cold Sylva. Study 2: anxious vs calm Sylva. 95% CIs. Exploratory.")
+save_fig(fig2, "fig_dyn2_trait_expression", 17, 6.5)
+
+fig3 <- traj_plot(paste0("user:", USER_CODES), ylab = "% of participant messages") +
+  labs(title = "What participants did over the chat (LLM-coded)",
+       caption = "Participant means within 2-min blocks, 95% CIs. Exploratory.")
+save_fig(fig3, "fig_dyn3_participant_behavior", 15, 6.5)
+```
+
+```{r fig-traj-show, fig.width = 15, fig.height = 6.5}
+fig1; fig3
+```
+
+```{r fig-traj-show2, fig.width = 17, fig.height = 6.5}
+fig2
+```
+
+# 4. Conversation features and the end ratings
+
+## 4.1 What this asks
+
+Did participants whose conversations looked a certain way (overall, or in how they changed) give different ratings afterward? Three questions:
+
+1. **Level.** Is the whole-chat average of a feature associated with the end rating?
+2. **Movement.** Is the change over the chat (minute 0 to 10, as in section 3) associated with the end rating, over and above the feature's average level?
+3. **Start vs end.** When the first third (minutes 0-3.3) and the last third (minutes 6.7-10) of the chat are entered together, does the end go with the rating more strongly than the start?
+
+## 4.2 Model
+
+Per study, complete cases, outcome and features z-scored within study, condition coded +0.5 high-trait / -0.5 low-trait persona (as in section 5 of `cross_study_analyses.Rmd`):
+
+- Level: `z(rating) ~ z(level) + cond`
+- Movement: `z(rating) ~ z(change) + z(level) + cond` (the `z(change)` coefficient is reported)
+- Start vs end: `z(rating) ~ z(first third) + z(last third) + cond`; the end-minus-start difference in coefficients is tested with an HC3 contrast.
+
+Pooled (N = 274): both studies stacked, z-scored within study, with `study` and a separate condition code for each study (`cond_s1`, `cond_s2`). **Replicated** = same sign and p < .05 in both studies. BH-FDR is applied within each family (level, movement, start-vs-end) and within each of Study 1, Study 2 and pooled. HC3 p values are reported alongside.
+
+**Features.** Sylva's tone (W, R, A) and three participant behaviors (emotional self-disclosure, bonding language, challenging Sylva), all per message as in section 3. Challenging Sylva has no movement or start/end term because it is rare (see section 3).
+
+```{r person, compute = TRUE}
+FEAT <- c(`bot:W` = "Sylva warmth (W)", `bot:R` = "Sylva resistance (R)", `bot:A` = "Sylva anxious affect (A)",
+          `user:emotional_self_disclosure` = "User emotional self-disclosure",
+          `user:bonding_language` = "User bonding language",
+          `user:challenging_sylva` = "User challenging Sylva")
+FEAT_MOVE <- names(FEAT)[1:5]
+
+thirds <- bind_rows(lapply(FEAT_MOVE, function(k) {
+  m <- MEAS[MEAS$key == k, ]
+  long_meas(m) %>% mutate(third = cut(minute, c(-Inf, 10 / 3, 20 / 3, Inf), labels = c("first", "mid", "last"))) %>%
+    filter(third != "mid") %>% group_by(study, id, third) %>% summarise(v = mean(value), .groups = "drop") %>%
+    pivot_wider(names_from = third, values_from = v) %>% mutate(key = k)
+}))
+
+PF <- person_slopes %>% filter(key %in% names(FEAT)) %>% select(study, id, key, level, change) %>%
+  left_join(thirds, by = c("study", "id", "key")) %>%
+  left_join(RAT %>% select(study, id, cell, high, all_of(names(OUTCOMES))), by = c("study", "id"))
+stopifnot(nrow(distinct(PF, study, id)) == nrow(RAT))
+cat(sprintf("Participants missing a first- or last-third value, by feature: %s\n",
+            paste(sprintf("%s %d", FEAT[FEAT_MOVE],
+                          sapply(FEAT_MOVE, function(k) sum(PF$key == k & (is.na(PF$first) | is.na(PF$last))))),
+                  collapse = "; ")))
+```
+
+```{r assoc, compute = TRUE}
+fit_one <- function(d, y, family, pooled) {
+  d <- d %>% group_by(study) %>%
+    mutate(zy = zs(.data[[y]]), zl = zs(level), zc = zs(change), zf = zs(first), zla = zs(last)) %>% ungroup()
+  rhs_cond <- if (pooled) "+ study_f + cond_s1 + cond_s2" else "+ cond"
+  d <- d %>% mutate(cond = high - 0.5, study_f = factor(study),
+                    cond_s1 = ifelse(study == 1, high - 0.5, 0), cond_s2 = ifelse(study == 2, high - 0.5, 0))
+  if (family == "level")    { f <- paste("zy ~ zl", rhs_cond); terms <- "zl" }
+  if (family == "movement") { f <- paste("zy ~ zc + zl", rhs_cond); terms <- "zc" }
+  if (family == "start_end"){ f <- paste("zy ~ zf + zla", rhs_cond); terms <- c("zf", "zla") }
+  d <- d[complete.cases(d[, all.vars(as.formula(f))]), ]
+  fit <- lm(as.formula(f), data = d); ci <- confint(fit); sm <- summary(fit)$coefficients
+  out <- bind_rows(lapply(terms, function(tm) data.frame(
+    term = c(zl = "level", zc = "change (adj. level)", zf = "first third", zla = "last third")[tm],
+    beta = unname(coef(fit)[tm]), ci_lo = ci[tm, 1], ci_hi = ci[tm, 2], t = sm[tm, 3],
+    df = df.residual(fit), p = sm[tm, 4], p_hc3 = hc3_p(fit, tm), n = nrow(d))))
+  if (family == "start_end") {   # end minus start, HC3
+    V <- sandwich::vcovHC(fit, type = "HC3"); cvec <- setNames(rep(0, length(coef(fit))), names(coef(fit)))
+    cvec[c("zla", "zf")] <- c(1, -1); est <- sum(cvec * coef(fit)); se <- sqrt(drop(t(cvec) %*% V %*% cvec))
+    out <- bind_rows(out, data.frame(term = "last minus first (HC3)", beta = est,
+                                     ci_lo = est - qt(.975, df.residual(fit)) * se,
+                                     ci_hi = est + qt(.975, df.residual(fit)) * se, t = est / se,
+                                     df = df.residual(fit), p = 2 * pt(-abs(est / se), df.residual(fit)),
+                                     p_hc3 = 2 * pt(-abs(est / se), df.residual(fit)), n = nrow(d)))
+  }
+  out
+}
+
+assoc <- bind_rows(lapply(c("level", "movement", "start_end"), function(fam) {
+  keys <- if (fam == "level") names(FEAT) else FEAT_MOVE
+  bind_rows(lapply(keys, function(k) bind_rows(lapply(names(OUTCOMES), function(y) {
+    dk <- PF[PF$key == k, ]
+    bind_rows(
+      fit_one(dk[dk$study == 1, ], y, fam, FALSE) %>% mutate(sample = "Study 1"),
+      fit_one(dk[dk$study == 2, ], y, fam, FALSE) %>% mutate(sample = "Study 2"),
+      fit_one(dk, y, fam, TRUE) %>% mutate(sample = "Pooled")) %>%
+      mutate(family = fam, feature_key = k, feature = FEAT[[k]], outcome = y, outcome_label = OUTCOMES[[y]])
+  }))))
+})) %>%
+  group_by(family, sample, is_contrast = term == "last minus first (HC3)") %>%
+  mutate(q_bh = p.adjust(p, "BH")) %>% ungroup() %>% select(-is_contrast) %>%
+  mutate(status = "exploratory, correlational")
+
+rep_tab <- assoc %>% filter(sample != "Pooled") %>%
+  select(family, feature_key, outcome, term, sample, beta, p) %>%
+  pivot_wider(names_from = sample, values_from = c(beta, p)) %>%
+  mutate(replicated = sign(`beta_Study 1`) == sign(`beta_Study 2`) & `p_Study 1` < .05 & `p_Study 2` < .05) %>%
+  select(family, feature_key, outcome, term, replicated)
+assoc <- assoc %>% left_join(rep_tab, by = c("family", "feature_key", "outcome", "term")) %>%
+  select(family, sample, feature, feature_key, outcome, outcome_label, term, beta, ci_lo, ci_hi,
+         t, df, p, p_hc3, q_bh, n, replicated, status)
+```
+
+## 4.3 Results
+
+```{r assoc-show}
+show_fam <- function(fam, ttl) {
+  kable(assoc %>% filter(family == fam, sample == "Pooled") %>%
+          left_join(assoc %>% filter(family == fam, sample != "Pooled") %>%
+                      select(sample, feature_key, outcome, term, beta) %>%
+                      pivot_wider(names_from = sample, values_from = beta),
+                    by = c("feature_key", "outcome", "term")) %>%
+          transmute(feature, outcome = outcome_label, term, S1 = f2(`Study 1`), S2 = f2(`Study 2`),
+                    pooled = f2(beta), CI = sprintf("[%s, %s]", f2(ci_lo), f2(ci_hi)),
+                    p = fmt_p(p, FALSE), p_hc3 = fmt_p(p_hc3, FALSE), q = fmt_p(q_bh, FALSE),
+                    replicated = ifelse(replicated, "yes", "")),
+        caption = ttl)
+}
+show_fam("level", "Level: whole-chat feature and end rating (standardized beta, condition-adjusted)")
+show_fam("movement", "Movement: change over the chat and end rating, adjusted for level")
+show_fam("start_end", "Start vs end: first and last third entered together")
+```
+
+## 4.4 Figures
+
+```{r fig-assoc, compute = TRUE}
+grid_dat <- assoc %>% filter(sample == "Pooled", family %in% c("level", "movement")) %>%
+  mutate(row = paste0(feature, ifelse(family == "movement", ": change", "")),
+         row = factor(row, levels = rev(c(paste0(FEAT, ""), paste0(FEAT[FEAT_MOVE], ": change")))),
+         col = factor(outcome_label, levels = OUTCOMES),
+         lab = sub("^(-?)0\\.", "\\1.", sprintf("%.2f", beta)),
+         lab = paste0(lab, ifelse(replicated %in% TRUE, "†", "")),
+         sig = ifelse(q_bh < .05, "q < .05", ifelse(p < .05, "p < .05", "n.s.")))
+fig4 <- ggplot(grid_dat, aes(col, row)) +
+  geom_tile(aes(fill = abs(beta)), colour = "white", linewidth = 1) +
+  geom_tile(data = filter(grid_dat, sig == "q < .05"), fill = NA, colour = "black", linewidth = 1.3) +
+  geom_text(aes(label = lab, fontface = ifelse(sig == "n.s.", "plain", "bold"),
+                colour = abs(beta) > 0.22), size = 5.6) +
+  scale_fill_gradient(low = "white", high = "#404040", limits = c(0, 0.45), oob = scales::squish,
+                      name = "Size of\nbeta") +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "white"), guide = "none") +
+  scale_x_discrete(position = "top") +
+  labs(x = NULL, y = NULL, title = "Conversation features and end-of-study ratings (pooled, N = 274)",
+       caption = paste("Standardized beta, condition-adjusted, z within study. Bold: p < .05. Boxed: BH q < .05.",
+                       "†: same sign and p < .05 in both studies.\n\"Change\" rows are adjusted for the feature's level.",
+                       "Exploratory and correlational. Ratings were collected once, after the chat.")) +
+  theme_talk() +
+  theme(axis.text.x.top = element_text(angle = 35, hjust = 0, vjust = 0), axis.line = element_blank(),
+        plot.title.position = "plot", plot.caption.position = "plot",
+        axis.ticks = element_blank(), legend.position = "right", legend.title = element_text(size = 16),
+        panel.grid.major.y = element_blank())
+save_fig(fig4, "fig_dyn4_features_ratings_grid", 17, 10)
+
+se_dat <- assoc %>% filter(family == "start_end", sample == "Pooled",
+                           term %in% c("first third", "last third"),
+                           outcome %in% c("psr_total", "ec_total", "trust_total", "liab_chat")) %>%
+  mutate(panel = factor(feature, levels = FEAT[FEAT_MOVE]),
+         outcome_label = factor(outcome_label, levels = rev(OUTCOMES)),
+         term = factor(term, levels = c("last third", "first third")))
+fig5 <- ggplot(se_dat, aes(beta, outcome_label, fill = term, group = term)) +
+  geom_vline(xintercept = 0, colour = "#7F7F7F") +
+  geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0, linewidth = 0.7,
+                 position = position_dodge(width = 0.55)) +
+  geom_point(shape = 21, size = 4, stroke = 1.1, position = position_dodge(width = 0.55)) +
+  facet_wrap(~ panel, ncol = 5, labeller = label_wrap_gen(width = 18)) +
+  scale_fill_manual(values = c(`first third` = "white", `last third` = "#404040"),
+                    breaks = c("first third", "last third"),
+                    labels = c("First third of the chat (min 0-3.3)", "Last third (min 6.7-10)")) +
+  scale_x_continuous(breaks = c(-0.2, 0, 0.2)) +
+  labs(x = "Standardized beta (both thirds entered together)", y = NULL,
+       title = "Does the end of the chat go with the ratings more than the start?",
+       caption = "Pooled Studies 1-2 (N = 274), condition-adjusted, z within study; 95% CIs. Exploratory and correlational.") +
+  theme_talk() + theme(panel.spacing = unit(1.4, "lines"), plot.title.position = "plot",
+                       plot.caption.position = "plot")
+save_fig(fig5, "fig_dyn5_start_vs_end", 18, 7)
+```
+
+```{r fig-assoc-show, fig.width = 17, fig.height = 10}
+fig4
+```
+
+```{r fig-assoc-show2, fig.width = 18, fig.height = 7}
+fig5
+```
+
+# 5. Write
+
+```{r write, compute = TRUE}
+write.csv(block_means %>% select(side, measure, label, study, cell, block, block_label, mean, ci_lo, ci_hi, n),
+          file.path(OUT_DIR, "dyn_block_means.csv"), row.names = FALSE)
+write.csv(traj_tests, file.path(OUT_DIR, "dyn_trajectory_tests.csv"), row.names = FALSE)
+write.csv(assoc, file.path(OUT_DIR, "dyn_feature_rating_assoc.csv"), row.names = FALSE)
+```
+
+```{r summary-text, compute = TRUE}
+pp  <- function(x) paste0(f1(x), "%")
+ar  <- function(d) sprintf("%s to %s", pp(d[1]), pp(d[2]))
+k_w <- "bot:expressed_warmth"; k_a <- "bot:expressed_anxiety"; k_r <- "bot:resistance_or_disagreement"
+k_c <- "bot:calm_stability"
+desc_cell <- function(k, cl) {
+  w <- tw(k, cl)
+  sprintf("%s in minutes 0-2 to %s in minutes 8-10 (fitted change %s points, 95%% CI [%s, %s], %s, %s)",
+          pp(bm(k, cl, 1)), pp(bm(k, cl, 5)), sgn1(w$mean_change_0_to_10min), f1(w$ci_lo), f1(w$ci_hi),
+          fmt_p(w$p), fmt_q(traj_tests$q_bh[traj_tests$measure == sub("^.*:", "", k) &
+                                              traj_tests$side == sub(":.*$", "", k) &
+                                              traj_tests$contrast == cl]))
+}
+desc_probe <- function(k, cl) {
+  w <- tw(k, cl)
+  sprintf("%s to %s (change %s, %s)", f2(bm(k, cl, 1)), f2(bm(k, cl, 5)), sgn2(w$mean_change_0_to_10min), fmt_p(w$p))
+}
+sig_rows <- function(fam, smp = "Pooled") assoc %>% filter(family == fam, sample == smp, term != "last minus first (HC3)", q_bh < .05)
+lvl <- sig_rows("level"); mov <- sig_rows("movement")
+lvl_rep <- assoc %>% filter(family == "level", sample == "Pooled", replicated %in% TRUE)
+mov_any <- assoc %>% filter(family == "movement", sample == "Pooled", p < .05)
+se_c <- assoc %>% filter(family == "start_end", sample == "Pooled", term == "last minus first (HC3)")
+list_assoc <- function(d) if (nrow(d) == 0) "none" else
+  paste(sprintf("%s with %s (beta = %s, %s%s)", d$feature, tolower(d$outcome_label), sgn2(d$beta),
+                fmt_q(d$q_bh), ifelse(d$replicated %in% TRUE, ", replicated in both studies", "")), collapse = "; ")
+user_esd <- "user:emotional_self_disclosure"; user_bond <- "user:bonding_language"
+
+summary_text <- c(
+  "**The limit first.** Ratings were collected once, after the chat. These analyses show how the conversations moved and how conversation features relate to the *end* ratings, not how ratings moved during the chat (Study 3's in-chat probes will). Everything below is exploratory and correlational.\n\n",
+  "**1. The manipulated trait over the chat (LLM codes; figure 2).** ",
+  sprintf("In Study 2, the share of the anxious Sylva's replies coded anxious went from %s. The calm Sylva went from %s. ",
+          desc_cell(k_a, "Study 2 Anxious"), desc_cell(k_a, "Study 2 Calm")),
+  sprintf("The anxious persona's decline was larger (difference in change %s points, %s). ",
+          sgn1(tb(k_a, 2)$mean_change_0_to_10min), fmt_p(tb(k_a, 2)$p)),
+  sprintf("In Study 1, the warm Sylva's replies coded warm went from %s; the cold Sylva's went from %s. ",
+          desc_cell(k_w, "Study 1 Warm"), desc_cell(k_w, "Study 1 Cold")),
+  sprintf("The cold Sylva's resistance went from %s. ", desc_cell(k_r, "Study 1 Cold")),
+  sprintf("So the high-minus-low gap in the manipulated trait went from %s to %s points for anxiety (Study 2) and from %s to %s points for warmth (Study 1) between minutes 0-2 and 8-10.\n\n",
+          f1(bm(k_a, "Study 2 Anxious", 1) - bm(k_a, "Study 2 Calm", 1)), f1(bm(k_a, "Study 2 Anxious", 5) - bm(k_a, "Study 2 Calm", 5)),
+          f1(bm(k_w, "Study 1 Warm", 1) - bm(k_w, "Study 1 Cold", 1)), f1(bm(k_w, "Study 1 Warm", 5) - bm(k_w, "Study 1 Cold", 5))),
+  sprintf("**2. Sylva's tone scores (W, R, A; same probes in both studies; figure 1).** The warmth score rose over the chat in %d of the 4 personas and the anxious-affect score fell in %d of 4 (p < .05). Block means, minutes 0-2 to 8-10, and fitted change: ",
+          sum(sapply(CELL_LEV, function(cl) tw("bot:W", cl)$p < .05 & tw("bot:W", cl)$mean_change_0_to_10min > 0)),
+          sum(sapply(CELL_LEV, function(cl) tw("bot:A", cl)$p < .05 & tw("bot:A", cl)$mean_change_0_to_10min < 0))),
+  paste(sapply(CELL_LEV, function(cl) sprintf("%s: warmth %s; resistance %s; anxious affect %s.", cl,
+                                              desc_probe("bot:W", cl), desc_probe("bot:R", cl), desc_probe("bot:A", cl))),
+        collapse = " "), "\n\n",
+  "**3. What participants did (figure 3).** ",
+  paste(sapply(CELL_LEV, function(cl) sprintf("%s: emotional self-disclosure %s; bonding language %s.", cl,
+                                              desc_cell(user_esd, cl), desc_cell(user_bond, cl))), collapse = " "),
+  sprintf(" Emotional self-disclosure did not move in a straight line: its highest block was minutes %s, after which it fell, so a straight-line change understates the rise and fall.",
+          paste(sprintf("%s (%s)", sapply(CELL_LEV, function(cl) {
+            d <- block_means[block_means$key == user_esd & block_means$cell == cl, ]; d$block_label[which.max(d$mean)] }),
+            CELL_LEV), collapse = ", ")),
+  "\n\n",
+  "**4. Which conversation features went with the end ratings (figures 4 and 5; pooled, condition-adjusted, BH q < .05).** ",
+  sprintf("Whole-chat level: %s. ", list_assoc(lvl)),
+  sprintf("%d level associations had the same sign and p < .05 in both studies. ", nrow(lvl_rep)),
+  sprintf("Movement over the chat, over and above level: %s (%d of %d movement tests at uncorrected p < .05, about %s expected by chance). ",
+          list_assoc(mov), nrow(mov_any), nrow(assoc %>% filter(family == "movement", sample == "Pooled")),
+          f1(0.05 * nrow(assoc %>% filter(family == "movement", sample == "Pooled")))),
+  sprintf("Start vs end: the last third's coefficient exceeded the first third's at p < .05 in %d of %d pooled feature-by-rating pairs (q < .05 in %d) and fell below it at p < .05 in %d.\n\n",
+          sum(se_c$p < .05 & se_c$beta > 0), nrow(se_c), sum(se_c$q_bh < .05 & se_c$beta > 0), sum(se_c$p < .05 & se_c$beta < 0)),
+  "Note: the fitted change uses every message and can differ from the difference between the first and last block means.\n\n",
+  "**Caveats.** The conversation is co-produced: what participants wrote and what Sylva wrote move together, so neither can be read as driving the other or the ratings. Bonding and the other ratings came after the chat. The tone probes and LLM codes are automated measures of what the replies expressed.\n")
+```
+
+# 6. Caveats
+
+- **Ratings were measured once, after the chat.** Nothing here shows how ratings changed during the chat.
+- **Exploratory and correlational.** Not preregistered; many tests (see BH q). Associations are within condition but not causal: participants were not assigned to how their conversations went.
+- **Co-produced conversations.** Sylva's tone responds to what participants write, and vice versa. A change in Sylva's tone over time may reflect the participant's messages, the persona prompt's hold weakening over a growing context, or both.
+- **Automated measures.** The LLM-consensus codes and the embedding-based tone probes are measures of what a message expresses; their reliability is documented in `chat_reliability_table.csv` and `measurement/probe_validation.csv`.
+- **Time blocks.** Few messages per participant fall in each 2-minute block, so block means are noisy per person; the change estimates use every message.
+- **Rare codes.** Bonding language and challenging Sylva are rare in some cells, so their block means are close to zero and their change estimates are imprecise.
+
+# 7. Files written
+
+```{r files-written}
+written <- sort(list.files(OUT_DIR))
+kable(data.frame(file = written, bytes = file.info(file.path(OUT_DIR, written))$size,
+                 md5 = unname(tools::md5sum(file.path(OUT_DIR, written)))),
+      caption = paste("Outputs in", OUT_DIR), row.names = FALSE)
+```
+
+# 8. Session info
+
+```{r session}
+sessionInfo()
+```

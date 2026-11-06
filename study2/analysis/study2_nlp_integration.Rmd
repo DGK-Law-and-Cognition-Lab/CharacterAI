@@ -1,0 +1,1909 @@
+---
+title: "Study 2 — NLP Integration"
+subtitle: "Convergence analysis: chat coding, OE coding, topics, sentiment, self-report"
+author: "DGK Lab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    theme: simplex
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL KNITR OPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# echo=TRUE shows code in the rendered HTML; folded by default via YAML so
+#   readers can hide it. message/warning=FALSE keeps the report clean.
+# fig.path/cache.path keep auxiliary files inside the R project's tmp area
+#   rather than next to the .Rmd, so RStudio doesn't litter your editor.
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.width = 8,
+  fig.height= 5,
+  dpi       = 110
+)
+```
+
+# Purpose and reading guide
+
+This notebook is the **convergence step** for Study 2. It joins five signal
+sources at the participant level and asks: do the NLP-derived measures tell
+the same story as the self-report scales?
+
+The five sources:
+
+| Source | File(s) | Granularity |
+|---|---|---|
+| **Self-report scales** | `data/processed/analytic_data.csv` | 1 row / participant |
+| **OE consensus codes** | `data/derived/coding/consensus_long.parquet` | 1 row / (participant × code) |
+| **Topic membership** | `data/derived/topics/topics_per_response.parquet` | 1 row / OE response |
+| **Sentiment** | `data/derived/sentiment/sentiment_per_response.parquet` + `sentiment_per_participant.csv` | response-level + aggregated |
+| **Chat-turn features** | `data/derived/chat_coding/chat_participant_features.parquet` | 1 row / participant |
+
+<!-- FIX 2026-09-30 (I6): 'establishes' -> 'examines'; '§8 frames the dissociation' -> neutral wording matching the §8 heading -->
+**Reading order:** §2 examines manipulation fidelity across three modalities.
+§3–§6 run condition tests in each modality. §7 looks at within-participant
+cross-modal convergence. §8 summarizes manipulation vs. downstream-outcome signals. §9 saves a master
+evidence table for the consolidated doc.
+
+**This Rmd is the canonical home for NLP-side figures.** All figures it
+generates land in `outputs/integration/figures/`; the per-notebook NB04–07
+scripts produce data only (per CLAUDE.md convention).
+
+---
+
+# Setup
+
+```{r packages}
+# ─────────────────────────────────────────────────────────────────────────────
+# PACKAGE LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+# Required:
+#   tidyverse   – data manipulation + ggplot2
+#   here        – project-root-relative paths (so this Rmd works no matter
+#                 where it's knitted from)
+#   arrow       – read .parquet files
+#   broom       – tidy() / glance() for model output
+#   knitr       – kable() for HTML tables
+#   kableExtra  – kable_styling() for prettier tables
+#   scales      – percent/comma formatters
+#
+# To install missing packages, run:
+#   install.packages(c("tidyverse","here","arrow","broom","knitr","kableExtra","scales"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(arrow)       # for read_parquet()
+  library(broom)
+  library(knitr)
+  library(kableExtra)
+  library(scales)
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+# here::here() resolves to the Study 2 project root regardless of where
+# the .Rmd is knitted from. The .Rproj file at the project root anchors it.
+PROC      <- here("data", "processed")
+DERIVED   <- here("data", "derived")
+OUT_TAB   <- here("outputs", "integration", "tables")
+OUT_FIG   <- here("outputs", "integration", "figures")
+dir.create(OUT_TAB, showWarnings = FALSE, recursive = TRUE)
+dir.create(OUT_FIG, showWarnings = FALSE, recursive = TRUE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A FEW CONVENIENCE FUNCTIONS USED THROUGHOUT
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Welch's t-test by condition, returning a tidy 1-row tibble with g, CI, p.
+# Used for any continuous outcome × HighN/LowN comparison.
+# FIX 2026-09-30 (I2): the exported effect size `d` (and d_ci_lo/d_ci_hi) is now
+#   Hedges' g with its 95% CI from effectsize::hedges_g(high, low, paired = FALSE,
+#   ci = 0.95) — the identical call (default pooled SD) the core pipeline uses for
+#   the ten outcomes — instead of pooled-SD Cohen's d with a Wald CI. Welch t/df/p
+#   are unchanged. The old Cohen's d and its Wald CI are kept as extra columns
+#   (cohens_d, cohens_d_ci_lo, cohens_d_ci_hi) so nothing is lost.
+welch_d <- function(data, value_col, group_col = "condition_label",
+                    high_label = "HighN", low_label = "LowN") {
+  v <- data[[value_col]]
+  g <- data[[group_col]]
+  h <- v[g == high_label]
+  l <- v[g == low_label]
+  h <- h[!is.na(h)]; l <- l[!is.na(l)]
+  if (length(h) < 2 || length(l) < 2) return(NULL)
+  tt <- t.test(h, l, var.equal = FALSE)
+  # Cohen's d with pooled SD (kept for reference; no longer the exported `d`)  # FIX 2026-09-30 (I2): comment
+  nh <- length(h); nl <- length(l)
+  sd_pool <- sqrt(((nh - 1) * var(h) + (nl - 1) * var(l)) / (nh + nl - 2))
+  d_cohen <- (mean(h) - mean(l)) / sd_pool                                     # FIX 2026-09-30 (I2): renamed from d
+  se_d <- sqrt((nh + nl) / (nh * nl) + d_cohen^2 / (2 * (nh + nl)))            # FIX 2026-09-30 (I2): uses d_cohen
+  # FIX 2026-09-30 (I2): Hedges' g + 95% CI exactly as in the core pipeline.
+  #   suppressWarnings only silences effectsize's "'y' has only 2 unique values"
+  #   notice, which fires for sparse 0/1-like rate columns; the numeric result is
+  #   still the two-sample g (verified). tryCatch → NA if g is undefined (SD = 0).
+  gg <- tryCatch(suppressWarnings(  # FIX 2026-09-30 (I2)
+          effectsize::hedges_g(h, l, paired = FALSE, ci = 0.95)),  # FIX 2026-09-30 (I2)
+          error = function(e) NULL)                                              # FIX 2026-09-30 (I2)
+  g_est <- if (is.null(gg)) NA_real_ else gg$Hedges_g                            # FIX 2026-09-30 (I2)
+  g_lo  <- if (is.null(gg)) NA_real_ else gg$CI_low                              # FIX 2026-09-30 (I2)
+  g_hi  <- if (is.null(gg)) NA_real_ else gg$CI_high                             # FIX 2026-09-30 (I2)
+  tibble(
+    n_HighN  = nh, n_LowN = nl,
+    mean_HighN = mean(h), mean_LowN = mean(l),
+    sd_HighN = sd(h),  sd_LowN = sd(l),
+    diff   = mean(h) - mean(l),
+    t      = unname(tt$statistic),
+    df     = unname(tt$parameter),
+    p      = tt$p.value,
+    d      = g_est,                      # FIX 2026-09-30 (I2): Hedges' g (was pooled-SD Cohen's d)
+    hedges_g = g_est,                    # FIX 2026-09-30 (I2): effectsize exact-J g (was approx-J g; same meaning)
+    d_ci_lo = g_lo,                      # FIX 2026-09-30 (I2): g 95% CI (effectsize), was Wald CI of Cohen's d
+    d_ci_hi = g_hi,                      # FIX 2026-09-30 (I2): g 95% CI (effectsize), was Wald CI of Cohen's d
+    cohens_d       = d_cohen,            # FIX 2026-09-30 (I2): added — old `d` value
+    cohens_d_ci_lo = d_cohen - 1.96 * se_d,  # FIX 2026-09-30 (I2): added — old d_ci_lo value
+    cohens_d_ci_hi = d_cohen + 1.96 * se_d   # FIX 2026-09-30 (I2): added — old d_ci_hi value
+  )
+}
+
+# FIX 2026-09-30 (I1): participant-ID normalizer applied at EVERY read of an
+#   ID-bearing source. analytic_data.csv stores zero-padded IDs as text
+#   (e.g. "012345678") while the NLP-derived parquet/csv files store the same ID
+#   as a number (1234567); a plain as.character() + left_join silently dropped
+#   that participant from every chat/sentiment/OE-derived column. Numeric input
+#   is formatted without scientific notation before stripping leading zeros.
+norm_id <- function(x) {                                                          # FIX 2026-09-30 (I1)
+  x <- if (is.numeric(x)) formatC(x, format = "f", digits = 0) else as.character(x)  # FIX 2026-09-30 (I1)
+  x[x == "NA"] <- NA_character_                                                   # FIX 2026-09-30 (I1)
+  sub("^0+(?=\\d)", "", trimws(x), perl = TRUE)                                   # FIX 2026-09-30 (I1)
+}                                                                                 # FIX 2026-09-30 (I1)
+
+# FIX 2026-09-30 (I1): normalize a source's sona_id and assert that no two
+#   distinct raw IDs collapse onto the same normalized ID, and (optionally) that
+#   the source's natural key is still unique after normalization.
+normalize_ids <- function(df, source_name, key = "sona_id") {                     # FIX 2026-09-30 (I1)
+  raw_ids  <- unique(trimws(as.character(df$sona_id)))                            # FIX 2026-09-30 (I1)
+  df <- df %>% mutate(sona_id = norm_id(sona_id))                                 # FIX 2026-09-30 (I1)
+  if (length(unique(norm_id(raw_ids))) != length(raw_ids))                        # FIX 2026-09-30 (I1)
+    stop("ID normalization collapsed distinct IDs in ", source_name)              # FIX 2026-09-30 (I1)
+  if (anyNA(df$sona_id)) stop("Missing sona_id in ", source_name)                # FIX 2026-09-30 (I1)
+  if (anyDuplicated(df[, key, drop = FALSE]) > 0)                                 # FIX 2026-09-30 (I1)
+    stop("Key (", paste(key, collapse = ", "), ") not unique in ", source_name)  # FIX 2026-09-30 (I1)
+  df                                                                              # FIX 2026-09-30 (I1)
+}                                                                                 # FIX 2026-09-30 (I1)
+
+# Fisher's exact test for a binary outcome × HighN/LowN.
+# Returns prevalence by condition, diff, Cohen's h, OR, p.
+fisher_h <- function(data, value_col, group_col = "condition_label",
+                     high_label = "HighN", low_label = "LowN") {
+  v <- data[[value_col]]
+  g <- data[[group_col]]
+  h_pos <- sum(g == high_label & v == 1, na.rm = TRUE)
+  h_neg <- sum(g == high_label & v == 0, na.rm = TRUE)
+  l_pos <- sum(g == low_label  & v == 1, na.rm = TRUE)
+  l_neg <- sum(g == low_label  & v == 0, na.rm = TRUE)
+  n_h <- h_pos + h_neg; n_l <- l_pos + l_neg
+  if (n_h == 0 || n_l == 0) return(NULL)
+  p_h <- h_pos / n_h
+  p_l <- l_pos / n_l
+  # Cohen's h via arcsine transform of proportions
+  h_eff <- 2 * (asin(sqrt(p_h)) - asin(sqrt(p_l)))
+  ft <- fisher.test(matrix(c(h_pos, h_neg, l_pos, l_neg), nrow = 2, byrow = TRUE))
+  tibble(
+    n_HighN = n_h, n_LowN = n_l,
+    p_HighN = p_h, p_LowN = p_l,
+    diff = p_h - p_l,
+    cohen_h = h_eff,
+    odds_ratio = unname(ft$estimate),
+    p = ft$p.value
+  )
+}
+
+# FIX 2026-09-30 (I6): formatter for live narrative p-values (replaces hard-coded
+#   numbers in prose). Returns e.g. "p = .012" or "p < .001".
+fmt_p <- function(p) ifelse(is.na(p), "p = NA",                                  # FIX 2026-09-30 (I6)
+                            ifelse(p < .001, "p < .001",                          # FIX 2026-09-30 (I6)
+                                   paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p)))))  # FIX 2026-09-30 (I6)
+
+# Pretty HTML table helper — adds standard styling for the report.
+ktab <- function(x, caption = NULL, digits = 3) {
+  x %>%
+    kable(caption = caption, digits = digits, format = "html") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left")
+}
+
+# Save a ggplot to PDF + PNG in outputs/integration/figures/.
+save_fig <- function(plot, filename, width = 7, height = 5) {
+  ggsave(file.path(OUT_FIG, paste0(filename, ".pdf")),
+         plot, width = width, height = height, units = "in")
+  ggsave(file.path(OUT_FIG, paste0(filename, ".png")),
+         plot, width = width, height = height, units = "in", dpi = 200)
+  invisible(plot)
+}
+```
+
+```{r load-data}
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD ALL FIVE DATA SOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Self-report scales (analytic dataset)
+# FIX 2026-09-30 (I6): removed the stale "N was 130 when the NLP pipeline was
+#   last run" history (no hard-coded N). If the NLP-derived files ever cover
+#   fewer participants than the analytic file, the left-joins below leave NLP
+#   measures NA for the uncovered participants and both Ns are printed so the
+#   mismatch is visible.
+analytic <- read_csv(file.path(PROC, "analytic_data.csv"),
+                     show_col_types = FALSE, guess_max = 5000,  # FIX 2026-09-30 (I1)
+                     col_types = cols(sona_id = col_character())) %>%    # FIX 2026-09-30 (I1): read ID as text so zero-padded IDs are not coerced
+  filter(excl_any == FALSE) %>%
+  normalize_ids("analytic_data.csv")                                     # FIX 2026-09-30 (I1): was mutate(sona_id = as.character(sona_id))
+N_SELF <- nrow(analytic)
+cat("Self-report analytic N:", N_SELF, "\n")
+cat(sprintf("  HighN: %d, LowN: %d\n",
+            sum(analytic$condition_label == "HighN"),
+            sum(analytic$condition_label == "LowN")))
+
+# 2. OE consensus codes (long form: one row per participant × code)
+#    Columns: sona_id, condition_label, oe_field, code_id, category,
+#             coding_type, consensus (0/1), n_coders, agreement_strength
+oe_long <- read_parquet(file.path(DERIVED, "coding", "consensus_long.parquet")) %>%
+  normalize_ids("consensus_long.parquet", key = c("sona_id", "oe_field", "code_id"))  # FIX 2026-09-30 (I1): was as.character()
+
+# 3. Topic membership (response-level)
+#    Columns include: sona_id, oe_field, topic_id, condition_label
+topics_resp <- read_parquet(file.path(DERIVED, "topics", "topics_per_response.parquet")) %>%
+  normalize_ids("topics_per_response.parquet", key = c("sona_id", "oe_field"))       # FIX 2026-09-30 (I1): was as.character()
+topic_summary <- read_csv(file.path(DERIVED, "topics", "topic_summary.csv"),
+                          show_col_types = FALSE)
+
+# 4. Sentiment
+#    - per_response: one row per (participant, OE question) with three sentiment
+#      methods (Roberta, VADER, Emotion) and seven emotion columns
+#    - per_participant: aggregated to participant means across questions
+sent_resp <- read_parquet(file.path(DERIVED, "sentiment", "sentiment_per_response.parquet")) %>%
+  normalize_ids("sentiment_per_response.parquet", key = c("sona_id", "oe_field"))    # FIX 2026-09-30 (I1): was as.character()
+sent_part <- read_csv(file.path(DERIVED, "sentiment", "sentiment_per_participant.csv"),
+                      show_col_types = FALSE,  # FIX 2026-09-30 (I1)
+                      col_types = cols(sona_id = col_character())) %>%              # FIX 2026-09-30 (I1): read ID as text
+  normalize_ids("sentiment_per_participant.csv")                                    # FIX 2026-09-30 (I1): was as.character()
+
+# 5. Chat-turn features (participant-level aggregates of NB08 codes)
+chat_feat <- read_parquet(file.path(DERIVED, "chat_coding", "chat_participant_features.parquet")) %>%
+  normalize_ids("chat_participant_features.parquet")                                # FIX 2026-09-30 (I1): was as.character()
+
+# FIX 2026-09-30 (I1): raw OE text (primary OE questions only) — used solely to
+#   assert that every participant with any non-blank OE answer has participant-
+#   level sentiment after the join (see master-table chunk).
+oe_text <- read_parquet(file.path(DERIVED, "open_ends_long.parquet")) %>%          # FIX 2026-09-30 (I1)
+  normalize_ids("open_ends_long.parquet", key = c("sona_id", "oe_field"))           # FIX 2026-09-30 (I1)
+N_OE_TEXT <- oe_text %>%                                                            # FIX 2026-09-30 (I1)
+  filter(is_primary, !is_blank, !is.na(response), nchar(trimws(response)) > 0) %>% # FIX 2026-09-30 (I1)
+  filter(sona_id %in% analytic$sona_id) %>%                                         # FIX 2026-09-30 (I1)
+  pull(sona_id) %>% n_distinct()                                                    # FIX 2026-09-30 (I1)
+
+# Reliability tables (used for tier annotations)
+oe_rel    <- read_csv(file.path(DERIVED, "coding", "reliability_table.csv"),
+                      show_col_types = FALSE)
+chat_rel  <- read_csv(file.path(DERIVED, "chat_coding", "chat_reliability_table.csv"),
+                      show_col_types = FALSE)
+
+# Provenance check — print Ns from each source and warn if asymmetric
+N_NLP <- length(unique(chat_feat$sona_id))
+if (N_SELF != N_NLP) {
+  cat("\n⚠  Sample asymmetry detected:\n")
+  cat(sprintf("    Self-report: N=%d\n", N_SELF))
+  cat(sprintf("    NLP-derived: N=%d\n", N_NLP))
+  cat("    NLP analyses below will run on the N=", N_NLP,
+      " subset; new participants in analytic have NA on NLP measures.\n", sep="")
+  # Identify which participants are in analytic but missing from NLP
+  missing_in_nlp <- setdiff(analytic$sona_id, chat_feat$sona_id)
+  if (length(missing_in_nlp) > 0) {
+    cat("    Participants in analytic but missing from NLP outputs: ",
+        paste(missing_in_nlp, collapse=", "), "\n")
+  }
+}
+stopifnot(length(unique(sent_part$sona_id))   <= N_NLP)
+stopifnot(length(unique(oe_long$sona_id))     <= N_NLP)
+
+# Print a quick provenance summary for the rendered report.
+tibble(
+  source = c("analytic_data.csv", "consensus_long.parquet",
+             "topics_per_response.parquet", "sentiment_per_response.parquet",
+             "sentiment_per_participant.csv", "chat_participant_features.parquet"),
+  rows = c(nrow(analytic), nrow(oe_long), nrow(topics_resp),
+           nrow(sent_resp), nrow(sent_part), nrow(chat_feat)),
+  unique_participants = c(
+    n_distinct(analytic$sona_id), n_distinct(oe_long$sona_id),
+    n_distinct(topics_resp$sona_id), n_distinct(sent_resp$sona_id),
+    n_distinct(sent_part$sona_id), n_distinct(chat_feat$sona_id)
+  )
+) %>%
+  ktab(caption = "Data sources loaded")
+```
+
+```{r master-table}
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD A WIDE PER-PARTICIPANT MASTER TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the working table for cross-modal analyses. One row per participant.
+# Columns:
+#   - identifiers + condition
+#   - self-report scale composites (already in analytic_data)
+#   - chat-coded participant features (joined from chat_feat)
+#   - sentiment participant means (joined from sent_part)
+#   - OE codes pivoted wide (one column per code, 0/1 consensus)
+
+# Self-report columns we'll need downstream
+SELF_REPORT_KEYS <- c(
+  "sona_id", "condition_label", "condition_level",
+  # primary DVs
+  "psr_total","psr_connection","psr_desire","psr_caring",
+  "ec_total","trust_total","et_total","ma_total","mp_total",
+  "liab_corp","liab_chat","liab_user","liab_harm",
+  # manipulation check (focal = emostab/neuroticism) + diffusion (held-constant A, E)
+  "tipi_bot_agree","tipi_bot_extra","tipi_bot_emostab","tipi_bot_consc","tipi_bot_open",
+  "mc_neuroticism_score","mc_agreeableness_score","mc_extraversion_score",
+  # moderators / baseline scales
+  "tipi_self_extra","tipi_self_agree","tipi_self_consc","tipi_self_emostab","tipi_self_open",
+  "phq4_total","phq4_anx","phq4_dep",
+  "gaais_pos","gaais_neg","legal_expertise_z","free_speech_avg",
+  # behavior
+  "chat_total_rounds","chat_idle_pause_count",
+  "user_chars_per_turn","user_total_chars",
+  "bot_chars_per_turn"
+)
+
+# Some of these may not exist if column names differ; pick what's present
+self_cols <- intersect(SELF_REPORT_KEYS, names(analytic))
+analytic_slim <- analytic %>% select(all_of(self_cols))
+
+# Pivot OE codes wide: one column per code_id, value = consensus (0/1)
+oe_wide <- oe_long %>%
+  mutate(code_full = paste0(oe_field, "__", code_id)) %>%
+  select(sona_id, code_full, consensus) %>%
+  pivot_wider(names_from = code_full, values_from = consensus,
+              values_fill = NA_real_)
+
+# Sentiment participant-level — keep means and signed scores
+sent_slim <- sent_part %>%
+  select(sona_id,
+         roberta_score_mean, roberta_positive_mean, roberta_negative_mean,
+         emotion_joy_mean, emotion_sadness_mean,
+         vader_compound_mean,
+         starts_with("vader_compound_oe_"))   # per-question vader
+
+# Chat features — keep rate columns + onsets/trajectories
+chat_slim <- chat_feat %>%
+  select(sona_id, n_user_turns, n_bot_turns, n_turns_total, total_words,
+         mean_user_words_per_turn, mean_bot_words_per_turn,
+         starts_with("pct_"), starts_with("onset_"), starts_with("trajectory_"))
+
+# Join everything onto the analytic skeleton
+master <- analytic_slim %>%
+  left_join(chat_slim, by = "sona_id") %>%
+  left_join(sent_slim, by = "sona_id") %>%
+  left_join(oe_wide,   by = "sona_id")
+
+stopifnot(nrow(master) == N_SELF)
+
+# FIX 2026-09-30 (I1): post-join coverage assertions. Every analytic participant
+#   must carry chat features, and every participant with any non-blank primary
+#   OE answer must carry participant-level sentiment. A silent ID mismatch (the
+#   bug fixed above) would make either count fall short and stop the knit.
+N_CHAT_JOINED <- sum(!is.na(master$n_turns_total))                               # FIX 2026-09-30 (I1)
+N_SENT_JOINED <- sum(!is.na(master$roberta_score_mean))                          # FIX 2026-09-30 (I1)
+cat(sprintf("Participants with non-missing chat features after join: %d (analytic N = %d)\n",  # FIX 2026-09-30 (I1)
+            N_CHAT_JOINED, N_SELF))                                               # FIX 2026-09-30 (I1)
+cat(sprintf("Participants with non-missing participant-level sentiment after join: %d (participants with any non-blank OE text = %d)\n",  # FIX 2026-09-30 (I1)
+            N_SENT_JOINED, N_OE_TEXT))                                            # FIX 2026-09-30 (I1)
+stopifnot(N_CHAT_JOINED == N_SELF)                                               # FIX 2026-09-30 (I1)
+stopifnot(N_SENT_JOINED == N_OE_TEXT)                                            # FIX 2026-09-30 (I1)
+# FIX 2026-09-30 (I1): the joined sources must agree on each participant's condition.
+stopifnot(all(analytic_slim$condition_label ==  # FIX 2026-09-30 (I1)
+              chat_feat$condition_label[match(analytic_slim$sona_id, chat_feat$sona_id)],  # FIX 2026-09-30 (I1)
+              na.rm = TRUE))                                                      # FIX 2026-09-30 (I1)
+stopifnot(all(analytic_slim$condition_label ==  # FIX 2026-09-30 (I1)
+              sent_part$condition_label[match(analytic_slim$sona_id, sent_part$sona_id)],  # FIX 2026-09-30 (I1)
+              na.rm = TRUE))                                                      # FIX 2026-09-30 (I1)
+
+master %>%
+  count(condition_label) %>%
+  ktab(caption = "Master table: condition split")
+
+cat("Master table has", nrow(master), "rows and", ncol(master), "columns.\n")
+cat("Rows with full NLP coverage:",
+    sum(!is.na(master$n_turns_total)),
+    "/ Rows with self-report only:",
+    sum(is.na(master$n_turns_total)), "\n")
+```
+
+---
+
+# Sample asymmetry
+
+The five data sources can cover slightly different subsets of participants
+because the NLP pipeline filters to substantive OE responders, and because
+the analytic file can be updated after the NLP pipeline runs. Participant IDs
+are normalized (whitespace and leading zeros stripped) in every source before
+any join or comparison.
+<!-- FIX 2026-09-30 (I1): "cover" -> "can cover"; added the ID-normalization sentence. -->
+<!-- FIX 2026-09-30 (I6): the table below is the live record of any asymmetry. -->
+
+```{r sample-asymmetry}
+# ─────────────────────────────────────────────────────────────────────────────
+# Tabulate exact N per data source so the reader can see the asymmetry
+# ─────────────────────────────────────────────────────────────────────────────
+
+asymmetry <- tibble(
+  source = c(
+    "Self-report (analytic_data.csv)",
+    "Chat-turn features (NB08)",
+    "OE consensus codes (NB05)",
+    "Topic membership (NB06)",
+    "Sentiment per response (NB07)"
+  ),
+  n = c(
+    nrow(analytic),
+    n_distinct(chat_feat$sona_id),
+    n_distinct(oe_long$sona_id),
+    n_distinct(topics_resp$sona_id),
+    n_distinct(sent_resp$sona_id)
+  ),
+  n_HighN = c(
+    sum(analytic$condition_label == "HighN"),
+    sum(chat_feat$condition_label  == "HighN"),
+    n_distinct(oe_long$sona_id[oe_long$condition_label  == "HighN"]),
+    n_distinct(topics_resp$sona_id[topics_resp$condition_label == "HighN"]),
+    n_distinct(sent_resp$sona_id[sent_resp$condition_label == "HighN"])
+  ),
+  n_LowN = c(
+    sum(analytic$condition_label == "LowN"),
+    sum(chat_feat$condition_label  == "LowN"),
+    n_distinct(oe_long$sona_id[oe_long$condition_label  == "LowN"]),
+    n_distinct(topics_resp$sona_id[topics_resp$condition_label == "LowN"]),
+    n_distinct(sent_resp$sona_id[sent_resp$condition_label == "LowN"])
+  )
+)
+
+asymmetry %>% ktab(caption = "N per data source × condition")
+
+# Who's missing from each NLP source vs. analytic?
+self_ids  <- analytic$sona_id
+nlp_ids   <- list(
+  "Chat features" = chat_feat$sona_id,
+  "OE codes"      = unique(oe_long$sona_id),
+  "Topics"        = unique(topics_resp$sona_id),
+  "Sentiment"     = unique(sent_resp$sona_id)
+)
+missing_table <- map_dfr(names(nlp_ids), function(nm) {
+  miss <- setdiff(self_ids, nlp_ids[[nm]])
+  if (length(miss) == 0) return(tibble(source = nm, missing_n = 0L,
+                                       missing_ids = "—"))
+  tibble(source = nm, missing_n = length(miss),
+         missing_ids = paste(miss, collapse = ", "))
+})
+missing_table %>% ktab(caption = "Participants in analytic but missing from NLP source")
+```
+
+**How analyses handle this.** The master table is built by left-joining all
+NLP sources onto the analytic skeleton; participants missing from an NLP
+source carry NA in that source's columns. Welch t and Fisher tests drop
+NAs implicitly, so each test runs on whoever has data for that measure.
+Sample sizes per test are reported in every table (`n_HighN` / `n_LowN`
+columns) so the reader can see exactly which subset each row reflects.
+
+---
+
+# Manipulation fidelity — three-layer triangulation
+
+We test the manipulation three different ways using three different data
+modalities. The question is whether they converge.
+
+```{r mf-three-layer}
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 1 — Self-report TIPI-Bot Emotional Stability (the primary preregistered MC; HighN < LowN)
+# LAYER 2 — Single-item anxiety check (`mc_neuroticism_score`; "anxious/worried", HighN > LowN)
+# LAYER 3 — Chat-coded behavioral anxiety/volatility (from NB08, summarized at participant)
+# LAYER 4 — OE1 sentiment (Roberta on the "Describe your experience" question)
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: directions differ by measure for N. HighN is expected HIGHER on
+# anxiety/volatility but LOWER on emotional stability and calm_stability,
+# so the forest plot will show signed effects on both sides of zero.
+
+mf_rows <- bind_rows(
+  welch_d(master, "tipi_bot_emostab")        %>% mutate(measure = "TIPI-Bot Emotional Stability (self-report)", source = "analytic_data"),
+  welch_d(master, "mc_neuroticism_score")    %>% mutate(measure = "Single-item anxiety check (post-chat)", source = "analytic_data"),
+  welch_d(master, "pct_expressed_anxiety")   %>% mutate(measure = "Chat: bot expressed_anxiety (% of turns)", source = "chat_feat"),
+  welch_d(master, "pct_emotional_volatility") %>% mutate(measure = "Chat: bot emotional_volatility (% of turns)", source = "chat_feat"),
+  welch_d(master, "pct_calm_stability")      %>% mutate(measure = "Chat: bot calm_stability (% of turns, reverse-keyed)", source = "chat_feat")
+)
+
+# OE1 sentiment is at response level, so handle separately
+sent_oe1 <- sent_resp %>% filter(oe_field == "oe_experience")
+mf_oe1 <- welch_d(sent_oe1, "roberta_score") %>%
+  mutate(measure = "OE1 sentiment (Roberta on oe_experience)", source = "sentiment_per_response")
+
+mf_table <- bind_rows(mf_rows, mf_oe1) %>%
+  select(measure, source, n_HighN, n_LowN,
+         mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi, t, p,  # FIX 2026-09-30 (I2)
+         cohens_d, cohens_d_ci_lo, cohens_d_ci_hi)   # FIX 2026-09-30 (I2): keep old Cohen's d + Wald CI as extra columns
+
+mf_table %>%
+  mutate(across(c(mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi, t), ~ round(.x, 3)),
+         p = format.pval(p, digits = 3, eps = 1e-6)) %>%
+  ktab(caption = "Manipulation fidelity across four measurement modalities (d = Hedges' g with its 95% CI; cohens_d = pooled-SD Cohen's d, kept for reference)")  # FIX 2026-09-30 (R4-G): state that d is Hedges' g
+
+write_csv(mf_table, file.path(OUT_TAB, "01_manipulation_fidelity.csv"))
+```
+
+```{r mf-forest, fig.height=4}
+# Forest plot of effect sizes for the manipulation fidelity layers
+mf_plot_df <- mf_table %>%
+  mutate(measure = fct_reorder(measure, d))
+
+p_mf <- ggplot(mf_plot_df, aes(x = d, y = measure)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = d_ci_lo, xmax = d_ci_hi), height = 0.15) +
+  geom_point(size = 3, color = "#2c3e50") +
+  scale_x_continuous(breaks = seq(-2, 3, 0.5)) +
+  labs(
+    title    = "Manipulation fidelity across measurement modalities",
+    subtitle = "Hedges' g (HighN – LowN), 95% CI; HighN expected higher on anxiety, lower on stability",  # FIX 2026-09-30 (I2): was Cohen's d
+    x = "Hedges' g (HighN – LowN)",                                                                    # FIX 2026-09-30 (I2): was Cohen's d
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot",
+        panel.grid.major.y = element_blank())
+
+save_fig(p_mf, "01_manipulation_fidelity_forest", width = 8, height = 4)
+p_mf
+```
+
+<!-- FIX 2026-09-30 (I6): the hard-coded "What this shows" paragraph (d = −1.41, +1.31, +3.10, −3.04, −0.11 and the diffusion values) is replaced by the live chunk below; the diffusion/halo part moved after the diffusion chunk, where those values are computed. -->
+
+```{r mf-narrative, results='asis'}
+# FIX 2026-09-30 (I6): live fidelity narrative. Predicted sign per measure:
+#   HighN higher on anxiety/volatility (+), lower on stability/calm (−).
+#   OE1 sentiment is not a bot-side measure and is reported separately.
+mf_pred <- c("TIPI-Bot Emotional Stability (self-report)"          = -1,   # FIX 2026-09-30 (I6)
+             "Single-item anxiety check (post-chat)"               = +1,   # FIX 2026-09-30 (I6)
+             "Chat: bot expressed_anxiety (% of turns)"            = +1,   # FIX 2026-09-30 (I6)
+             "Chat: bot emotional_volatility (% of turns)"         = +1,   # FIX 2026-09-30 (I6)
+             "Chat: bot calm_stability (% of turns, reverse-keyed)" = -1)  # FIX 2026-09-30 (I6)
+mf_dir <- mf_table %>% filter(measure %in% names(mf_pred)) %>%               # FIX 2026-09-30 (I6)
+  mutate(pred = mf_pred[measure], ok = sign(d) == pred & p < .05)            # FIX 2026-09-30 (I6)
+mf_lines <- sprintf("%s: g = %+.2f, %s (predicted %s)", mf_dir$measure, mf_dir$d,  # FIX 2026-09-30 (I6)
+                    fmt_p(mf_dir$p), ifelse(mf_dir$pred > 0, "HighN > LowN", "HighN < LowN"))  # FIX 2026-09-30 (I6)
+mf_oe1_r <- mf_table %>% filter(grepl("^OE1", measure))                      # FIX 2026-09-30 (I6)
+cat(sprintf("**What this shows.** %d of %d directional fidelity measures differ at p < .05 in the predicted direction. %s. OE1 sentiment (Roberta; reported separately): g = %+.2f, %s.\n",  # FIX 2026-09-30 (I6)
+            sum(mf_dir$ok), nrow(mf_dir), paste(mf_lines, collapse = "; "),  # FIX 2026-09-30 (I6)
+            mf_oe1_r$d, fmt_p(mf_oe1_r$p)))                                  # FIX 2026-09-30 (I6)
+```
+
+```{r diffusion}
+# ─────────────────────────────────────────────────────────────────────────────
+# DIFFUSION CHECK — non-focal TIPI-Bot ratings (A, E, Conscientiousness, Openness)
+# ─────────────────────────────────────────────────────────────────────────────
+# These traits were NOT manipulated. Agreeableness and Extraversion were held
+# at MOD_HIGH_A and MOD_HIGH_E across both conditions (Conscientiousness and
+# Openness were never manipulated in any study). Any condition difference here
+# is perceptual halo from the focal N manipulation. Emotional Stability is the
+# focal manipulation check and lives in the fidelity block above, not here.
+
+diffusion_df <- bind_rows(
+  welch_d(master, "tipi_bot_agree")   %>% mutate(measure = "TIPI-Bot Agreeableness"),
+  welch_d(master, "tipi_bot_extra")   %>% mutate(measure = "TIPI-Bot Extraversion"),
+  welch_d(master, "tipi_bot_consc")   %>% mutate(measure = "TIPI-Bot Conscientiousness"),
+  welch_d(master, "tipi_bot_open")    %>% mutate(measure = "TIPI-Bot Openness"),
+  welch_d(master, "mc_agreeableness_score") %>% mutate(measure = "Single-item: warm/kind"),
+  welch_d(master, "mc_extraversion_score")  %>% mutate(measure = "Single-item: outgoing/talkative")
+)
+
+diffusion_df %>%
+  select(measure, n_HighN, n_LowN, mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi, p) %>%
+  mutate(across(c(mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi), ~ round(.x, 3)),
+         p = format.pval(p, digits = 3, eps = 1e-6)) %>%
+  ktab(caption = "Diffusion: condition effects on non-focal trait perceptions (halo; d = Hedges' g with its 95% CI)")  # FIX 2026-09-30 (R4-G): state that d is Hedges' g
+
+write_csv(diffusion_df %>% mutate(measure = as.character(measure)),
+          file.path(OUT_TAB, "02_diffusion.csv"))
+```
+
+```{r diffusion-narrative, results='asis'}
+# FIX 2026-09-30 (I6): live halo narrative (replaces hard-coded diffusion values
+#   and the hard-coded "survives Bonferroni in the core analysis" claim, which is
+#   now read from the core pipeline's own Bonferroni table when it exists).
+diff_lines <- sprintf("%s g = %+.2f (%s)", diffusion_df$measure, diffusion_df$d,  # FIX 2026-09-30 (I6)
+                      fmt_p(diffusion_df$p))                                   # FIX 2026-09-30 (I6)
+n_lower <- sum(diffusion_df$d < 0, na.rm = TRUE)                              # FIX 2026-09-30 (I6)
+cat(sprintf("**Halo on non-focal traits.** %d of %d non-focal ratings are lower for the HighN bot: %s. Agreeableness and Extraversion were held at MOD_HIGH_A and MOD_HIGH_E in both conditions, so any difference is perceptual halo from the focal N manipulation, not a manipulation of A/E.",  # FIX 2026-09-30 (I6)
+            n_lower, nrow(diffusion_df), paste(diff_lines, collapse = "; ")))  # FIX 2026-09-30 (I6)
+core_diff_path <- here("outputs", "R", "tables", "02_diffusion_checks.csv")   # FIX 2026-09-30 (I6)
+if (file.exists(core_diff_path)) {                                            # FIX 2026-09-30 (I6)
+  core_diff <- read_csv(core_diff_path, show_col_types = FALSE)               # FIX 2026-09-30 (I6)
+  surv <- core_diff$dv[core_diff$significant_at_corrected %in% TRUE]          # FIX 2026-09-30 (I6)
+  # FIX 2026-09-30 (R4-I6b): name the core Bonferroni family (its size and DVs,
+  #   read live from the core file) and say which non-focal ratings in the table
+  #   above were outside it, so no rating reads as having failed a correction it
+  #   was never part of. Display labels are the ones used in diffusion_df.
+  diff_dv_lab <- c(tipi_bot_agree = "TIPI-Bot Agreeableness",                  # FIX 2026-09-30 (R4-I6b)
+                   tipi_bot_extra = "TIPI-Bot Extraversion",                   # FIX 2026-09-30 (R4-I6b)
+                   tipi_bot_emostab = "TIPI-Bot Emotional Stability",          # FIX 2026-09-30 (R4-I6b)
+                   tipi_bot_consc = "TIPI-Bot Conscientiousness",              # FIX 2026-09-30 (R4-I6b)
+                   tipi_bot_open = "TIPI-Bot Openness",                        # FIX 2026-09-30 (R4-I6b)
+                   mc_agreeableness_score = "Single-item: warm/kind",          # FIX 2026-09-30 (R4-I6b)
+                   mc_extraversion_score = "Single-item: outgoing/talkative")  # FIX 2026-09-30 (R4-I6b)
+  stopifnot(all(core_diff$dv %in% names(diff_dv_lab)))                        # FIX 2026-09-30 (R4-I6b): fail loudly on an unmapped core DV
+  core_fam_labs  <- unname(diff_dv_lab[core_diff$dv])                         # FIX 2026-09-30 (R4-I6b)
+  core_surv_labs <- unname(diff_dv_lab[surv])                                 # FIX 2026-09-30 (R4-I6b)
+  core_outside   <- setdiff(as.character(diffusion_df$measure), core_fam_labs)  # FIX 2026-09-30 (R4-I6b)
+  core_surv_txt  <- if (length(surv)) sprintf("%d of %d %s correction: %s", length(surv), nrow(core_diff),  # FIX 2026-09-30 (R4-I6b)
+                                             if (length(surv) == 1) "survives" else "survive",  # FIX 2026-09-30 (R4-I6b)
+                                             paste(core_surv_labs, collapse = ", "))  # FIX 2026-09-30 (R4-I6b)
+                    else sprintf("none of the %d survives correction", nrow(core_diff))  # FIX 2026-09-30 (R4-I6b)
+  core_outside_txt <- if (length(core_outside)) sprintf(" Non-focal ratings outside that family (%s) were not part of the corrected test; their p values here are unadjusted only.",  # FIX 2026-09-30 (R4-I6b)
+                                                        paste(core_outside, collapse = ", ")) else ""  # FIX 2026-09-30 (R4-I6b)
+  cat(sprintf(" The core pipeline's Bonferroni family for diffusion (outputs/R/tables/02_diffusion_checks.csv) has %d tests: %s; %s.%s\n",  # FIX 2026-09-30 (I6); (R4-I6b): names the family
+              nrow(core_diff),  # FIX 2026-09-30 (I6)
+              paste(sprintf("%s [%s]", core_fam_labs, core_diff$dv), collapse = ", "),  # FIX 2026-09-30 (R4-I6b)
+              core_surv_txt, core_outside_txt))                               # FIX 2026-09-30 (R4-I6b)
+} else cat("\n")                                                              # FIX 2026-09-30 (I6)
+```
+
+---
+
+# OE consensus codes — condition effects with BH-FDR within question
+
+For each rubric code, run Fisher's exact test on consensus(0/1) by
+condition. Apply Benjamini–Hochberg FDR within each OE question. Report
+codes by absolute condition gap. The coded data contain
+`r n_distinct(oe_long$oe_field)` OE questions ×
+`r paste(unique(range(table(distinct(oe_long, oe_field, code_id)$oe_field))), collapse = "–")`
+codes per question.
+<!-- FIX 2026-09-30 (I6): question/code counts are now computed inline (was hard-coded "rubric_v2 has 4 OE questions × 14–16 codes per question"). -->
+
+```{r oe-fisher}
+# ─────────────────────────────────────────────────────────────────────────────
+# OE CODE × CONDITION TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+# Loop over each (oe_field, code_id) combination. For each, run a
+# Fisher's exact test on the 2x2 (HighN × consensus) table.
+
+# Use group_modify (cleaner than rowwise + .env$ — no name-collision risk
+# between the rowwise scalar and the filtered tibble's column of the same name).
+# Each group's data slice (.x) is one participant × code panel; fisher_h returns
+# a 1-row tibble of stats that gets row-bound back.
+oe_results <- oe_long %>%
+  group_by(oe_field, code_id) %>%
+  group_modify(~ fisher_h(.x, "consensus")) %>%
+  ungroup() %>%
+  left_join(oe_rel %>% select(oe_field, code_id, category, tier, krippendorff_alpha),
+            by = c("oe_field", "code_id"))
+
+# BH-FDR within OE question (since codes within a question are testing
+# related aspects of the same response).
+oe_results <- oe_results %>%
+  group_by(oe_field) %>%
+  mutate(q_bh_within_q = p.adjust(p, method = "BH")) %>%
+  ungroup() %>%
+  mutate(direction = case_when(
+    diff >  0 ~ "HighN > LowN",
+    diff <  0 ~ "LowN > HighN",
+    TRUE      ~ "null"
+  ))
+
+# Save full table
+write_csv(oe_results, file.path(OUT_TAB, "03_oe_code_fisher.csv"))
+
+# Show top 15 by absolute diff, restricted to confirmatory-tier codes
+oe_results %>%
+  filter(tier == "confirmatory") %>%
+  arrange(desc(abs(diff))) %>%
+  head(15) %>%
+  select(oe_field, code_id, category,
+         p_HighN, p_LowN, diff, cohen_h, p, q_bh_within_q) %>%
+  mutate(across(c(p_HighN, p_LowN, diff, cohen_h), ~ round(.x, 3)),
+         p = format.pval(p, digits = 3, eps = 1e-6),
+         q_bh_within_q = round(q_bh_within_q, 3)) %>%
+  ktab(caption = "Top 15 confirmatory-tier OE codes by |condition gap|")
+```
+
+```{r oe-forest, fig.height=8}
+# ─────────────────────────────────────────────────────────────────────────────
+# Forest plot of top OE code effects, grouped by OE question
+# ─────────────────────────────────────────────────────────────────────────────
+# Show only confirmatory-tier codes for inferential reading.
+# Highlight which pass BH-FDR at q<.10 (counts are reported live below).  # FIX 2026-09-30 (I6): removed stale "(none currently do)"
+
+oe_top <- oe_results %>%
+  filter(tier == "confirmatory") %>%
+  arrange(oe_field, desc(abs(diff))) %>%
+  group_by(oe_field) %>%
+  slice_head(n = 8) %>%   # top 8 per question
+  ungroup() %>%
+  mutate(code_label = paste0(code_id, " (", category, ")"),
+         code_label = fct_reorder2(code_label, oe_field, abs(diff)),
+         sig = case_when(
+           q_bh_within_q < 0.05 ~ "q<.05",
+           q_bh_within_q < 0.10 ~ "q<.10",
+           p < 0.05             ~ "raw p<.05",
+           TRUE                 ~ "ns"
+         ))
+
+p_oe <- ggplot(oe_top, aes(x = diff, y = code_label, color = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("q<.05" = "#16a34a", "q<.10" = "#f59e0b",
+                                "raw p<.05" = "#3498db", "ns" = "grey60")) +
+  facet_grid(oe_field ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "OE consensus codes — condition gap by question (top 8 confirmatory each)",
+    subtitle = "diff = HighN prevalence – LowN prevalence",
+    x = "Difference in prevalence (HighN – LowN)",
+    y = NULL, color = "Significance"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(strip.text.y = element_text(angle = 0),
+        panel.grid.major.y = element_blank(),
+        plot.title.position = "plot")
+
+save_fig(p_oe, "03_oe_codes_by_question", width = 9, height = 8)
+p_oe
+```
+
+```{r oe-narrative-stats, results='asis'}
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic narrative: count BH-FDR survivors and list the strongest 3 codes
+# ─────────────────────────────────────────────────────────────────────────────
+# This block computes the actual numbers so the prose below stays accurate
+# across reruns even as the rubric or sample changes.
+
+n_total_codes <- nrow(oe_results)
+n_q05         <- sum(oe_results$q_bh_within_q < 0.05, na.rm = TRUE)
+n_q10         <- sum(oe_results$q_bh_within_q < 0.10, na.rm = TRUE)
+n_p05         <- sum(oe_results$p < 0.05, na.rm = TRUE)
+
+top3 <- oe_results %>%
+  filter(tier == "confirmatory") %>%
+  arrange(desc(abs(diff))) %>%
+  head(3)
+
+top3_str <- paste(sprintf("`%s` (%s; diff=%+.1f pp, p=%.3f)",
+                          top3$code_id, top3$oe_field,
+                          top3$diff * 100, top3$p),
+                  collapse = "; ")
+
+cat(sprintf(paste(
+  "**Multiple-comparison correction summary.** Across the %d codes tested,",
+  "%d clear raw p<.05; **%d clear BH-FDR at q<.10 within question**;",
+  "%d clear q<.05. The three strongest confirmatory-tier effects (by",
+  "absolute condition gap) are: %s. The OE-code layer is best used as a",
+  "descriptive lattice.\n"),   # FIX 2026-09-30 (I6): removed unconditional claim that sentiment/chat carry the "cleaner inferential signal"
+  n_total_codes, n_p05, n_q10, n_q05, top3_str))
+```
+
+---
+
+# Topic membership — condition effects
+
+For each OE question, test whether topic membership depends on condition
+(chi-square, excluding outlier cluster -1).
+
+```{r topics-chi}
+# ─────────────────────────────────────────────────────────────────────────────
+# TOPIC × CONDITION CHI-SQUARE PER OE QUESTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+topic_results <- topic_summary %>%
+  filter(topic_id != -1) %>%   # drop outlier cluster
+  group_by(oe_field) %>%
+  group_modify(~ {
+    obs <- as.matrix(.x %>% select(n_HighN, n_LowN))
+    if (nrow(obs) < 2) return(tibble())
+    ct <- suppressWarnings(chisq.test(obs))
+    tibble(
+      n_topics = nrow(obs),
+      n_total = sum(obs),
+      chi2 = unname(ct$statistic),
+      df   = unname(ct$parameter),
+      p    = ct$p.value,
+      cramers_v = sqrt(unname(ct$statistic) / (sum(obs) * (min(dim(obs)) - 1)))
+    )
+  }) %>%
+  ungroup()
+
+topic_results %>%
+  mutate(across(c(chi2, cramers_v), ~ round(.x, 3)),
+         p = format.pval(p, digits = 3, eps = 1e-4)) %>%
+  ktab(caption = "Topic membership × condition (chi-square, per OE question)")
+
+write_csv(topic_results, file.path(OUT_TAB, "04_topic_condition_chi.csv"))
+```
+
+```{r topics-table}
+# Print the topics themselves with their condition splits for reference
+topic_summary %>%
+  filter(topic_id != -1) %>%
+  select(oe_field, topic_id, opus_label, n_docs, n_HighN, n_LowN, pct_HighN) %>%
+  mutate(pct_HighN = round(pct_HighN, 3)) %>%
+  arrange(oe_field, topic_id) %>%
+  ktab(caption = "Topic discovery summary (excluding outlier clusters)")
+```
+
+<!-- FIX 2026-09-30 (I6): hard-coded topic reading (p = .40, p ≥ .58, ARI .71–.98 / .06–.31) replaced by the live chunk below. -->
+
+```{r topics-narrative, results='asis'}
+# FIX 2026-09-30 (I6): live topic narrative from topic_results and the NB06
+#   cross-embedding agreement file.
+tp <- topic_results %>% arrange(p)                                              # FIX 2026-09-30 (I6)
+cat(sprintf("**Reading.** Topic membership × condition (chi-square, outlier cluster excluded): %d of %d questions at p < .05. By question: %s.",  # FIX 2026-09-30 (I6)
+            sum(tp$p < .05), nrow(tp),  # FIX 2026-09-30 (I6)
+            paste(sprintf("%s χ²(%d) = %.2f, %s", tp$oe_field, as.integer(tp$df), tp$chi2, fmt_p(tp$p)),  # FIX 2026-09-30 (I6)
+                  collapse = "; ")))                                            # FIX 2026-09-30 (I6)
+ari_path <- file.path(DERIVED, "topics", "cross_embedding_agreement.csv")       # FIX 2026-09-30 (I6)
+if (file.exists(ari_path)) {                                                    # FIX 2026-09-30 (I6)
+  ari <- read_csv(ari_path, show_col_types = FALSE) %>%                         # FIX 2026-09-30 (I6)
+    group_by(oe_field) %>%  # FIX 2026-09-30 (I6)
+    summarise(lo = min(ari, na.rm = TRUE), hi = max(ari, na.rm = TRUE), .groups = "drop")  # FIX 2026-09-30 (I6)
+  cat(sprintf(" Cross-embedding agreement of the topic solutions (ARI range across embedding pairs): %s. We treat topics descriptively rather than as an inferential test of the manipulation.\n",  # FIX 2026-09-30 (I6)
+              paste(sprintf("%s %.2f–%.2f", ari$oe_field, ari$lo, ari$hi), collapse = "; ")))  # FIX 2026-09-30 (I6)
+} else cat(" We treat topics descriptively rather than as an inferential test of the manipulation.\n")  # FIX 2026-09-30 (I6)
+```
+
+---
+
+# Sentiment — condition effects per OE question
+
+For each of the four OE questions, run Welch t-tests on four sentiment
+measures (Roberta signed score, VADER compound, Emotion joy, Emotion sadness),
+with BH-FDR within each question and across all tests.
+<!-- FIX 2026-09-30 (I4): the code tests four measures (incl. emotion_sadness), not three; the correction families are now stated. -->
+
+```{r sentiment-by-oe}
+# ─────────────────────────────────────────────────────────────────────────────
+# RESPONSE-LEVEL SENTIMENT × CONDITION, PER OE QUESTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+oe_order <- c("oe_experience", "oe_person_or_tool",
+              "oe_responsibility", "oe_compensation")
+oe_labels <- c(oe_experience = "OE1 Experience (about interaction)",
+               oe_person_or_tool = "OE2 Person/Tool (about interaction)",
+               oe_responsibility = "OE3 Responsibility (about vignette)",
+               oe_compensation   = "OE4 Compensation (about vignette)")
+
+# Use purrr::map2 with a temporary column name "question" so the iterator
+# variable doesn't shadow sent_resp's "oe_field" column.
+sent_by_oe <- expand_grid(
+  question = oe_order,
+  method   = c("roberta_score", "vader_compound", "emotion_joy", "emotion_sadness")
+) %>%
+  mutate(test = map2(question, method,
+                     ~ welch_d(sent_resp %>% filter(oe_field == .x), .y))) %>%
+  unnest_wider(test) %>%
+  rename(oe_field = question) %>%
+  mutate(oe_label = oe_labels[oe_field],
+         oe_label = factor(oe_label, levels = oe_labels))
+
+# FIX 2026-09-30 (I4): multiplicity for the sentiment condition tests (existing
+#   p unchanged). q_bh_question = BH within each OE question across the sentiment
+#   measures tested for it; q_bh_all = BH across every sentiment test in this table.
+sent_by_oe <- sent_by_oe %>%  # FIX 2026-09-30 (I4)
+  group_by(oe_field) %>%  # FIX 2026-09-30 (I4)
+  mutate(q_bh_question = p.adjust(p, method = "BH")) %>%                        # FIX 2026-09-30 (I4)
+  ungroup() %>%  # FIX 2026-09-30 (I4)
+  mutate(q_bh_all = p.adjust(p, method = "BH"))                                  # FIX 2026-09-30 (I4)
+
+sent_by_oe %>%
+  select(oe_label, method, n_HighN, n_LowN, mean_HighN, mean_LowN, diff, d, p,  # FIX 2026-09-30 (I4)
+         q_bh_question, q_bh_all) %>%                                            # FIX 2026-09-30 (I4): show q columns
+  mutate(across(c(mean_HighN, mean_LowN, diff, d, q_bh_question, q_bh_all), ~ round(.x, 3)),  # FIX 2026-09-30 (I4)
+         p = format.pval(p, digits = 3, eps = 1e-4)) %>%
+  ktab(caption = "Sentiment by OE question × method (Welch t; d = Hedges' g; BH q within question and across all)")  # FIX 2026-09-30 (I2/I4)
+
+write_csv(sent_by_oe, file.path(OUT_TAB, "05_sentiment_by_oe.csv"))
+```
+
+```{r sentiment-plot, fig.height=4}
+# ─────────────────────────────────────────────────────────────────────────────
+# Visualize sentiment effects by OE question  # FIX 2026-09-30 (I6): was "the OE1-strong / OE4-null gradient"
+# ─────────────────────────────────────────────────────────────────────────────
+
+sent_plot <- sent_by_oe %>%
+  filter(method %in% c("roberta_score", "vader_compound", "emotion_joy")) %>%
+  mutate(method_lab = case_when(
+    method == "roberta_score" ~ "Roberta (signed)",
+    method == "vader_compound" ~ "VADER compound",
+    method == "emotion_joy" ~ "Emotion: joy"
+  ),
+  sig = ifelse(p < 0.05, "p<.05", "ns"))
+
+p_sent <- ggplot(sent_plot, aes(x = d, y = oe_label, color = sig, shape = method_lab)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = d_ci_lo, xmax = d_ci_hi), height = 0.15,
+                 position = position_dodge(width = 0.4)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = c("p<.05" = "#16a34a", "ns" = "grey60")) +
+  labs(
+    title    = "Sentiment effects by OE question",                                # FIX 2026-09-30 (I6): was "Sentiment effect specificity: OE1 strong, OE4 null"
+    subtitle = "Hedges' g (HighN – LowN) on response-level sentiment, 95% CI",   # FIX 2026-09-30 (I2): was Cohen's d
+    x = "Hedges' g", y = NULL,                                                   # FIX 2026-09-30 (I2): was Cohen's d
+    color = NULL, shape = "Method"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot",
+        panel.grid.major.y = element_blank())
+
+save_fig(p_sent, "05_sentiment_by_oe", width = 9, height = 4)
+p_sent
+```
+
+```{r sentiment-narrative, results='asis'}
+# Dynamic narrative for sentiment by OE
+sent_summary <- sent_by_oe %>%
+  filter(method %in% c("roberta_score", "vader_compound", "emotion_joy")) %>%
+  group_by(oe_field) %>%
+  summarise(
+    n_sig = sum(p < 0.05, na.rm = TRUE),
+    d_max = d[which.max(abs(d))],
+    method_max = method[which.max(abs(d))],
+    p_max = p[which.max(abs(d))],
+    .groups = "drop"
+  )
+
+# Build a sentence for each OE question
+lines <- sent_summary %>%
+  mutate(line = sprintf("- **%s**: %d of 3 methods clear α=.05; strongest %s (g=%+.2f, p=%.3f)",   # FIX 2026-09-30 (I2): d -> g label
+                        oe_field, n_sig, method_max, d_max, p_max)) %>%
+  pull(line)
+
+cat("**Per-question sentiment summary (Roberta + VADER + Joy):**\n\n")
+cat(paste(lines, collapse = "\n"))
+
+# FIX 2026-09-30 (I4/I6): the hard-coded reading ("all |d| <= 0.19, all p >= .27
+#   ... do not survive correction ... no sentiment 'dissociation'") is replaced by
+#   text computed from the live table, stating the correction families and the
+#   threshold (q < .05) explicitly.
+rob   <- sent_by_oe %>% filter(method == "roberta_score")                        # FIX 2026-09-30 (I4/I6)
+nom   <- sent_by_oe %>% filter(p < .05)                                          # FIX 2026-09-30 (I4/I6)
+n_fam_q <- sent_by_oe %>% count(oe_field) %>% pull(n) %>% unique()               # FIX 2026-09-30 (I4/I6)
+nom_str <- if (nrow(nom)) paste(sprintf("%s/%s g=%+.2f, %s, q_question=%.3f, q_all=%.3f",  # FIX 2026-09-30 (I4/I6)
+                                        nom$oe_field, nom$method, nom$d, fmt_p(nom$p),  # FIX 2026-09-30 (I4/I6)
+                                        nom$q_bh_question, nom$q_bh_all), collapse = "; ") else "none"  # FIX 2026-09-30 (I4/I6)
+cat(sprintf(paste0(  # FIX 2026-09-30 (I4/I6)
+  "\n\n**Reading.** Primary measure (Roberta): %d of %d questions at p < .05; |g| range %.2f–%.2f; p range %.3f–%.3f. ",  # FIX 2026-09-30 (I4/I6)
+  "Across all %d sentiment tests (%d methods × %d questions), %d reach nominal p < .05 (%s). ",  # FIX 2026-09-30 (I4/I6)
+  "Multiplicity: BH-FDR within each question (family = the %s sentiment measures for that question) leaves %d at q < .05; ",  # FIX 2026-09-30 (I4/I6)
+  "BH-FDR across all %d tests leaves %d at q < .05.\n"),  # FIX 2026-09-30 (I4/I6)
+  sum(rob$p < .05), nrow(rob), min(abs(rob$d)), max(abs(rob$d)), min(rob$p), max(rob$p),  # FIX 2026-09-30 (I4/I6)
+  nrow(sent_by_oe), n_distinct(sent_by_oe$method), n_distinct(sent_by_oe$oe_field),  # FIX 2026-09-30 (I4/I6)
+  nrow(nom), nom_str,  # FIX 2026-09-30 (I4/I6)
+  paste(n_fam_q, collapse = "/"), sum(sent_by_oe$q_bh_question < .05, na.rm = TRUE),  # FIX 2026-09-30 (I4/I6)
+  nrow(sent_by_oe), sum(sent_by_oe$q_bh_all < .05, na.rm = TRUE)))              # FIX 2026-09-30 (I4/I6)
+```
+
+---
+
+# Chat-turn features — condition effects (NB08)
+
+Welch t-tests on each of the 14 participant-level rates. Annotate with
+reliability tier (confirmatory / exploratory / descriptive-only).
+
+```{r chat-features}
+# ─────────────────────────────────────────────────────────────────────────────
+# CHAT FEATURE × CONDITION TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Map of pct_<code> columns back to (role, tier) from the chat reliability table
+chat_meta <- chat_rel %>% select(code_id, role, tier)
+
+# Build the test rows
+chat_cols <- grep("^pct_", names(chat_feat), value = TRUE)
+chat_results <- tibble(pct_col = chat_cols) %>%
+  mutate(code_id = sub("^pct_", "", pct_col)) %>%
+  left_join(chat_meta, by = "code_id") %>%
+  rowwise() %>%
+  mutate(test = list(welch_d(master, pct_col))) %>%
+  unnest_wider(test) %>%
+  ungroup() %>%
+  arrange(role, desc(abs(d)))
+
+# FIX 2026-09-30 (I4): BH-FDR within role (family = all bot codes; all user codes).
+#   Existing p unchanged.
+stopifnot(!anyNA(chat_results$role))                                             # FIX 2026-09-30 (I4): every code must map to a role family
+chat_results <- chat_results %>%  # FIX 2026-09-30 (I4)
+  group_by(role) %>%  # FIX 2026-09-30 (I4)
+  mutate(q_bh_role = p.adjust(p, method = "BH")) %>%                            # FIX 2026-09-30 (I4)
+  ungroup()  # FIX 2026-09-30 (I4)
+
+chat_results %>%
+  select(code_id, role, tier, n_HighN, n_LowN, mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi, p, q_bh_role) %>%  # FIX 2026-09-30 (I1/I4): show n and q
+  mutate(across(c(mean_HighN, mean_LowN, diff, d, d_ci_lo, d_ci_hi, q_bh_role), ~ round(.x, 3)),  # FIX 2026-09-30 (I4)
+         p = format.pval(p, digits = 3, eps = 1e-6)) %>%
+  ktab(caption = "Chat-coded features by condition (Welch t; d = Hedges' g; BH q within role; with reliability tier)")  # FIX 2026-09-30 (I2/I4)
+
+write_csv(chat_results, file.path(OUT_TAB, "06_chat_features_by_condition.csv"))
+```
+
+```{r chat-plot, fig.height=6}
+# Forest plot grouped by role (bot vs user) with tier as color
+chat_plot <- chat_results %>%
+  mutate(code_label = fct_reorder(code_id, d),
+         tier = factor(tier, levels = c("confirmatory","exploratory","descriptive_only")))
+
+p_chat <- ggplot(chat_plot, aes(x = d, y = code_label, color = tier)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = d_ci_lo, xmax = d_ci_hi), height = 0.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c(confirmatory = "#16a34a",
+                                 exploratory = "#f59e0b",
+                                 descriptive_only = "grey60")) +
+  facet_grid(role ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "Chat-coded turn-level features: condition effects",
+    subtitle = "Hedges' g (HighN – LowN) with 95% CI; coloured by reliability tier",  # FIX 2026-09-30 (I2): was Cohen's d
+    x = "Hedges' g", y = NULL, color = "Tier"                                       # FIX 2026-09-30 (I2): was Cohen's d
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(strip.text.y = element_text(angle = 0),
+        plot.title.position = "plot",
+        panel.grid.major.y = element_blank())
+
+save_fig(p_chat, "06_chat_features_forest", width = 9, height = 6)
+p_chat
+```
+
+```{r chat-narrative, results='asis'}
+# Dynamic narrative for chat-coded features
+top_bot <- chat_results %>% filter(role == "bot")  %>% arrange(desc(abs(d)))   %>% head(3)
+top_usr <- chat_results %>% filter(role == "user") %>% arrange(desc(abs(d)))   %>% head(3)
+
+bot_line <- paste(sprintf("`%s` g=%+.2f (q=%.3f)", top_bot$code_id, top_bot$d, top_bot$q_bh_role),  # FIX 2026-09-30 (I2/I4): g label + q
+                  collapse = "; ")
+usr_line <- paste(sprintf("`%s` g=%+.2f (q=%.3f)", top_usr$code_id, top_usr$d, top_usr$q_bh_role),  # FIX 2026-09-30 (I2/I4): g label + q
+                  collapse = "; ")
+
+# FIX 2026-09-30 (I4): live multiplicity summary per role family (q < .05).
+role_sum <- chat_results %>% group_by(role) %>%  # FIX 2026-09-30 (I4)
+  summarise(k = n(), n_p = sum(p < .05, na.rm = TRUE),  # FIX 2026-09-30 (I4)
+            n_q = sum(q_bh_role < .05, na.rm = TRUE), .groups = "drop")         # FIX 2026-09-30 (I4)
+role_str <- paste(sprintf("%s codes: %d of %d at p < .05, %d at q < .05",  # FIX 2026-09-30 (I4)
+                          role_sum$role, role_sum$n_p, role_sum$k, role_sum$n_q),  # FIX 2026-09-30 (I4)
+                  collapse = "; ")                                               # FIX 2026-09-30 (I4)
+stopifnot(all(c("self_disclosure", "mirroring_user_emotion") %in% chat_results$code_id[chat_results$role == "bot"]))  # FIX 2026-09-30 (I6/R4): guard for the sentence below
+cat(sprintf(paste(
+  "**Reading.** The three strongest **bot-side** effects: %s.",  # FIX 2026-09-30 (I6): sentence split; unconditional claim below removed
+  "The bot-side family mixes codes that target the manipulated trait with trait-general conversational codes",  # FIX 2026-09-30 (I6/R4): the bot family is not all fidelity codes (self_disclosure, mirroring_user_emotion are retained trait-general codes per chat_rubric_chat_v1.json)
+  "(including the bot's own self-disclosure and its mirroring of the user's emotion), so the bot-code count in the multiplicity line below is not a count of manipulation-fidelity checks.",  # FIX 2026-09-30 (I6/R4)
+  "**User-side** strongest effects: %s.",  # FIX 2026-09-30 (I4); (I6): line re-wrapped
+  "Multiplicity (BH-FDR within role; family = all coded features for that role; threshold q < .05): %s.\n"),  # FIX 2026-09-30 (I4): replaces unconditional "Most other user codes are small or null"
+  bot_line, usr_line, role_str))  # FIX 2026-09-30 (I4)
+```
+
+---
+
+# Length-adjusted bonding (NLP parallel to R §7 verbosity adjustment)
+
+The core R pipeline's verbosity analysis adjusts the self-report outcomes for
+**bot verbosity**, measured as mean bot completion tokens per turn
+(`bot_tokens_c`, centred); its results are in `outputs/R/tables/05_verbosity_adjusted.csv`.
+This section applies the parallel adjustment to the NLP-derived bonding-relevant
+signals: bot mirroring, user bonding language, user disclosure, and participant-mean
+sentiment (the bot's anxiety/volatility codes are the manipulation itself and are
+not adjusted). The covariates here are mean bot and user **words** per turn from
+the chat-coded transcripts. We report the condition coefficient before and after
+adjustment descriptively.
+<!-- FIX 2026-09-30 (I6): was "The R Rmd's §7 verbosity analysis showed that bonding effects on PSR / EC / Trust survive after controlling for bot verbosity (bot_chars_per_turn)" — wrong covariate (the core covariate is bot completion tokens per turn, bot_tokens_c) and a stale result claim; the outcome list also named anxiety/volatility, which the code does not adjust. -->
+
+```{r length-adjusted-bonding}
+# ─────────────────────────────────────────────────────────────────────────────
+# LENGTH-ADJUSTED BONDING REGRESSIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# For each NLP-side bonding outcome, fit two models on the master table:
+#   raw:      outcome ~ condition
+#   adjusted: outcome ~ condition + mean_bot_words_per_turn + mean_user_words_per_turn
+# Then compare the condition coefficient before and after adjustment.
+# This is the NLP parallel to R's verbosity-adjusted bonding analyses.
+
+cond_dummy <- as.integer(master$condition_label == "HighN")
+
+# Helper: fit raw and adjusted regression for one outcome column
+fit_pair <- function(outcome_col) {
+  y <- master[[outcome_col]]
+  if (sum(!is.na(y)) < 10) return(NULL)
+  d_raw <- tibble(y = y, cond = cond_dummy,
+                  bot_w = master$mean_bot_words_per_turn,
+                  usr_w = master$mean_user_words_per_turn)
+  d_raw <- d_raw[complete.cases(d_raw), ]
+
+  raw_fit <- lm(y ~ cond, data = d_raw)
+  adj_fit <- lm(y ~ cond + bot_w + usr_w, data = d_raw)
+
+  raw_t  <- broom::tidy(raw_fit) %>% filter(term == "cond")
+  adj_t  <- broom::tidy(adj_fit) %>% filter(term == "cond")
+  raw_eta2 <- summary(raw_fit)$r.squared *
+              (anova(raw_fit)["cond","Sum Sq"] / sum(anova(raw_fit)[,"Sum Sq"]))
+
+  tibble(
+    outcome  = outcome_col,
+    n        = nrow(d_raw),
+    raw_b    = raw_t$estimate,
+    raw_se   = raw_t$std.error,
+    raw_p    = raw_t$p.value,
+    adj_b    = adj_t$estimate,
+    adj_se   = adj_t$std.error,
+    adj_p    = adj_t$p.value,
+    pct_change_b = (raw_t$estimate - adj_t$estimate) / raw_t$estimate * 100,
+    bot_w_p  = broom::tidy(adj_fit) %>% filter(term == "bot_w") %>% pull(p.value),
+    usr_w_p  = broom::tidy(adj_fit) %>% filter(term == "usr_w") %>% pull(p.value)
+  )
+}
+
+# Outcomes to adjust: the BONDING-relevant signals only — NOT the manipulation-
+# fidelity codes. Bot anxiety/volatility/calm ARE the manipulation, so verbosity-
+# adjusting them is meaningless; they are excluded here. Bonding-relevant signals =
+# bot responsiveness (mirroring), user bonding language, user disclosure, sentiment.
+length_adj <- bind_rows(
+  fit_pair("pct_mirroring_user_emotion")  %>% mutate(measure = "Bot mirroring (chat)"),
+  fit_pair("pct_bonding_language")        %>% mutate(measure = "User bonding language (chat)"),
+  fit_pair("pct_emotional_self_disclosure") %>% mutate(measure = "User disclosure (chat)"),
+  fit_pair("roberta_score_mean")          %>% mutate(measure = "Sentiment (Roberta, mean across OE)"),
+  fit_pair("emotion_joy_mean")            %>% mutate(measure = "Sentiment (Emotion: joy, mean across OE)")
+) %>%
+  select(measure, n, raw_b, raw_p, adj_b, adj_p, pct_change_b, bot_w_p, usr_w_p)
+
+length_adj %>%
+  mutate(across(c(raw_b, adj_b, pct_change_b), ~ round(.x, 3)),
+         raw_p = format.pval(raw_p, digits = 3, eps = 1e-6),
+         adj_p = format.pval(adj_p, digits = 3, eps = 1e-6),
+         bot_w_p = format.pval(bot_w_p, digits = 3, eps = 1e-4),
+         usr_w_p = format.pval(usr_w_p, digits = 3, eps = 1e-4)) %>%
+  ktab(caption = paste0("Length-adjusted bonding regressions. ",
+                        "Raw column = condition coefficient with no controls. ",
+                        "Adj = same coefficient after adding bot/user words-per-turn covariates."))
+
+write_csv(length_adj, file.path(OUT_TAB, "06c_length_adjusted_bonding.csv"))
+```
+
+```{r length-adj-plot, fig.height=5}
+# Visualize raw vs adjusted condition coefficients
+la_plot <- length_adj %>%
+  pivot_longer(c(raw_b, adj_b), names_to = "model", values_to = "b") %>%
+  mutate(model = recode(model, raw_b = "Raw (condition only)",
+                                adj_b = "Adjusted (+ bot/user verbosity)"),
+         measure = fct_reorder(measure, b, .fun = max))
+
+p_la <- ggplot(la_plot, aes(x = b, y = measure, color = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = c("Raw (condition only)" = "#2c3e50",
+                                 "Adjusted (+ bot/user verbosity)" = "#dc2626")) +
+  labs(
+    title    = "Bonding signals: raw vs verbosity-adjusted condition coefficient",
+    subtitle = "Condition coefficient with no covariates (dark) vs. adjusted for bot and user words per turn (red)",  # FIX 2026-09-30 (I6): was an implicit robustness rule ("If the red dot stays close ... verbosity isn't driving the effect")
+    x = "Condition coefficient (HighN − LowN, raw units of outcome)",
+    y = NULL, color = NULL, shape = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title.position = "plot",
+        legend.position = "bottom",
+        panel.grid.major.y = element_blank())
+
+save_fig(p_la, "06c_length_adjusted_bonding", width = 9, height = 5)
+p_la
+```
+
+```{r length-adj-narrative, results='asis'}
+# Dynamic narrative for length-adjusted bonding
+robust   <- length_adj %>% filter(raw_p < 0.05 & adj_p < 0.05)
+dropped  <- length_adj %>% filter(raw_p < 0.05 & adj_p >= 0.05)
+
+# FIX 2026-09-30 (I6): purely descriptive. Removed the arbitrary ">25% attenuation"
+#   count and the evaluative sentences ("carry the bonding story", "partly mediated
+#   by talkativeness"), which took a position on a robustness criterion that has
+#   not been specified. Per-outcome raw/adjusted b and p are reported instead.
+#   pct_change_b in 06c = (raw_b − adj_b)/raw_b × 100 (positive = attenuation).
+la_lines <- sprintf("%s: raw b = %+.3f (%s), adjusted b = %+.3f (%s), change in b = %+.1f%% of raw",  # FIX 2026-09-30 (I6)
+                    length_adj$measure, length_adj$raw_b, fmt_p(length_adj$raw_p),  # FIX 2026-09-30 (I6)
+                    length_adj$adj_b, fmt_p(length_adj$adj_p),  # FIX 2026-09-30 (I6)
+                    -length_adj$pct_change_b)                                    # FIX 2026-09-30 (I6)
+# FIX 2026-09-30 (I6): the 06c set is not all "bonding outcomes" (in Study 1 it
+#   includes the bot manipulation codes). Label each measure by side for the TEXT
+#   only; 06c and length_adj are unchanged.
+la_plural <- c("bot manipulation code"      = "bot manipulation codes",           # FIX 2026-09-30 (I6)
+               "other bot-side chat code"   = "other bot-side chat codes",        # FIX 2026-09-30 (I6)
+               "user-side chat code"        = "user-side chat codes",             # FIX 2026-09-30 (I6)
+               "participant sentiment measure" = "participant sentiment measures") # FIX 2026-09-30 (I6)
+la_side <- function(m) dplyr::case_when(                                          # FIX 2026-09-30 (I6)
+  m %in% c("Bot warmth (chat)", "Bot agreeable compliance (chat)",                # FIX 2026-09-30 (I6)
+           "Bot resistance (chat)")  ~ "bot manipulation code",                   # FIX 2026-09-30 (I6)
+  grepl("^Bot ", m)                  ~ "other bot-side chat code",                # FIX 2026-09-30 (I6)
+  grepl("^User ", m)                 ~ "user-side chat code",                     # FIX 2026-09-30 (I6)
+  grepl("^Sentiment", m)             ~ "participant sentiment measure",           # FIX 2026-09-30 (I6)
+  TRUE                               ~ NA_character_)                             # FIX 2026-09-30 (I6)
+stopifnot(!anyNA(la_side(length_adj$measure)))                                    # FIX 2026-09-30 (I6): every 06c measure must get a side label
+la_counts <- function(m) {                                                        # FIX 2026-09-30 (I6)
+  tb <- table(factor(la_side(m), levels = names(la_plural))); tb <- tb[tb > 0]    # FIX 2026-09-30 (I6)
+  paste(sprintf("%d %s", as.integer(tb),                                          # FIX 2026-09-30 (I6)
+                ifelse(tb == 1, names(tb), la_plural[names(tb)])), collapse = ", ")  # FIX 2026-09-30 (I6)
+}                                                                                 # FIX 2026-09-30 (I6)
+la_names <- function(df) if (nrow(df) == 0) "none" else                           # FIX 2026-09-30 (I6)
+  paste0(df$measure, " [", la_side(df$measure), "]", collapse = "; ")             # FIX 2026-09-30 (I6)
+la_rawsig <- length_adj %>% filter(raw_p < 0.05)                                  # FIX 2026-09-30 (I6)
+cat(sprintf(paste(
+  "**Reading.** Of the %d NLP outcomes tested (%s), the condition coefficient has p < .05",  # FIX 2026-09-30 (I6): was "bonding outcomes"
+  "in the raw model for %d (%s); of those, it also has p < .05 after adjusting for bot and user",  # FIX 2026-09-30 (I6)
+  "words-per-turn for %d (%s) and not for %d (%s).\n\n%s\n"),  # FIX 2026-09-30 (I6)
+  nrow(length_adj), la_counts(length_adj$measure),  # FIX 2026-09-30 (I6)
+  nrow(la_rawsig), la_names(la_rawsig),  # FIX 2026-09-30 (I6)
+  nrow(robust), la_names(robust), nrow(dropped), la_names(dropped),  # FIX 2026-09-30 (I6)
+  paste0("- ", la_lines, collapse = "\n")))                                     # FIX 2026-09-30 (I6)
+```
+
+---
+
+# Onset and trajectory: when does bonding emerge?
+
+NB08 records two temporal features for each of four bonding-relevant codes
+(bot `expressed_anxiety`, bot `mirroring_user_emotion`, user
+`emotional_self_disclosure`, user `bonding_language`):
+
+- **Onset:** the index of the first turn at which the code appeared
+  (NA if it never appeared during this participant's conversation).
+- **Trajectory:** (rate in second half of conversation) − (rate in first half).
+  Positive values mean the code grew across the conversation; negative
+  means it faded.
+
+For each code we ask three orthogonal questions:
+
+1. **EVER appeared?** Does HighN differ from LowN in the fraction of
+   participants who ever produced this code at all? (Fisher's exact on 0/1)
+2. **WHEN, conditional on ever?** Among participants who did show the code,
+   did it appear earlier in HighN than in LowN? (Welch t on onset turn,
+   subset to participants with non-NA onset)
+3. **GROW over the conversation?** Did the second-half rate exceed the
+   first-half rate more in one condition? (Welch t on trajectory)
+
+```{r onset-trajectory-build}
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull the onset_* and trajectory_* columns out of chat_feat and tidy them.
+# ─────────────────────────────────────────────────────────────────────────────
+# chat_feat has 8 columns: onset_<4 codes> and trajectory_<same 4 codes>.
+# We pivot to long form so we can group_modify by code.
+
+bonding_codes_short <- c(
+  user_emotional_self_disclosure = "User: emotional disclosure",
+  user_bonding_language          = "User: bonding language",
+  bot_expressed_anxiety          = "Bot: expressed anxiety",
+  bot_mirroring_user_emotion     = "Bot: mirroring user emotion"
+)
+
+onset_long <- chat_feat %>%
+  select(sona_id, condition_label, starts_with("onset_")) %>%
+  pivot_longer(-c(sona_id, condition_label),
+               names_to = "code", values_to = "onset") %>%
+  mutate(code = sub("^onset_", "", code),
+         ever = as.integer(!is.na(onset)))
+
+traj_long <- chat_feat %>%
+  select(sona_id, condition_label, starts_with("trajectory_")) %>%
+  pivot_longer(-c(sona_id, condition_label),
+               names_to = "code", values_to = "trajectory") %>%
+  mutate(code = sub("^trajectory_", "", code))
+
+# Quick sanity check: how many participants ever showed each code
+onset_long %>%
+  group_by(code, condition_label) %>%
+  summarise(n_total = n(),
+            n_ever = sum(ever),
+            pct_ever = mean(ever), .groups = "drop") %>%
+  mutate(code_label = bonding_codes_short[code]) %>%
+  ktab(caption = "Ever-appeared counts by code × condition")
+```
+
+```{r onset-trajectory-tests}
+# ─────────────────────────────────────────────────────────────────────────────
+# Three analyses per code (Q1 ever, Q2 when, Q3 grow)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Q1: Fisher's exact on EVER-appeared by condition
+ever_results <- onset_long %>%
+  group_by(code) %>%
+  group_modify(~ {
+    # Re-shape so fisher_h sees a column named 'ever_val' to test
+    res <- fisher_h(.x %>% mutate(ever_val = ever), "ever_val")
+    res
+  }) %>%
+  ungroup() %>%
+  mutate(analysis = "ever_appeared",
+         metric   = "% who ever showed code")
+
+# Q2: Welch t on onset turn, restricted to participants who showed the code
+# (NA onsets dropped). Negative diff = HighN earlier onset.
+when_results <- onset_long %>%
+  filter(!is.na(onset)) %>%
+  group_by(code) %>%
+  group_modify(~ welch_d(.x, "onset")) %>%
+  ungroup() %>%
+  mutate(analysis = "onset_turn",
+         metric   = "first turn appearing (lower = earlier)")
+
+# Q3: Welch t on trajectory (positive = code grew across conversation)
+grow_results <- traj_long %>%
+  filter(!is.na(trajectory)) %>%
+  group_by(code) %>%
+  group_modify(~ welch_d(.x, "trajectory")) %>%
+  ungroup() %>%
+  mutate(analysis = "trajectory_2nd_minus_1st",
+         metric   = "2nd-half rate − 1st-half rate")
+
+# Combine all three sets of tests
+onset_traj_all <- bind_rows(
+  # Standardize column names: ever_results uses p_HighN/p_LowN/cohen_h;
+  # when/grow use mean_HighN/mean_LowN/d. Map to a common schema.
+  ever_results %>%
+    transmute(code, analysis, metric,
+              n_HighN, n_LowN,
+              val_HighN = p_HighN, val_LowN = p_LowN,
+              diff, effect_size = cohen_h, effect_type = "Cohen's h",
+              p),
+  when_results %>%
+    transmute(code, analysis, metric,
+              n_HighN, n_LowN,
+              val_HighN = mean_HighN, val_LowN = mean_LowN,
+              diff, effect_size = d, effect_type = "Hedges' g",   # FIX 2026-09-30 (I2): was "Cohen's d"
+              p, d_ci_lo, d_ci_hi,  # FIX 2026-09-30 (I2)
+              cohens_d, cohens_d_ci_lo, cohens_d_ci_hi),          # FIX 2026-09-30 (I2): keep old values
+  grow_results %>%
+    transmute(code, analysis, metric,
+              n_HighN, n_LowN,
+              val_HighN = mean_HighN, val_LowN = mean_LowN,
+              diff, effect_size = d, effect_type = "Hedges' g",   # FIX 2026-09-30 (I2): was "Cohen's d"
+              p, d_ci_lo, d_ci_hi,  # FIX 2026-09-30 (I2)
+              cohens_d, cohens_d_ci_lo, cohens_d_ci_hi)           # FIX 2026-09-30 (I2): keep old values
+) %>%
+  mutate(code_label = bonding_codes_short[code]) %>%
+  arrange(code, analysis)
+
+# Display: pretty table
+onset_traj_all %>%
+  select(code_label, analysis, n_HighN, n_LowN,
+         val_HighN, val_LowN, diff, effect_size, effect_type, p) %>%
+  mutate(across(c(val_HighN, val_LowN, diff, effect_size), ~ round(.x, 3)),
+         p = format.pval(p, digits = 3, eps = 1e-4)) %>%
+  ktab(caption = "Onset / trajectory tests by bonding code × condition")
+
+write_csv(onset_traj_all, file.path(OUT_TAB, "06b_onset_trajectory.csv"))
+```
+
+```{r onset-trajectory-plot, fig.height=5}
+# ─────────────────────────────────────────────────────────────────────────────
+# Forest-style figure: effect size per (code × analysis)
+# ─────────────────────────────────────────────────────────────────────────────
+# Cohen's h (for ever-appeared) and Hedges' g (for onset and trajectory) are   # FIX 2026-09-30 (I2): was Cohen's d
+# on different scales but conceptually comparable in magnitude. Plot side
+# by side so direction and rough magnitude are visible at a glance.
+
+ot_plot <- onset_traj_all %>%
+  mutate(
+    analysis_label = case_when(
+      analysis == "ever_appeared"            ~ "1. Ever appeared (Cohen's h)",
+      analysis == "onset_turn"               ~ "2. Onset turn (Hedges' g; – = HighN earlier)",      # FIX 2026-09-30 (I2): was Cohen's d
+      analysis == "trajectory_2nd_minus_1st" ~ "3. Trajectory (Hedges' g; + = grew more in HighN)"      # FIX 2026-09-30 (I2): was Cohen's d; FIX 2026-09-30 (I6): was "+ = grew over time" (g is the HighN − LowN difference in 2nd−1st-half change)
+    ),
+    code_label = factor(code_label, levels = unname(bonding_codes_short)),
+    sig = ifelse(p < 0.05, "p<.05", "ns")
+  )
+
+p_ot <- ggplot(ot_plot, aes(x = effect_size, y = code_label, color = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  # CIs only available for Hedges' g (when/grow), not for h   # FIX 2026-09-30 (I2): was Cohen's d
+  geom_errorbarh(aes(xmin = d_ci_lo, xmax = d_ci_hi),
+                 height = 0.15, na.rm = TRUE) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("p<.05" = "#16a34a", "ns" = "grey60")) +
+  facet_wrap(~ analysis_label, ncol = 1, scales = "free_x") +
+  labs(
+    title    = "Bonding codes — onset and trajectory by condition",
+    subtitle = "Effect size (HighN – LowN). Ever: + = more often in HighN; Onset: – = HighN earlier; Trajectory: + = grew more in HighN.",  # FIX 2026-09-30 (I6): was "Positive: more/earlier/grew in HighN" (wrong sign for onset: onset g = mean HighN turn − mean LowN turn, so + = HighN later)
+    x = "Effect size",
+    y = NULL,
+    color = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title.position = "plot",
+        strip.text = element_text(face = "bold", hjust = 0),
+        panel.grid.major.y = element_blank())
+
+save_fig(p_ot, "06b_onset_trajectory", width = 9, height = 6)
+p_ot
+```
+
+**Reading the three panels.**
+
+- **Panel 1 (Ever appeared)** answers: "did the manipulation change which
+  participants ever produced this code at all?" Larger positive h means
+  more HighN participants showed it. For bot codes (anxiety, mirroring) this
+  is largely about prompt compliance. For user codes (disclosure, bonding
+  language) it captures whether HighN Sylva elicited any of that behavior.
+
+- **Panel 2 (Onset turn)** answers: "among participants who did show the
+  code, when did it first appear?" Negative g (Hedges' g) = HighN earlier. The
+  interesting case is bot anxiety: a HighN bot should not just be more
+  anxious on average but anxious **sooner** in the conversation. Similarly
+  for user bonding language and disclosure — does HighN accelerate openness?
+
+- **Panel 3 (Trajectory)** answers: "did this code grow or fade across the
+  conversation?" Positive g = grew more under HighN. The bonding
+  hypothesis predicts user disclosure and bonding language should grow
+  *more* under HighN as participants are drawn in. Bot codes are less
+  hypothesis-driven here (the prompt is constant) but worth seeing
+  whether HighN Sylva escalates anxiety or stays flat.
+<!-- FIX 2026-09-30 (I2): "d" -> "g" in the Panel 2/3 descriptions above (the plotted effect is now Hedges' g). -->
+
+---
+
+# Cross-modal convergence
+
+Within-participant correlations between bonding measures across modalities.
+The dissociation hypothesis predicts: bonding measures should correlate
+within themselves and with chat-coded bot anxiety/vulnerability; liability
+measures should be relatively independent of all bonding signals.
+
+```{r convergence-matrix, fig.height=7}
+# ─────────────────────────────────────────────────────────────────────────────
+# WITHIN-PARTICIPANT CROSS-MODAL CORRELATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# We pick representative measures from each modality and correlate them.
+
+corr_vars <- c(
+  # Self-report bonding
+  "psr_total" = "PSR (self-report)",
+  "ec_total"  = "EC (self-report)",
+  "trust_total" = "Trust (self-report)",
+  "et_total"    = "Experience-Taking",   # FIX 2026-09-30 (I3): added (was missing from corr_vars)
+  # Self-report liability/mind
+  "liab_corp" = "Corp Liability",
+  "liab_chat" = "Chatbot Resp",
+  "liab_user" = "User Resp",
+  "liab_harm" = "Harm Severity",         # FIX 2026-09-30 (I3): added (was missing from corr_vars)
+  "ma_total"  = "Moral Agency",
+  "mp_total"  = "Moral Patiency",
+  # Chat behaviour (bot)
+  "pct_expressed_anxiety" = "Bot anxiety (chat)",
+  # Chat behaviour (user)
+  "pct_bonding_language" = "User bonding lang (chat)",
+  "pct_emotional_self_disclosure" = "User disclosure (chat)",
+  # Sentiment
+  "roberta_score_mean" = "Sentiment (mean Roberta)",
+  "emotion_joy_mean"   = "Sentiment (mean joy)"
+)
+corr_keys <- names(corr_vars)
+stopifnot(all(corr_keys %in% names(master)))   # FIX 2026-09-30 (I3): fail loudly instead of any_of() silently dropping a variable
+corr_data <- master %>% select(any_of(corr_keys))
+
+cor_mat <- cor(corr_data, use = "pairwise.complete.obs", method = "pearson")
+# Rename for plotting
+rownames(cor_mat) <- corr_vars[rownames(cor_mat)]
+colnames(cor_mat) <- corr_vars[colnames(cor_mat)]
+
+# Long form for ggplot heatmap
+cor_long <- as_tibble(cor_mat, rownames = "row") %>%
+  pivot_longer(-row, names_to = "col", values_to = "r")
+
+p_corr <- ggplot(cor_long, aes(x = col, y = row, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.6) +
+  scale_fill_gradient2(low = "#3b82f6", mid = "white", high = "#dc2626",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(
+    title    = "Cross-modal correlations (per participant)",
+    subtitle = "Pearson r, pairwise complete (n, p and 95% CI in 07b_cross_modal_inference.csv)",  # FIX 2026-09-30 (I6): was the result claim "bonding signals cluster, liability signals don't"
+    x = NULL, y = NULL, fill = "r"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title.position = "plot")
+
+save_fig(p_corr, "07_cross_modal_corr", width = 10, height = 7)
+p_corr
+
+write_csv(as_tibble(cor_mat, rownames = "measure"),
+          file.path(OUT_TAB, "07_cross_modal_correlations.csv"))
+
+# FIX 2026-09-30 (I3): long inference table for every unordered pair — r, n
+#   (pairwise complete), t, df, p and the 95% CI from cor.test(). The wide 07
+#   matrix above is unchanged in method (pairwise-complete Pearson r).
+pair_idx <- t(combn(corr_keys, 2))                                               # FIX 2026-09-30 (I3)
+cross_modal_inf <- map_dfr(seq_len(nrow(pair_idx)), function(i) {               # FIX 2026-09-30 (I3)
+  k1 <- pair_idx[i, 1]; k2 <- pair_idx[i, 2]  # FIX 2026-09-30 (I3)
+  x <- master[[k1]]; y <- master[[k2]]; ok <- !is.na(x) & !is.na(y)  # FIX 2026-09-30 (I3)
+  ct <- cor.test(x[ok], y[ok], method = "pearson")  # FIX 2026-09-30 (I3)
+  tibble(var1 = unname(corr_vars[k1]), var2 = unname(corr_vars[k2]),  # FIX 2026-09-30 (I3)
+         var1_key = k1, var2_key = k2,  # FIX 2026-09-30 (I3)
+         r = unname(ct$estimate), n = sum(ok),  # FIX 2026-09-30 (I3)
+         t = unname(ct$statistic), df = unname(ct$parameter), p = ct$p.value,  # FIX 2026-09-30 (I3)
+         ci_lo = ct$conf.int[1], ci_hi = ct$conf.int[2])  # FIX 2026-09-30 (I3)
+})                                                                               # FIX 2026-09-30 (I3)
+# Sanity: long-table r must equal the wide-matrix r for every pair.
+stopifnot(isTRUE(all.equal(cross_modal_inf$r,  # FIX 2026-09-30 (I3)
+                           cor_mat[cbind(cross_modal_inf$var1, cross_modal_inf$var2)],  # FIX 2026-09-30 (I3)
+                           tolerance = 1e-10)))                                  # FIX 2026-09-30 (I3)
+write_csv(cross_modal_inf, file.path(OUT_TAB, "07b_cross_modal_inference.csv")) # FIX 2026-09-30 (I3)
+cat(sprintf("07b: %d pairs; pairwise n range %d–%d.\n", nrow(cross_modal_inf),  # FIX 2026-09-30 (I3)
+            min(cross_modal_inf$n), max(cross_modal_inf$n)))                    # FIX 2026-09-30 (I3)
+```
+
+<!-- FIX 2026-09-30 (I6): the hard-coded reading (PSR–EC r = .82, PSR–Trust .74, ~.5, ~.25, ~.4–.5, r ≈ −.05, r = −.25, Corp–Chatbot r = .53) is replaced by the live chunk below; values are pulled from 07b with n and p. -->
+
+```{r convergence-narrative, results='asis'}
+# FIX 2026-09-30 (I6): live cross-modal reading from the 07b inference table.
+get_pair <- function(a, b) cross_modal_inf %>%  # FIX 2026-09-30 (I6)
+  filter((var1_key == a & var2_key == b) | (var1_key == b & var2_key == a))     # FIX 2026-09-30 (I6)
+fmt_pair <- function(a, b) { x <- get_pair(a, b)  # FIX 2026-09-30 (I6)
+  sprintf("%s–%s r = %+.2f (n = %d, %s)", corr_vars[a], corr_vars[b], x$r, x$n, fmt_p(x$p)) }  # FIX 2026-09-30 (I6)
+bond_keys <- c("psr_total", "ec_total", "trust_total")                          # FIX 2026-09-30 (I6)
+liab_keys <- c("liab_corp", "liab_chat", "liab_user", "liab_harm")              # FIX 2026-09-30 (I6)
+bot_key   <- "pct_expressed_anxiety"                                            # FIX 2026-09-30 (I6)
+bl <- cross_modal_inf %>%  # FIX 2026-09-30 (I6)
+  filter((var1_key %in% bond_keys & var2_key %in% liab_keys) |  # FIX 2026-09-30 (I6)
+         (var1_key %in% liab_keys & var2_key %in% bond_keys))                   # FIX 2026-09-30 (I6)
+cat(sprintf(paste0(  # FIX 2026-09-30 (I6)
+  "**Reading.** Within the self-report bonding block: %s; %s. Within the liability block: %s. ",  # FIX 2026-09-30 (I6): liab_corp–liab_chat moved out of the bonding clause (it is a liability pair)
+  "Bot behaviour vs. bonding and disclosure: %s; %s. ",  # FIX 2026-09-30 (I6)
+  "Bonding × liability (%d pairs incl. Harm Severity): r range %+.2f to %+.2f; %d of %d at p < .05. ",  # FIX 2026-09-30 (I6)
+  "Experience-Taking: %s; %s. ",  # FIX 2026-09-30 (I6)
+  "These are within-participant correlations (structure), not condition effects; p values are unadjusted (%d pairs in 07b).\n"),  # FIX 2026-09-30 (I6)
+  fmt_pair("psr_total", "ec_total"), fmt_pair("psr_total", "trust_total"), fmt_pair("liab_corp", "liab_chat"),  # FIX 2026-09-30 (I6)
+  fmt_pair(bot_key, "psr_total"), fmt_pair(bot_key, "pct_emotional_self_disclosure"),  # FIX 2026-09-30 (I6)
+  nrow(bl), min(bl$r), max(bl$r), sum(bl$p < .05), nrow(bl),  # FIX 2026-09-30 (I6)
+  fmt_pair("et_total", "psr_total"), fmt_pair("et_total", "liab_harm"),  # FIX 2026-09-30 (I6)
+  nrow(cross_modal_inf)))                                                        # FIX 2026-09-30 (I6)
+```
+
+---
+
+# Manipulation vs. downstream outcomes, summarized
+
+```{r dissociation-summary, fig.height=5}
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE SUMMARY FIGURE: a powerful manipulation, but flat bonding AND liability outcomes
+# ─────────────────────────────────────────────────────────────────────────────
+# Build a unified table of d values for headline measures across modalities.
+# NOTE: the bot's coded anxiety is the MANIPULATION (the treatment), not a bonding
+# outcome — it is shown in its own "Manipulation check" band, never under Bonding.
+
+headline <- bind_rows(
+  # Manipulation check at the behavioural level (the treatment, not an outcome)
+  welch_d(master, "pct_expressed_anxiety") %>% mutate(measure = "Bot anxiety (chat) — manipulation", family = "Manipulation check"),
+  # Bonding self-report
+  welch_d(master, "psr_total")    %>% mutate(measure = "PSR (self-report)", family = "Bonding"),
+  welch_d(master, "ec_total")     %>% mutate(measure = "EC (self-report)",  family = "Bonding"),
+  welch_d(master, "trust_total")  %>% mutate(measure = "Trust (self-report)", family = "Bonding"),
+  # Bonding behaviour (user side)
+  welch_d(master, "pct_bonding_language") %>% mutate(measure = "User bonding lang (chat)", family = "Bonding"),
+  # Bonding sentiment
+  {tmp <- welch_d(sent_resp %>% filter(oe_field == "oe_experience"), "roberta_score")
+   tmp$measure <- "OE1 sentiment (Roberta)"; tmp$family <- "Bonding"; tmp},
+  # Liability self-report
+  welch_d(master, "liab_corp") %>% mutate(measure = "Corp Liability (self-report)", family = "Liability"),
+  welch_d(master, "liab_chat") %>% mutate(measure = "Chatbot Resp (self-report)",   family = "Liability"),
+  welch_d(master, "liab_user") %>% mutate(measure = "User Resp (self-report)",      family = "Liability"),
+  welch_d(master, "liab_harm") %>% mutate(measure = "Harm Severity (self-report)",  family = "Liability"),
+  # Liability sentiment (OE3, OE4)
+  {tmp <- welch_d(sent_resp %>% filter(oe_field == "oe_responsibility"), "roberta_score")
+   tmp$measure <- "OE3 sentiment (Roberta)"; tmp$family <- "Liability"; tmp},
+  {tmp <- welch_d(sent_resp %>% filter(oe_field == "oe_compensation"), "roberta_score")
+   tmp$measure <- "OE4 sentiment (Roberta)"; tmp$family <- "Liability"; tmp}
+)
+
+headline <- headline %>%
+  mutate(measure = fct_reorder(measure, d),
+         family = factor(family, levels = c("Manipulation check","Bonding","Liability")))
+
+p_diss <- ggplot(headline, aes(x = d, y = measure, color = family)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = d_ci_lo, xmax = d_ci_hi), height = 0.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Manipulation check" = "#6b7280", Bonding = "#16a34a", Liability = "#3b82f6")) +
+  facet_grid(family ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "Manipulation vs. downstream outcomes",                                   # FIX 2026-09-30 (I6): was the result claim "A powerful manipulation, but flat downstream outcomes"
+    subtitle = "Hedges' g (anxious − calm), 95% CI. Top band is the manipulation itself (the bot's coded anxiety), not an outcome.",  # FIX 2026-09-30 (I2): was Cohen's d
+    x = "Hedges' g (anxious − calm)", y = NULL, color = NULL                             # FIX 2026-09-30 (I2): was Cohen's d
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text.y = element_text(angle = 0),
+        plot.title.position = "plot",
+        panel.grid.major.y = element_blank())
+
+save_fig(p_diss, "08_dissociation_summary", width = 9, height = 5)
+p_diss
+
+write_csv(headline %>% mutate(measure = as.character(measure)),
+          file.path(OUT_TAB, "08_dissociation_summary.csv"))
+```
+
+<!-- FIX 2026-09-30 (I6): the hard-coded headline (d≈3.1, −0.05 to −0.23, −0.11, +0.39, 0–0.27, −0.06 to −0.19) is replaced by the live chunk below. These are unadjusted per-measure tests; the confirmatory, multiplicity-controlled outcome tests live in the core pipeline. -->
+
+```{r dissociation-narrative, results='asis'}
+# FIX 2026-09-30 (I6): live headline from the `headline` table.
+fam_line <- function(fam) {                                                      # FIX 2026-09-30 (I6)
+  x <- headline %>% filter(family == fam) %>% arrange(desc(d))  # FIX 2026-09-30 (I6)
+  sprintf("**%s** (%d of %d at p < .05, unadjusted): %s", fam, sum(x$p < .05), nrow(x),  # FIX 2026-09-30 (I6)
+          paste(sprintf("%s g = %+.2f (%s)", as.character(x$measure), x$d, fmt_p(x$p)), collapse = "; "))  # FIX 2026-09-30 (I6)
+}  # FIX 2026-09-30 (I6)
+cat(paste0("**The headline.** ", paste(sapply(levels(headline$family), fam_line), collapse = ". "), ".\n"))  # FIX 2026-09-30 (I6)
+```
+
+---
+
+# Save master evidence table
+
+```{r save-evidence}
+# ─────────────────────────────────────────────────────────────────────────────
+# MASTER EVIDENCE TABLE — one row per claim, all stats, for doc rebuild
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reshape onset_traj_all to match the layer-table schema (measure, family, d, ...).
+onset_traj_for_evidence <- onset_traj_all %>%
+  transmute(
+    measure  = paste0(code_label, " — ", analysis),
+    layer    = "onset_trajectory",
+    n_HighN, n_LowN,
+    mean_HighN = val_HighN, mean_LowN = val_LowN,
+    diff,
+    d        = effect_size,
+    d_ci_lo, d_ci_hi,
+    p,  # FIX 2026-09-30 (I2)
+    cohens_d, cohens_d_ci_lo, cohens_d_ci_hi   # FIX 2026-09-30 (I2): carry old Cohen's d columns
+  )
+
+evidence <- bind_rows(
+  mf_table     %>% mutate(layer = "manipulation_fidelity"),
+  diffusion_df %>% mutate(layer = "diffusion"),
+  headline     %>% mutate(layer = "headline_dissociation",
+                          measure = as.character(measure)),
+  onset_traj_for_evidence
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+write_csv(evidence, file.path(OUT_TAB, "00_evidence_master.csv"))
+
+cat("Saved master evidence table to:\n")
+cat("  ", file.path(OUT_TAB, "00_evidence_master.csv"), "\n\n")
+cat("All other per-section tables saved alongside; figures in outputs/integration/figures/.\n")
+```
+
+---
+
+# Participant personality × NLP-derived outcomes
+
+Section 7 looked at how NLP-side bonding measures correlate with each other and with self-report outcomes. This section asks a different question: do baseline participant characteristics (their own personality, mental health, attitudes toward AI, attitudes toward free speech) predict NLP-derived outcomes, regardless of condition?
+
+This complements the moderation analyses in the R Rmd (which test whether personality changes the size of the condition effect) and the cross-modal correlation matrix in §7 (which uses outcome-side measures only). Here we add personality predictors and look at their main-effect correlations with NLP-derived measures.
+
+```{r personality-nlp-matrix, fig.height=7}
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSONALITY × NLP CROSS-MODAL CORRELATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull baseline scales from analytic and join with NLP-derived measures from
+# the master table. Compute Pearson correlations across all participants.
+
+personality_vars <- c(
+  "tipi_self_extra"  = "TIPI Extra",
+  "tipi_self_agree"  = "TIPI Agree",
+  "tipi_self_consc"  = "TIPI Consc",
+  "tipi_self_emostab"= "TIPI EmoStab",
+  "tipi_self_open"   = "TIPI Open",
+  "phq4_total"       = "PHQ-4 total",
+  "phq4_anx"         = "PHQ-4 anx",
+  "phq4_dep"         = "PHQ-4 dep",
+  "gaais_pos"        = "GAAIS Pos",
+  "gaais_neg"        = "GAAIS Neg",
+  "free_speech_avg"  = "Free speech"
+)
+
+nlp_vars <- c(
+  "pct_expressed_anxiety"          = "Bot anxiety",
+  "pct_emotional_volatility"       = "Bot volatility",
+  "pct_calm_stability"             = "Bot calm (rev)",
+  "pct_mirroring_user_emotion"     = "Bot mirroring",
+  "pct_emotional_self_disclosure"  = "User disclosure",
+  "pct_bonding_language"           = "User bonding lang",
+  "pct_challenging_sylva"          = "User challenge",
+  "pct_testing_or_probing"         = "User testing",
+  "roberta_score_mean"             = "Roberta sentiment",
+  "vader_compound_mean"            = "VADER sentiment",
+  "emotion_joy_mean"               = "Joy sentiment"
+)
+
+# Build a long-form correlation table
+pn_pairs <- expand_grid(
+  personality_var = names(personality_vars),
+  nlp_var = names(nlp_vars)
+)
+
+compute_corr <- function(p, n) {
+  x <- master[[p]]
+  y <- master[[n]]
+  valid <- !is.na(x) & !is.na(y)
+  if (sum(valid) < 5) return(tibble(r = NA, p = NA, n = sum(valid)))
+  ct <- suppressWarnings(cor.test(x[valid], y[valid]))
+  tibble(r = unname(ct$estimate), p = ct$p.value, n = sum(valid))
+}
+
+pn_results <- pn_pairs %>%
+  mutate(out = map2(personality_var, nlp_var, compute_corr)) %>%
+  unnest(out) %>%
+  mutate(
+    personality_lab = personality_vars[personality_var],
+    nlp_lab         = nlp_vars[nlp_var],
+    sig             = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      TRUE      ~ ""
+    )
+  )
+
+# Heatmap: personality (rows) × NLP (cols), cells colored by r, asterisks for p
+p_pn <- ggplot(pn_results,
+               aes(x = factor(nlp_lab, levels = unname(nlp_vars)),
+                   y = factor(personality_lab, levels = rev(unname(personality_vars))),
+                   fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f%s", r, sig)), size = 2.7) +
+  scale_fill_gradient2(low = "#3b82f6", mid = "white", high = "#dc2626",
+                       midpoint = 0, limits = c(-0.5, 0.5),
+                       oob = scales::squish) +
+  labs(
+    title = "Participant personality and attitudes × NLP-derived outcomes",
+    subtitle = "Pearson r; cells annotated with significance (* p<.05, ** p<.01, *** p<.001)",
+    x = NULL, y = NULL, fill = "r"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title.position = "plot")
+
+save_fig(p_pn, "09_personality_x_nlp", width = 11, height = 7)
+p_pn
+
+# Also save the full long-form table
+write_csv(pn_results %>%
+            select(personality_var, nlp_var, personality_lab, nlp_lab, r, p, n, sig) %>%
+            mutate(r = round(r, 4)),   # FIX 2026-09-30 (R4-H): p written unrounded (was round(p, 4)) so p agrees with sig, which uses the unrounded p
+          file.path(OUT_TAB, "09_personality_x_nlp.csv"))
+```
+
+```{r personality-nlp-narrative, results='asis'}
+# Dynamic narrative pulling the top correlations
+top_n_sig <- pn_results %>% filter(p < 0.05) %>%
+  arrange(desc(abs(r))) %>% head(8)
+
+cat("**Top 8 personality × NLP correlations (p < .05, ranked by |r|):**\n\n")   # FIX 2026-09-30 (I5): labelled "top 8"
+
+for (i in seq_len(nrow(top_n_sig))) {
+  row <- top_n_sig[i, ]
+  cat(sprintf("- %s × %s: r = %+.2f (p = %.3g, n = %d)\n",  # FIX 2026-09-30 (I5)
+              row$personality_lab, row$nlp_lab, row$r, row$p, row$n))            # FIX 2026-09-30 (I5): show n
+}
+
+cat(sprintf("\n%d of %d cells (%d × %d matrix) cleared p < .05 (unadjusted).\n",  # FIX 2026-09-30 (I5)
+            sum(pn_results$p < 0.05, na.rm = TRUE),                               # FIX 2026-09-30 (I5): count from the full results, not the head(8) subset
+            sum(!is.na(pn_results$p)),
+            length(personality_vars), length(nlp_vars)))
+```
+
+The heatmap (`outputs/integration/figures/09_personality_x_nlp.png`) and the full long-form table (`outputs/integration/tables/09_personality_x_nlp.csv`) capture every pairwise correlation. These are descriptive: we do not apply multiple comparison correction here because the goal is to characterize the texture of how personality relates to NLP-side behavior, not to test specific hypotheses. We report the strongest patterns in §9 of the Results document.
+
+---
+
+# Headline summary for the consolidated doc
+
+```{r headline-summary, results='asis'}
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC HEADLINE BULLETS — pulled live from each section's results
+# ─────────────────────────────────────────────────────────────────────────────
+# This block consolidates the NLP-side conclusions into bullets the
+# consolidated doc rebuild (Task 4) can paste directly. Every number is
+# computed from the analyses above; nothing is hardcoded.
+
+# Manipulation fidelity headline numbers
+mf_self  <- mf_table %>% filter(grepl("TIPI-Bot", measure))    %>% slice(1)
+mf_chat  <- mf_table %>% filter(grepl("expressed_anxiety", measure)) %>% slice(1)
+mf_oe1   <- mf_table %>% filter(grepl("OE1", measure))         %>% slice(1)
+
+# Diffusion: largest non-focal effect
+diff_max <- diffusion_df %>% slice_max(abs(d), n = 1)
+
+# Bonding: from headline table
+bond_max <- headline %>% filter(family == "Bonding")  %>% slice_max(abs(d), n = 1)   # FIX 2026-09-30 (I6): largest by |g| (was signed max)
+liab_max <- headline %>% filter(family == "Liability") %>%
+              mutate(abs_d = abs(d)) %>% slice_max(abs_d, n = 1)
+bond_fam <- headline %>% filter(family == "Bonding")                               # FIX 2026-09-30 (I6)
+liab_fam <- headline %>% filter(family == "Liability")                             # FIX 2026-09-30 (I6)
+
+# Sentiment dissociation: OE1 vs OE4
+sent_oe1_row <- sent_by_oe %>% filter(oe_field == "oe_experience",
+                                      method == "roberta_score") %>% slice(1)
+sent_oe4_row <- sent_by_oe %>% filter(oe_field == "oe_compensation",
+                                      method == "roberta_score") %>% slice(1)
+rob_all <- sent_by_oe %>% filter(method == "roberta_score")                        # FIX 2026-09-30 (I6)
+
+cat("## NLP integration findings (auto-generated, N varies per layer)\n\n")
+
+cat("> *Headline NLP findings; every number is pulled live from the analyses above. Effect sizes are Hedges' g; p values are unadjusted unless a q is given.*\n\n")  # FIX 2026-09-30 (I2/I6)
+
+# FIX 2026-09-30 (I6): every evaluative phrase below is now computed ("overwhelming",
+#   "the one null fidelity measure", "rated lower on every other trait", "survives
+#   Bonferroni", "null", "does not survive correction", "d≈3.1" were hard-coded).
+cat(sprintf("- **Manipulation fidelity (three modalities).** TIPI-Bot Emotional Stability self-report g=%.2f (p=%.3g); chat-coded bot anxiety g=%.2f (p=%.3g); OE1 Roberta sentiment g=%.2f (p=%.3g). %d of %d directional fidelity measures differ at p < .05 in the predicted direction.\n",  # FIX 2026-09-30 (I6)
+            mf_self$d, mf_self$p, mf_chat$d, mf_chat$p, mf_oe1$d, mf_oe1$p,  # FIX 2026-09-30 (I6)
+            sum(mf_dir$ok), nrow(mf_dir)))                                         # FIX 2026-09-30 (I6)
+
+bonf_clause <- if (exists("core_diff")) {                                          # FIX 2026-09-30 (I6)
+  paste0(" In the core pipeline's Bonferroni family (", nrow(core_diff), " tests: ",  # FIX 2026-09-30 (R4-I6b): names the family (was "Surviving the core pipeline's Bonferroni correction: <dv keys>")
+         paste(core_fam_labs, collapse = ", "), "), ", core_surv_txt, ".",          # FIX 2026-09-30 (R4-I6b)
+         core_outside_txt)                                                            # FIX 2026-09-30 (R4-I6b)
+} else ""  # FIX 2026-09-30 (I6)
+cat(sprintf("- **Perceptual halo on non-focal traits.** %d of %d non-focal ratings are lower for the anxious bot; the largest is %s g=%.2f (p=%.3g). A and E were held constant by design (MOD_HIGH_A + MOD_HIGH_E), so any difference is halo from the N manipulation, not a manipulation of A/E.%s\n",  # FIX 2026-09-30 (I6)
+            sum(diffusion_df$d < 0, na.rm = TRUE), nrow(diffusion_df),  # FIX 2026-09-30 (I6)
+            diff_max$measure, diff_max$d, diff_max$p, bonf_clause))                # FIX 2026-09-30 (I6)
+
+cat(sprintf("- **Bonding signals (participant-side).** %d of %d participant-side bonding measures differ at p < .05 (unadjusted); the largest |g| is %s g=%.2f (p=%.3g). (The bot's coded anxiety, g=%.2f, is the manipulation, not a bonding outcome; it is reported under fidelity.)\n",  # FIX 2026-09-30 (I6)
+            sum(bond_fam$p < .05), nrow(bond_fam),  # FIX 2026-09-30 (I6)
+            bond_max$measure, bond_max$d, bond_max$p, mf_chat$d))                  # FIX 2026-09-30 (I6)
+
+cat(sprintf("- **Liability signals.** %d of %d liability measures differ at p < .05 (unadjusted); the largest |g| is %s g=%.2f (p=%.3g).\n",  # FIX 2026-09-30 (I6)
+            sum(liab_fam$p < .05), nrow(liab_fam),  # FIX 2026-09-30 (I6)
+            liab_max$measure, liab_max$d, liab_max$p))                             # FIX 2026-09-30 (I6)
+
+cat(sprintf("- **Sentiment by question (Roberta).** OE1 (interaction) g=%.2f (p=%.3g); OE4 (vignette) g=%.2f (p=%.3g); %d of %d questions at p < .05. Across all %d sentiment tests, %d at p < .05, %d at BH q < .05 within question, %d at BH q < .05 across all.\n",  # FIX 2026-09-30 (I6)
+            sent_oe1_row$d, sent_oe1_row$p, sent_oe4_row$d, sent_oe4_row$p,  # FIX 2026-09-30 (I6)
+            sum(rob_all$p < .05), nrow(rob_all), nrow(sent_by_oe),  # FIX 2026-09-30 (I6)
+            sum(sent_by_oe$p < .05), sum(sent_by_oe$q_bh_question < .05),  # FIX 2026-09-30 (I6)
+            sum(sent_by_oe$q_bh_all < .05)))                                       # FIX 2026-09-30 (I4/I6)
+
+# FIX 2026-09-30 (I4): chat-feature multiplicity bullet.
+cat(sprintf("- **Chat-coded features (BH-FDR within role, q < .05).** %s.\n", role_str))  # FIX 2026-09-30 (I4)
+
+# OE codes inferential summary
+cat(sprintf("- **OE consensus codes (Fisher + BH-FDR within question).** Of %d codes tested: %d clear raw p<.05, %d clear q<.10, %d clear q<.05.\n",
+            n_total_codes, n_p05, n_q10, n_q05))
+
+# Length-adjusted bonding
+if (exists("length_adj")) {
+  la_hl_raw  <- length_adj %>% filter(raw_p < 0.05)                               # FIX 2026-09-30 (I6)
+  la_hl_keep <- length_adj %>% filter(raw_p < 0.05 & adj_p <  0.05)               # FIX 2026-09-30 (I6)
+  la_hl_drop <- length_adj %>% filter(raw_p < 0.05 & adj_p >= 0.05)               # FIX 2026-09-30 (I6)
+  cat(sprintf("- **NLP outcomes vs. verbosity adjustment.** Of %d NLP outcomes (%s), the condition coefficient has p < .05 in the raw regression for %d (%s). After controlling for bot/user words-per-turn, p < .05 for %d of these (%s) and p >= .05 for %d (%s).\n",  # FIX 2026-09-30 (I6): was "Of %d bonding outcomes ..." (the set includes bot-side codes)
+              nrow(length_adj), la_counts(length_adj$measure),                    # FIX 2026-09-30 (I6)
+              nrow(la_hl_raw), la_names(la_hl_raw),                               # FIX 2026-09-30 (I6)
+              nrow(la_hl_keep), la_names(la_hl_keep),                             # FIX 2026-09-30 (I6)
+              nrow(la_hl_drop), la_names(la_hl_drop)))                            # FIX 2026-09-30 (I6)
+}
+
+cat("\n*This bullet list was auto-generated from the analyses in this Rmd. ",
+    "All numbers refresh on re-knit.*\n")
+```
+
+---
+
+# Session info
+
+```{r sessioninfo}
+sessionInfo()
+```

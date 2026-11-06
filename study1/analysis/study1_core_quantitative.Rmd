@@ -1,0 +1,3030 @@
+---
+title: "Study 1: Core Quantitative Analyses"
+subtitle: "Chatbot Agreeableness, Parasocial Bonding, Mind Perception, and Corporate Liability"
+author: "DGK Lab — UCLA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    code_folding: show
+    fig_width: 8
+    fig_height: 5
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  dpi = 150,
+  out.width = "90%"
+)
+options(scipen = 999, digits = 4)
+```
+
+# Overview
+
+This notebook executes the confirmatory and primary quantitative analyses for Study 1 as specified in the preregistration. It runs end-to-end from raw CSVs in `data/raw/` through composite scoring, exclusions, the ten coequal confirmatory tests with BH-FDR correction, the verbosity-adjusted parallel analysis, behavioral DVs, the legal-expertise directional hypothesis, item-level analyses with forest plots, and exploratory moderators and mediation. Outputs include `data/processed/analytic_data.csv` and `data/processed/composite_scores.csv` for use by the NLP and integration notebooks.
+
+The notebook is structured to mirror the preregistration sections (7 → 8 → 9.1–9.9). Each major analysis section produces tables and figures that are written to `outputs/R/`.
+
+# 1. Setup
+
+## 1.1 Packages
+
+```{r packages}
+needed <- c(
+  # core
+  "tidyverse", "here", "janitor", "glue", "fs", "jsonlite",
+  # stats
+  "BayesFactor", "effectsize", "psych", "TOSTER", "pwr", "car",
+  "lavaan", "semTools", "broom", "broom.mixed",
+  # moderation
+  "interactions", "emmeans",
+  # tables and figures
+  "kableExtra", "gt", "patchwork", "ggtext", "scales"
+)
+
+for (pkg in needed) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(tidyverse)
+library(here)
+library(janitor)
+library(glue)
+library(BayesFactor)
+library(effectsize)
+library(psych)
+library(TOSTER)
+library(pwr)
+library(lavaan)
+library(semTools)
+library(broom)
+library(interactions)
+library(emmeans)
+library(kableExtra)
+library(gt)
+library(patchwork)
+library(scales)
+
+# Anchor here() to project root
+here::i_am("R/study1_core_quantitative.Rmd")
+
+# Output directories
+fs::dir_create(here("data", "processed"))
+fs::dir_create(here("outputs", "R", "tables"))
+fs::dir_create(here("outputs", "R", "figures"))
+
+# Reproducibility
+set.seed(42)
+options(mc.cores = 1)  # FIX 2026-09-30 (R4-R1): psych::alpha / fa.parallel bootstrap via parallel::mclapply; forked
+                       # FIX 2026-09-30 (R4-R1)  workers do not inherit a reproducible RNG stream, so run them serially
+
+# Theme for figures
+theme_set(
+  theme_minimal(base_size = 12, base_family = "sans") +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "grey92"),
+      panel.grid.major.y = element_line(color = "grey92"),
+      strip.background = element_rect(fill = "grey95", color = NA),
+      strip.text = element_text(face = "bold"),
+      axis.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(color = "grey30")
+    )
+)
+
+# Condition colors (consistent throughout)
+cond_colors <- c(LowA = "#D9D9D9", HighA = "#333333")
+```
+
+## 1.2 Helper functions
+
+```{r helpers}
+# Welch's t with Hedges' g (effectsize::hedges_g), 95% CI, BF10, Mann-Whitney U  # FIX 2026-09-30 (R4-G)
+welch_full <- function(data, dv, group_var = "condition_label",
+                       ref_level = "LowA", comp_level = "HighA",
+                       paired = FALSE, alternative = "two.sided") {
+  d <- data %>% filter(!is.na(.data[[dv]]), !is.na(.data[[group_var]]))
+  ref <- d[[dv]][d[[group_var]] == ref_level]
+  comp <- d[[dv]][d[[group_var]] == comp_level]
+
+  if (length(ref) < 3 || length(comp) < 3) {
+    return(tibble(
+      dv = dv, n_ref = length(ref), n_comp = length(comp),
+      mean_ref = NA_real_, sd_ref = NA_real_,
+      mean_comp = NA_real_, sd_comp = NA_real_,
+      t = NA_real_, df = NA_real_, p = NA_real_,
+      d = NA_real_, d_lo = NA_real_, d_hi = NA_real_,
+      bf10 = NA_real_, U = NA_real_, p_mw = NA_real_, r_mw = NA_real_
+    ))
+  }
+
+  tt <- t.test(comp, ref, var.equal = FALSE, alternative = alternative)
+  dd <- effectsize::hedges_g(comp, ref, paired = FALSE, ci = 0.95)
+
+  bf <- tryCatch({
+    bf_obj <- BayesFactor::ttestBF(x = comp, y = ref, paired = FALSE,
+                                    rscale = 0.707, nullInterval = NULL)
+    as.numeric(BayesFactor::extractBF(bf_obj)$bf)[1]
+  }, error = function(e) NA_real_)
+
+  mw <- tryCatch({
+    suppressWarnings(wilcox.test(comp, ref, alternative = alternative,
+                                  exact = FALSE, correct = TRUE))
+  }, error = function(e) NULL)
+
+  if (!is.null(mw)) {
+    n_total <- length(ref) + length(comp)
+    z_approx <- qnorm(mw$p.value / 2, lower.tail = FALSE) * sign(median(comp) - median(ref))
+    r_mw <- abs(z_approx) / sqrt(n_total)
+  } else {
+    r_mw <- NA_real_
+  }
+
+  tibble(
+    dv = dv,
+    n_ref = length(ref), n_comp = length(comp),
+    mean_ref = mean(ref, na.rm = TRUE), sd_ref = sd(ref, na.rm = TRUE),
+    mean_comp = mean(comp, na.rm = TRUE), sd_comp = sd(comp, na.rm = TRUE),
+    t = unname(tt$statistic), df = unname(tt$parameter), p = tt$p.value,
+    d = dd$Hedges_g, d_lo = dd$CI_low, d_hi = dd$CI_high,
+    bf10 = bf,
+    U = if (!is.null(mw)) unname(mw$statistic) else NA_real_,
+    p_mw = if (!is.null(mw)) mw$p.value else NA_real_,
+    r_mw = r_mw
+  )
+}
+
+# Reverse-score helper: x is on a scale of 1..max
+rev_score <- function(x, max_val) max_val + 1 - x
+
+# Format p-values for tables
+fmt_p <- function(p) {
+  ifelse(is.na(p), "—",
+    ifelse(p < 0.001, "<.001",
+      ifelse(p < 0.01, sprintf("%.3f", p),
+        sprintf("%.3f", p))))
+}
+
+# Format Bayes factors
+fmt_bf <- function(bf) {
+  ifelse(is.na(bf), "—",
+    ifelse(bf >= 100, sprintf("%.0f", bf),
+      ifelse(bf >= 10, sprintf("%.1f", bf),
+        ifelse(bf >= 1, sprintf("%.2f", bf),
+          sprintf("1/%.1f", 1/bf)))))
+}
+
+# BF10 verbal interpretation (Jeffreys-Lee)
+bf_verbal <- function(bf) {
+  case_when(
+    is.na(bf) ~ "—",
+    bf > 100 ~ "Extreme H1",
+    bf > 30 ~ "Very strong H1",
+    bf > 10 ~ "Strong H1",
+    bf > 3 ~ "Moderate H1",
+    bf > 1 ~ "Anecdotal H1",
+    bf > 1/3 ~ "Anecdotal H0",
+    bf > 1/10 ~ "Moderate H0",
+    bf > 1/30 ~ "Strong H0",
+    TRUE ~ "Very strong H0"
+  )
+}
+
+# Tidy a regression for table output
+tidy_lm <- function(m) {
+  broom::tidy(m, conf.int = TRUE) %>%
+    mutate(across(where(is.numeric), ~round(., 4)))
+}
+
+# Save tables and figures
+save_table <- function(tbl, name, ...) {
+  readr::write_csv(tbl, here("outputs", "R", "tables", paste0(name, ".csv")))
+  invisible(tbl)
+}
+save_fig <- function(p, name, w = 8, h = 5) {
+  ggplot2::ggsave(here("outputs", "R", "figures", paste0(name, ".png")),
+                  plot = p, width = w, height = h, dpi = 200, bg = "white")
+  ggplot2::ggsave(here("outputs", "R", "figures", paste0(name, ".pdf")),
+                  plot = p, width = w, height = h)
+  invisible(p)
+}
+```
+
+# 2. Load raw data
+
+The raw CSVs are one row per participant, one file per session. Column counts vary across files because per-message columns expand with conversation length. We read with `bind_rows()` which tolerates this — short conversations get NA for unused message columns.
+
+```{r load-raw}
+raw_dir <- here("data", "raw")
+raw_files <- list.files(raw_dir, pattern = "\\.csv$", full.names = TRUE)
+
+cat(glue("Found {length(raw_files)} raw CSV files in {raw_dir}\n"))
+
+raw <- raw_files %>%
+  map_dfr(~suppressMessages(readr::read_csv(.x, show_col_types = FALSE,
+                                             progress = FALSE)) %>%
+            mutate(across(everything(), as.character))) %>%
+  type_convert(guess_integer = TRUE)
+
+cat(glue("\nLoaded {nrow(raw)} sessions × {ncol(raw)} columns\n"))
+cat(glue("Conditions in raw data: HighA = {sum(raw$condition_label == 'HighA', na.rm = TRUE)}, ",
+        "LowA = {sum(raw$condition_label == 'LowA', na.rm = TRUE)}\n"))
+```
+
+# 3. Exclusions (Prereg §7)
+
+The preregistration specifies five participant-level exclusion criteria, plus pilot/test session and duplicate handling. Implementation follows Section 7 verbatim.
+
+## 3.1 Apply exclusion criteria
+
+```{r exclusions}
+# Pre-specified pilot/test SONA IDs (Prereg §7.2)
+pilot_ids <- c("TEST", "<PILOT_ID_1>", "<PILOT_ID_2>")  # pilot and lab-member test IDs are withheld from the public copy (shared with the data under a data use agreement)
+
+# Build exclusion flags
+ex <- raw %>%
+  mutate(
+    sona_id = as.character(sona_id),
+    # 7.1.1 attention failure both passes
+    excl_attention = (attn1_pass == FALSE) & (attn1_retry_pass == FALSE) &
+                      !is.na(attn1_pass) & !is.na(attn1_retry_pass),
+    # 7.1.2 comprehension
+    excl_comprehension = (comprehension_correct == FALSE) & !is.na(comprehension_correct),
+    # 7.1.3 captcha
+    excl_captcha = (captcha_pass == FALSE) & !is.na(captcha_pass),
+    # 7.1.4 self-reported AI use (1 = Yes)
+    excl_ai_used = (d_ai_used_in_study == 1) & !is.na(d_ai_used_in_study),
+    # 7.1.5 self-reported non-serious (1 = No, did not complete seriously)
+    excl_not_serious = (d_serious == 1) & !is.na(d_serious),
+    # 7.2 pilot/test sessions
+    excl_pilot = sona_id %in% pilot_ids
+  )
+
+# 7.3 Duplicate SONA: keep earliest by start_time
+ex <- ex %>%
+  arrange(sona_id, start_time) %>%
+  group_by(sona_id) %>%
+  mutate(
+    session_rank = row_number(),
+    excl_duplicate = (session_rank > 1) & !is.na(sona_id) & sona_id != ""
+  ) %>%
+  ungroup()
+
+# Combine all exclusions
+ex <- ex %>%
+  mutate(
+    excl_any = excl_attention | excl_comprehension | excl_captcha |
+               excl_ai_used | excl_not_serious | excl_pilot | excl_duplicate
+  )
+
+# CONSORT-style flow
+flow <- tibble(
+  Step = c(
+    "Sessions in raw data",
+    "Excluded: pilot/test SONA",
+    "Excluded: duplicate session (kept earliest)",
+    "Excluded: failed attention check (both attempts)",
+    "Excluded: failed comprehension check",
+    "Excluded: failed CAPTCHA",
+    "Excluded: self-reported AI tool use",
+    "Excluded: self-reported non-serious responding",
+    "Final analytic sample (primary)"
+  ),
+  N = c(
+    nrow(ex),
+    sum(ex$excl_pilot),
+    sum(ex$excl_duplicate),
+    sum(ex$excl_attention & !ex$excl_pilot & !ex$excl_duplicate),
+    sum(ex$excl_comprehension & !ex$excl_pilot & !ex$excl_duplicate & !ex$excl_attention),
+    sum(ex$excl_captcha & !ex$excl_pilot & !ex$excl_duplicate &
+        !ex$excl_attention & !ex$excl_comprehension),
+    sum(ex$excl_ai_used & !ex$excl_pilot & !ex$excl_duplicate &
+        !ex$excl_attention & !ex$excl_comprehension & !ex$excl_captcha),
+    sum(ex$excl_not_serious & !ex$excl_pilot & !ex$excl_duplicate &
+        !ex$excl_attention & !ex$excl_comprehension & !ex$excl_captcha & !ex$excl_ai_used),
+    sum(!ex$excl_any)
+  )
+)
+
+flow %>%
+  kbl(caption = "CONSORT exclusion flow", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE) %>%
+  row_spec(nrow(flow), bold = TRUE, background = "#F0F8FF")
+
+save_table(flow, "01_exclusion_flow")
+```
+
+## 3.2 Build the two analysis samples
+
+Per Prereg §7.7, all primary analyses run on both the strict-exclusion sample and a sensitivity sample (only pilot/test and duplicate exclusions applied).
+
+```{r build-samples}
+df_primary <- ex %>% filter(!excl_any)
+df_sensitivity <- ex %>% filter(!excl_pilot & !excl_duplicate)
+
+cat(glue("Primary sample N = {nrow(df_primary)} (HighA = {sum(df_primary$condition_label == 'HighA')}, ",
+        "LowA = {sum(df_primary$condition_label == 'LowA')})\n"))
+cat(glue("Sensitivity sample N = {nrow(df_sensitivity)} (HighA = {sum(df_sensitivity$condition_label == 'HighA')}, ",
+        "LowA = {sum(df_sensitivity$condition_label == 'LowA')})\n"))
+
+# Set condition_label as a factor with LowA reference
+df_primary <- df_primary %>%
+  mutate(condition_label = factor(condition_label, levels = c("LowA", "HighA")))
+df_sensitivity <- df_sensitivity %>%
+  mutate(condition_label = factor(condition_label, levels = c("LowA", "HighA")))
+```
+
+# 4. Composite scoring (Prereg §6)
+
+```{r composites}
+score_composites <- function(d) {
+  d %>%
+    mutate(
+      # TIPI-Self (7-point, reverse-score using 8-x)
+      tipi_self_extra = (tipi_self_1 + (8 - tipi_self_6)) / 2,
+      tipi_self_agree = ((8 - tipi_self_2) + tipi_self_7) / 2,
+      tipi_self_consc = (tipi_self_3 + (8 - tipi_self_8)) / 2,
+      tipi_self_emostab = ((8 - tipi_self_4) + tipi_self_9) / 2,
+      tipi_self_open = (tipi_self_5 + (8 - tipi_self_10)) / 2,
+
+      # TIPI-Bot (7-point, same scoring)
+      tipi_bot_extra = (tipi_bot_1 + (8 - tipi_bot_6)) / 2,
+      tipi_bot_agree = ((8 - tipi_bot_2) + tipi_bot_7) / 2,
+      tipi_bot_consc = (tipi_bot_3 + (8 - tipi_bot_8)) / 2,
+      tipi_bot_emostab = ((8 - tipi_bot_4) + tipi_bot_9) / 2,
+      tipi_bot_open = (tipi_bot_5 + (8 - tipi_bot_10)) / 2,
+
+      # Manipulation check single items
+      # NOTE: mc_neuroticism item ("How emotionally stable or unstable was Sylva?")
+      # is bipolar phrasing on a unipolar 1-5 scale and is structurally ambiguous.
+      # We retain the raw value for disclosure but DO NOT score a derived emostab
+      # composite (no mc_emostab_score). The multi-item TIPI-Bot Emotional Stability
+      # is the canonical check for that trait. See §5.3 methodological note.
+      mc_extraversion_score = mc_extraversion,
+      mc_agreeableness_score = mc_agreeableness,
+
+      # PSR composite + subscales
+      psr_connection = rowMeans(across(c(psr_1, psr_2, psr_3, psr_4)), na.rm = FALSE),
+      psr_desire     = rowMeans(across(c(psr_5, psr_6, psr_7, psr_8)), na.rm = FALSE),
+      psr_caring     = rowMeans(across(c(psr_9, psr_10, psr_11, psr_12)), na.rm = FALSE),
+      psr_total      = rowMeans(across(starts_with("psr_") & matches("^psr_\\d+$")), na.rm = FALSE),
+
+      # EC, Trust, ET, MA, MP composites
+      ec_total    = rowMeans(across(starts_with("ec_") & matches("^ec_\\d+$")), na.rm = FALSE),
+      trust_total = rowMeans(across(starts_with("tr_") & matches("^tr_\\d+$")), na.rm = FALSE),
+      et_total    = rowMeans(across(starts_with("et_") & matches("^et_\\d+$")), na.rm = FALSE),
+      ma_total    = rowMeans(across(starts_with("ma_") & matches("^ma_\\d+$")), na.rm = FALSE),
+      mp_total    = rowMeans(across(starts_with("mp_") & matches("^mp_\\d+$")), na.rm = FALSE),
+
+      # Liability components
+      liab_corp   = rowMeans(across(c(liab_1, liab_2, liab_3, liab_4, liab_5)), na.rm = FALSE),
+      liab_chat   = rowMeans(across(c(liab_6, liab_7, liab_8)), na.rm = FALSE),
+      liab_user   = rowMeans(across(c(liab_9, liab_10)), na.rm = FALSE),
+      liab_harm   = rowMeans(across(c(liab_11, liab_12)), na.rm = FALSE),
+
+      # PHQ-4 (0-3 scale)
+      phq4_anx    = phq4_1 + phq4_2,
+      phq4_dep    = phq4_3 + phq4_4,
+      phq4_total  = phq4_1 + phq4_2 + phq4_3 + phq4_4,
+
+      # GAAIS (item 10 reverse-scored in positive subscale; items 19, 20 reverse-scored in negative subscale)
+      gaais_pos = (gaais_1 + gaais_2 + gaais_3 + gaais_4 + gaais_5 +
+                   gaais_6 + gaais_7 + gaais_8 + gaais_9 + (6 - gaais_10)) / 10,
+      gaais_neg = (gaais_11 + gaais_12 + gaais_13 + gaais_14 + gaais_15 +
+                   gaais_16 + gaais_17 + gaais_18 + (6 - gaais_19) + (6 - gaais_20)) / 10
+    )
+}
+
+df_primary <- score_composites(df_primary)
+df_sensitivity <- score_composites(df_sensitivity)
+
+# Quick sanity check on composites
+df_primary %>%
+  select(condition_label, tipi_bot_agree, mc_agreeableness_score,
+         psr_total, ec_total, trust_total, et_total,
+         ma_total, mp_total, liab_corp, liab_chat, liab_user, liab_harm) %>%
+  pivot_longer(-condition_label, names_to = "Composite", values_to = "Score") %>%
+  group_by(condition_label, Composite) %>%
+  summarize(M = mean(Score, na.rm = TRUE), SD = sd(Score, na.rm = TRUE),
+            n = sum(!is.na(Score)), .groups = "drop") %>%
+  pivot_wider(names_from = condition_label, values_from = c(M, SD, n)) %>%
+  kbl(caption = "Composite descriptives by condition (primary sample)",
+      booktabs = TRUE, digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+# 5. Manipulation Integrity (Prereg §8.1)
+
+## 5.1 Primary manipulation check: TIPI-Bot Agreeableness
+
+```{r mc-tipi-A}
+mc_tipi_A <- welch_full(df_primary, "tipi_bot_agree")
+mc_tipi_A %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kbl(caption = "Manipulation check: TIPI-Bot Agreeableness (primary)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+cat("Hedges' g =", round(mc_tipi_A$d, 2),  # FIX 2026-09-30 (R4-G)
+    "[95% CI: ", round(mc_tipi_A$d_lo, 2), ", ", round(mc_tipi_A$d_hi, 2), "]\n")
+cat("BF10 =", fmt_bf(mc_tipi_A$bf10), " (", bf_verbal(mc_tipi_A$bf10), ")\n")
+```
+
+## 5.2 Secondary single-item check: warmth/support
+
+```{r mc-singleitem}
+mc_single <- welch_full(df_primary, "mc_agreeableness_score")
+mc_single %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kbl(caption = "Single-item manipulation check (warmth/support)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 5.3 Diffusion checks (held-constant traits)
+
+These should *not* differ between conditions — MOD_HIGH_E and MOD_LOW_N blocks are identical across conditions. Bonferroni correction is applied across the *three* psychometrically-clean diffusion tests (α = .0167 per test).
+
+**Methodological note on the dropped `mc_neuroticism` item:** The single-item check for emotional stability used the prompt *"How emotionally stable or unstable was Sylva?"* on a 1–5 unipolar response scale (1 = "Not at all", 5 = "Extremely"). This is a bipolar question paired with a unipolar scale, which is structurally ambiguous: a participant who perceives Sylva as very stable could legitimately answer "5 = Extremely [stable]" or "1 = Not at all [unstable]" — both readings are coherent. Because the two readings produce opposite numeric responses to the same underlying perception, the item cannot be coherently scored. At the interim looks on which this decision was made (between N = 80 and N = 96), it ran in the *opposite* direction from the two-item TIPI-Bot Emotional Stability scale, which is the psychometric symptom of an item that participants interpret two ways. In the final analytic sample the HighA − LowA effect is *g* = `r sprintf("%.2f", welch_full(df_primary, "mc_neuroticism")$d)` on the raw item versus *g* = `r sprintf("%.2f", welch_full(df_primary, "tipi_bot_emostab")$d)` on TIPI-Bot Emotional Stability. <!-- FIX 2026-09-30 (C5): interim history labelled as such, final-sample values added live; "four-item" corrected to "two-item" (TIPI emotional stability = items 4 and 9) --> We exclude `mc_neuroticism` from all analyses and report only the multi-item TIPI-Bot Emotional Stability scale as the diffusion check for that trait. The item will be reworded for Studies 1b–1d to a unipolar form (e.g., *"How emotionally stable did Sylva seem?"*, anchored 1=Not at all stable to 5=Extremely stable).
+
+```{r diffusion}
+# Three psychometrically-clean diffusion tests (Bonferroni alpha = .0167)
+# mc_neuroticism (and its derived mc_emostab_score) is excluded — see methodological note above
+diffusion_dvs <- c("tipi_bot_extra", "tipi_bot_emostab", "mc_extraversion_score")
+diffusion_results <- map_dfr(diffusion_dvs, ~welch_full(df_primary, .x))
+diffusion_results <- diffusion_results %>%
+  mutate(p_bonf = pmin(p * 3, 1),
+         significant_at_corrected = p_bonf < 0.05,
+         flag = ifelse(significant_at_corrected, "⚠ DIFFUSION", "OK"))
+
+diffusion_results %>%
+  select(dv, mean_ref, sd_ref, mean_comp, sd_comp, t, df, p, p_bonf, d, d_lo, d_hi, bf10, flag) %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         bf10 = fmt_bf(bf10)) %>%
+  kbl(caption = "Diffusion checks on held-constant traits (Bonferroni-corrected, three tests)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(diffusion_results, "02_diffusion_checks")
+```
+
+## 5.4 Variance comparison (Levene's test)
+
+```{r variance-comparison}
+levene_result <- car::leveneTest(tipi_bot_agree ~ condition_label, data = df_primary)
+print(levene_result)
+
+# SD by condition
+df_primary %>%
+  group_by(condition_label) %>%
+  summarize(SD_tipiA = sd(tipi_bot_agree, na.rm = TRUE),
+            n = sum(!is.na(tipi_bot_agree))) %>%
+  kbl(caption = "Variance check: SD of TIPI-Bot A by condition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 5.5 Visual: TIPI-Bot Agreeableness distribution by condition
+
+```{r mc-figure, fig.height=4}
+p_mc <- df_primary %>%
+  ggplot(aes(x = condition_label, y = tipi_bot_agree, fill = condition_label)) +
+  geom_violin(alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.18, fill = "white", color = "black", outlier.shape = NA) +
+  geom_jitter(position = position_jitter(width = 0.08, seed = 42), alpha = 0.4, size = 1.5, aes(color = condition_label)) +  # FIX 2026-09-30 (R4-R1): fixed jitter seed (same width)
+  scale_fill_manual(values = cond_colors, guide = "none") +
+  scale_color_manual(values = cond_colors, guide = "none") +
+  labs(title = "Manipulation Check: TIPI-Bot Agreeableness",
+       subtitle = glue("Hedges' g = {round(mc_tipi_A$d, 2)} [95% CI: {round(mc_tipi_A$d_lo, 2)}, {round(mc_tipi_A$d_hi, 2)}]"),  # FIX 2026-09-30 (R4-G)
+       x = NULL, y = "TIPI-Bot Agreeableness (1–7)") +
+  ylim(1, 7)
+
+p_mc
+save_fig(p_mc, "01_manipulation_check_tipiA", w = 6, h = 4.5)
+```
+
+# 6. Ten Coequal Confirmatory Tests with BH-FDR (Prereg §8.2)
+
+The ten DV composites are tested under an identical statistical template: Welch's *t*, Hedges' *g* with 95% CI, BF₁₀, Mann-Whitney *U* as non-parametric robustness check. The ten *p*-values are submitted to the Benjamini-Hochberg procedure with *q* = .05. <!-- FIX 2026-09-30 (R4-G): label was "Cohen's d ... (Hedges correction)"; the statistic is effectsize::hedges_g -->
+
+## 6.1 Run the ten confirmatory tests
+
+```{r ten-confirmatory}
+confirmatory_dvs <- c(
+  "psr_total", "ec_total", "trust_total", "et_total",
+  "ma_total", "mp_total",
+  "liab_corp", "liab_chat", "liab_user", "liab_harm"
+)
+
+dv_labels <- c(
+  psr_total = "Parasocial Relationship",
+  ec_total = "Emotional Connection",
+  trust_total = "Trust",
+  et_total = "Experience-Taking",
+  ma_total = "Moral Agency",
+  mp_total = "Moral Patiency",
+  liab_corp = "Corporate Liability",
+  liab_chat = "Chatbot Responsibility",
+  liab_user = "User Responsibility",
+  liab_harm = "Harm Severity"
+)
+
+# Primary sample
+results_primary <- map_dfr(confirmatory_dvs, ~welch_full(df_primary, .x)) %>%
+  mutate(
+    dv_label = dv_labels[dv],
+    q_bh = p.adjust(p, method = "BH"),
+    p_mw_bh = p.adjust(p_mw, method = "BH"),
+    bf_interp = bf_verbal(bf10),
+    confirmed = (q_bh < 0.05) & (bf10 >= 3),  # FIX 2026-09-30 (C4): stated rule is BF10 >= 3 (was > 3)
+    partially_supported = ((q_bh < 0.05) & !(bf10 >= 3)) | (!(q_bh < 0.05) & (bf10 >= 3)),  # FIX 2026-09-30 (C4): complement uses BF10 >= 3
+    interpretation = case_when(
+      confirmed ~ "Confirmed",
+      partially_supported ~ "Partial",
+      TRUE ~ "Inconclusive"
+    )
+  )
+
+# Sensitivity sample (for the §7.7 comparison)
+results_sensitivity <- map_dfr(confirmatory_dvs, ~welch_full(df_sensitivity, .x)) %>%
+  mutate(
+    dv_label = dv_labels[dv],
+    q_bh = p.adjust(p, method = "BH")
+  )
+
+results_primary %>%
+  select(dv_label, n_ref, mean_ref, sd_ref, n_comp, mean_comp, sd_comp,
+         t, df, p, q_bh, d, d_lo, d_hi, bf10, p_mw, interpretation) %>%
+  mutate(across(c(mean_ref, sd_ref, mean_comp, sd_comp, t, df, d, d_lo, d_hi), ~round(., 2)),
+         p = fmt_p(p), q_bh = fmt_p(q_bh), p_mw = fmt_p(p_mw),
+         bf10 = fmt_bf(bf10)) %>%
+  kbl(caption = "Ten coequal confirmatory tests (BH-FDR-corrected, primary sample)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(which(results_primary$confirmed), background = "#E6F4EA")
+
+save_table(results_primary, "03_confirmatory_primary")
+save_table(results_sensitivity, "03_confirmatory_sensitivity")
+```
+
+## 6.2 Sensitivity comparison
+
+```{r sensitivity-comparison}
+comparison <- bind_rows(
+  results_primary %>% mutate(sample = "Primary") %>%
+    select(dv_label, sample, t, p, q_bh, d, bf10),
+  results_sensitivity %>% mutate(sample = "Sensitivity") %>%
+    select(dv_label, sample, t, p, q_bh, d, bf10)
+) %>%
+  pivot_wider(names_from = sample, values_from = c(t, p, q_bh, d, bf10),
+              names_glue = "{sample}_{.value}")
+
+comparison %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         across(matches("(p|q_bh)$"), fmt_p),
+         across(matches("bf10$"), fmt_bf)) %>%
+  kbl(caption = "Primary vs. sensitivity sample comparison",
+      booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(comparison, "04_primary_vs_sensitivity")
+```
+
+## 6.3 Forest plot of the ten confirmatory effects
+
+```{r forest-confirmatory, fig.height=6}
+fp_data <- results_primary %>%
+  mutate(dv_label = factor(dv_label, levels = rev(dv_labels))) %>%
+  arrange(d) %>%
+  mutate(dv_label = factor(dv_label, levels = unique(dv_label)),
+         sig_label = case_when(
+           confirmed ~ paste0(dv_label, " ★★"),
+           partially_supported ~ paste0(dv_label, " ★"),
+           TRUE ~ as.character(dv_label)
+         ))
+
+p_forest <- fp_data %>%
+  ggplot(aes(x = d, y = reorder(dv_label, d))) +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = c(-0.2, 0.2), linewidth = 0.3, linetype = "dotted", color = "grey70") +
+  geom_vline(xintercept = c(-0.5, 0.5), linewidth = 0.3, linetype = "dotted", color = "grey70") +
+  geom_vline(xintercept = c(-0.8, 0.8), linewidth = 0.3, linetype = "dotted", color = "grey70") +
+  geom_errorbarh(aes(xmin = d_lo, xmax = d_hi), height = 0.25, color = "grey30") +
+  geom_point(aes(fill = interpretation, size = log10(bf10)),
+             shape = 21, color = "black") +
+  scale_fill_manual(values = c("Confirmed" = "#1A7E3A",
+                               "Partial" = "#E6A817",
+                               "Inconclusive" = "grey70")) +
+  scale_size_continuous(range = c(2.5, 6),
+                         name = "log10(BF10)", guide = guide_legend(order = 2)) +
+  labs(title = "Ten coequal confirmatory effects (HighA − LowA)",
+       subtitle = "Hedges' g with 95% CI; ★ = q<.05 OR BF10 ≥ 3, ★★ = both",  # FIX 2026-09-30 (C4): label BF10 ≥ 3; FIX 2026-09-30 (R4-G)
+       x = "Hedges' g", y = NULL,
+       fill = "Status") +
+  theme(legend.position = "right")
+
+p_forest
+save_fig(p_forest, "02_forest_ten_confirmatory", w = 9, h = 6)
+```
+
+## 6.4 Equivalence tests (Prereg §11.4)
+
+For each of the ten confirmatory DVs we conduct a two-one-sided equivalence test (TOST; Lakens, 2017) with bounds at ±d = 0.40, the prereg-specified smallest effect size of interest. <!-- FIX 2026-09-30 (C3/C5): equivalence is now defined by the implemented decision rule (tost_p_max < .05); the previous wording defined it by the CI and called for a "non-rejected" equivalence test, which is backwards. -->
+A DV is classified as "equivalent" to zero when the TOST is significant: both one-sided tests against ±0.40 reject at p < .05 (`tost_p_max < .05`). The Hedges's g(av) 90% CI reported in `smd_lo90`/`smd_hi90` is descriptive; because TOSTER computes the TOST p-values and this CI by different methods, the CI can lie just inside ±0.40 while the TOST narrowly fails at the boundary (or vice versa). Any such DV is listed by the `[C3 diagnostic]` output below and flagged in the `ci90_within_bounds` column of `04b_tost_equivalence.csv`; the classification always follows the TOST p-values. Equivalence-test results complement Bayes factors: a DV with BF10 < 1/3 AND a significant equivalence test (TOST p < .05) together provide the strongest evidence for the null available here. A DV with BF10 < 1/3 whose TOST is not significant at .05 is characterized as "absence of evidence" rather than "evidence of absence." <!-- FIX 2026-09-30 (C3/C5) -->
+
+```{r tost-equivalence}
+tost_results <- map_dfr(confirmatory_dvs, function(dv) {
+  d_sub <- df_primary %>% filter(!is.na(.data[[dv]]))
+  ref  <- d_sub[[dv]][d_sub$condition_label == "LowA"]
+  comp <- d_sub[[dv]][d_sub$condition_label == "HighA"]
+  if (length(ref) < 5 || length(comp) < 5) return(NULL)
+
+  tost_obj <- tryCatch(
+    TOSTER::tsum_TOST(
+      m1 = mean(comp, na.rm = TRUE), sd1 = sd(comp, na.rm = TRUE), n1 = length(comp),
+      m2 = mean(ref,  na.rm = TRUE), sd2 = sd(ref,  na.rm = TRUE), n2 = length(ref),
+      low_eqbound = -0.40, high_eqbound = 0.40, eqbound_type = "SMD",
+      alpha = 0.05
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(tost_obj)) return(NULL)
+
+  # Pull the two one-sided p-values; equivalence is concluded when BOTH one-sided nulls are rejected at p < .05  # FIX 2026-09-30 (C3/C5): comment said "equivalence is rejected", which is backwards
+  stopifnot(identical(rownames(tost_obj$TOST)[2:3], c("TOST Lower", "TOST Upper")))  # FIX 2026-09-30 (C3): guard positional p-value rows
+  tost_lower_p <- tost_obj$TOST$p.value[2]   # H0: true d ≤ -0.40 (reject -> bounded above lower)
+  tost_upper_p <- tost_obj$TOST$p.value[3]   # H0: true d ≥ +0.40 (reject -> bounded below upper)
+  tost_p_max   <- max(tost_lower_p, tost_upper_p, na.rm = TRUE)
+  equivalent   <- tost_p_max < 0.05
+
+  # FIX 2026-09-30 (C3): tost_obj$effsize has two rows, "Raw" (mean difference) and the
+  # standardized row (TOSTER 0.8.6 labels it "Hedges's g(av)" for Welch). Row [1] is the RAW  # FIX 2026-09-30 (C3)
+  # difference, which was previously stored as `smd`. Select both rows BY NAME.  # FIX 2026-09-30 (C3)
+  es_tab   <- tost_obj$effsize                                        # FIX 2026-09-30 (C3): effect-size table
+  smd_name <- setdiff(rownames(es_tab), "Raw")                        # FIX 2026-09-30 (C3): standardized row name
+  stopifnot("Raw" %in% rownames(es_tab), length(smd_name) == 1,  # FIX 2026-09-30 (C3)
+            grepl("Hedges|Cohen|Glass", smd_name))                    # FIX 2026-09-30 (C3): assert expected rows
+  es_raw <- es_tab["Raw", , drop = FALSE]                             # FIX 2026-09-30 (C3): raw mean-difference row
+  es_smd <- es_tab[smd_name, , drop = FALSE]                          # FIX 2026-09-30 (C3): standardized (SMD) row
+
+  tibble(
+    dv = dv,
+    dv_label = unname(dv_labels[dv]),
+    n_lowA = length(ref), n_highA = length(comp),
+    smd = es_smd$estimate,        # FIX 2026-09-30 (C3): standardized estimate (was raw row [1])
+    smd_lo90 = es_smd$lower.ci,   # FIX 2026-09-30 (C3): standardized 90% CI lower (was raw row [1])
+    smd_hi90 = es_smd$upper.ci,   # FIX 2026-09-30 (C3): standardized 90% CI upper (was raw row [1])
+    tost_p_lower = tost_lower_p,
+    tost_p_upper = tost_upper_p,
+    tost_p_max   = tost_p_max,
+    equivalent   = equivalent,  # FIX 2026-09-30 (C3)
+    smd_type  = smd_name,           # FIX 2026-09-30 (C3): added — which SMD TOSTER reports
+    raw_diff  = es_raw$estimate,    # FIX 2026-09-30 (C3): added — raw mean difference (HighA - LowA)
+    raw_lo90  = es_raw$lower.ci,    # FIX 2026-09-30 (C3): added — raw 90% CI lower
+    raw_hi90  = es_raw$upper.ci,    # FIX 2026-09-30 (C3): added — raw 90% CI upper
+    ci90_within_bounds = (es_smd$lower.ci > -0.40) & (es_smd$upper.ci < 0.40)  # FIX 2026-09-30 (C3): added diagnostic
+  )
+})
+
+# FIX 2026-09-30 (C3): diagnostic — print any DV where "SMD 90% CI inside ±0.40" disagrees with the
+# TOST decision (TOST tests on the raw scale with SMD-converted bounds, so borderline cases can differ).  # FIX 2026-09-30 (C3)
+tost_ci_disagree <- tost_results %>% filter(ci90_within_bounds != equivalent)  # FIX 2026-09-30 (C3): disagreement rows
+if (nrow(tost_ci_disagree) > 0) {                                                # FIX 2026-09-30 (C3)
+  cat("\n[C3 diagnostic] SMD 90% CI-within-bounds disagrees with the TOST decision for:\n")  # FIX 2026-09-30 (C3)
+  print(as.data.frame(tost_ci_disagree %>%  # FIX 2026-09-30 (C3)
+          select(dv_label, smd, smd_lo90, smd_hi90, tost_p_max, equivalent, ci90_within_bounds)))  # FIX 2026-09-30 (C3)
+} else {                                                                         # FIX 2026-09-30 (C3)
+  cat("\n[C3 diagnostic] SMD 90% CI-within-bounds agrees with the TOST decision for all DVs.\n")  # FIX 2026-09-30 (C3)
+}                                                                                # FIX 2026-09-30 (C3)
+
+tost_results %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         across(matches("p_"), fmt_p),
+         equivalent = ifelse(equivalent, "✓ equivalent", "✗ not equivalent")) %>%
+  kbl(caption = "TOST equivalence tests on the ten confirmatory DVs (bounds ±d = 0.40)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+# Cross-classify with BF10 categories for the headline interpretation.
+# IMPORTANT: compare the BOOLEAN `equivalent` column here (TRUE/FALSE), not the
+# ✓/✗ string version, which doesn't exist until we re-format for display below.
+# A previous version compared `equivalent == "✓ equivalent"` and silently
+# returned all "—" because the boolean never matched the string.
+tost_x_bf <- tost_results %>%
+  left_join(results_primary %>% select(dv, bf10), by = "dv") %>%
+  mutate(
+    bf10_class = case_when(
+      is.na(bf10) ~ "—",
+      bf10 < 1/10 ~ "Strong/very-strong H0",
+      bf10 < 1/3  ~ "Moderate H0",
+      bf10 < 1    ~ "Anecdotal H0",
+      bf10 < 3    ~ "Anecdotal H1",
+      TRUE        ~ "Moderate+ H1"
+    ),
+    null_evidence = case_when(
+      equivalent == TRUE  & !is.na(bf10) & bf10 < 1/3 ~ "Evidence of absence",
+      equivalent == FALSE & !is.na(bf10) & bf10 < 1/3 ~ "Bayesian-only null",
+      equivalent == TRUE  & !is.na(bf10) & bf10 >= 1/3 & bf10 < 3 ~ "TOST-only equivalence",
+      equivalent == FALSE & !is.na(bf10) & bf10 >= 3 ~ "Evidence of presence",
+      TRUE ~ "Inconclusive"
+    )
+  ) %>%
+  select(dv_label, smd, smd_lo90, smd_hi90, tost_p_max, equivalent, bf10_class, null_evidence)
+
+# Keep the boolean for downstream filtering, but make the display friendly
+tost_x_bf_display <- tost_x_bf %>%
+  mutate(equivalent = ifelse(equivalent, "✓ equivalent", "✗ not equivalent"))
+
+tost_x_bf_display %>%
+  kbl(caption = "Joint interpretation: TOST × Bayesian evidence categories") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+# Summary count for the manuscript
+n_evidence_of_absence <- sum(tost_x_bf$null_evidence == "Evidence of absence", na.rm = TRUE)
+n_evidence_of_presence <- sum(tost_x_bf$null_evidence == "Evidence of presence", na.rm = TRUE)
+n_bayesian_only_null  <- sum(tost_x_bf$null_evidence == "Bayesian-only null", na.rm = TRUE)
+n_inconclusive        <- sum(tost_x_bf$null_evidence == "Inconclusive", na.rm = TRUE)
+
+cat(glue::glue(
+  "\n--- Joint TOST × Bayesian classification ---\n",
+  "Evidence of absence (TOST equivalent AND BF10 < 1/3): ",
+  "{n_evidence_of_absence} of {nrow(tost_x_bf)} DVs.\n",
+  "Evidence of presence (TOST not equivalent AND BF10 ≥ 3): ",  # FIX 2026-09-30 (C4): label matches rule bf10 >= 3
+  "{n_evidence_of_presence} of {nrow(tost_x_bf)} DVs.\n",
+  "Bayesian-only null (BF10 < 1/3 but TOST not significant at .05): ",  # FIX 2026-09-30 (C3/C5): label matches the implemented rule (was "CI too wide for equivalence")
+  "{n_bayesian_only_null} of {nrow(tost_x_bf)} DVs.\n",
+  "Inconclusive: {n_inconclusive} of {nrow(tost_x_bf)} DVs.\n"
+))
+
+# Name the DVs in each headline category
+ev_absence_dvs <- tost_x_bf %>% filter(null_evidence == "Evidence of absence") %>% pull(dv_label)
+ev_presence_dvs <- tost_x_bf %>% filter(null_evidence == "Evidence of presence") %>% pull(dv_label)
+
+if (length(ev_absence_dvs) > 0) {
+  cat(glue::glue(
+    "\nDVs with evidence of absence: {paste(ev_absence_dvs, collapse = '; ')}\n"
+  ))
+}
+if (length(ev_presence_dvs) > 0) {
+  cat(glue::glue(
+    "DVs with evidence of presence: {paste(ev_presence_dvs, collapse = '; ')}\n"
+  ))
+}
+
+save_table(tost_results, "04b_tost_equivalence")
+save_table(tost_x_bf,    "04c_tost_x_bayes_classification")
+```
+
+## 6.4.1 Equivalence robustness: raw-metric bounds (TOSTER author's recommendation)
+
+The TOSTER package emits a warning when SMD bounds are used because the SMD pivot approximation can be biased; raw-metric bounds are recommended (Lakens, 2024). Our preregistration specified SMD bounds at ±0.40, which we keep as the primary equivalence test. As a robustness check we also compute equivalence with raw bounds set per DV at 0.40 × pooled SD; if both procedures agree on which DVs reach equivalence, the SMD bias is not material for our conclusions.
+
+```{r tost-raw-robustness}
+tost_raw_results <- map_dfr(confirmatory_dvs, function(dv) {
+  d_sub <- df_primary %>% filter(!is.na(.data[[dv]]))
+  ref  <- d_sub[[dv]][d_sub$condition_label == "LowA"]
+  comp <- d_sub[[dv]][d_sub$condition_label == "HighA"]
+  if (length(ref) < 5 || length(comp) < 5) return(NULL)
+
+  # Pooled SD for raw-bound conversion
+  n1 <- length(comp); n2 <- length(ref)
+  pooled_sd <- sqrt(((n1 - 1) * var(comp, na.rm = TRUE) +
+                     (n2 - 1) * var(ref,  na.rm = TRUE)) / (n1 + n2 - 2))
+  raw_bound <- 0.40 * pooled_sd
+
+  tost_raw <- tryCatch(
+    TOSTER::tsum_TOST(
+      m1 = mean(comp, na.rm = TRUE), sd1 = sd(comp, na.rm = TRUE), n1 = n1,
+      m2 = mean(ref,  na.rm = TRUE), sd2 = sd(ref,  na.rm = TRUE), n2 = n2,
+      low_eqbound = -raw_bound, high_eqbound = raw_bound,
+      eqbound_type = "raw", alpha = 0.05
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(tost_raw)) return(NULL)
+
+  tost_lower_p <- tost_raw$TOST$p.value[2]
+  tost_upper_p <- tost_raw$TOST$p.value[3]
+  tost_p_max_raw <- max(tost_lower_p, tost_upper_p, na.rm = TRUE)
+
+  tibble(
+    dv = dv,
+    dv_label = unname(dv_labels[dv]),
+    pooled_sd = pooled_sd,
+    raw_bound_pos = raw_bound,
+    raw_diff = mean(comp, na.rm = TRUE) - mean(ref, na.rm = TRUE),
+    tost_p_max_raw = tost_p_max_raw,
+    equivalent_raw = tost_p_max_raw < 0.05
+  )
+})
+
+# Cross-check against SMD result
+tost_compare <- tost_results %>%
+  select(dv, dv_label, equivalent_smd = equivalent, tost_p_max_smd = tost_p_max) %>%
+  left_join(tost_raw_results %>%
+              select(dv, equivalent_raw, tost_p_max_raw, raw_bound_pos),
+            by = "dv") %>%
+  mutate(agree = equivalent_smd == equivalent_raw)
+
+tost_compare %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         equivalent_smd = ifelse(equivalent_smd, "✓", "✗"),
+         equivalent_raw = ifelse(equivalent_raw, "✓", "✗"),
+         agree = ifelse(agree, "agree", "DISAGREE")) %>%
+  kbl(caption = "TOST robustness: SMD bounds (preregistered) vs. raw bounds (TOSTER author's recommendation)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+n_disagree <- sum(!tost_compare$agree, na.rm = TRUE)
+cat(glue::glue(
+  "\nSMD-bound and raw-bound TOST procedures agree on {nrow(tost_compare) - n_disagree} of ",
+  "{nrow(tost_compare)} DVs. ",
+  "{if (n_disagree == 0) 'The SMD bias warning does not affect any of our equivalence conclusions; the preregistered SMD-bound test is reported as primary.' else paste0('Disagreement on: ', paste(tost_compare %>% filter(!agree) %>% pull(dv_label), collapse = '; '), '. We retain the preregistered SMD-bound result as primary but flag these DVs for transparency.')}\n"
+))
+
+save_table(tost_raw_results, "04d_tost_equivalence_raw_bounds")
+save_table(tost_compare, "04e_tost_smd_vs_raw_agreement")
+```
+
+# 7. Bot Verbosity: Confound-Competition Sensitivity (Prereg §8.3)
+
+## 7.1 Compute per-participant verbosity from chat_log
+
+```{r verbosity-compute}
+library(jsonlite)
+
+compute_bot_verbosity <- function(chat_log_str) {
+  if (is.na(chat_log_str) || chat_log_str == "") return(NA_real_)
+  log <- tryCatch(fromJSON(chat_log_str, simplifyVector = FALSE),
+                  error = function(e) NULL)
+  if (is.null(log)) return(NA_real_)
+  bot_turns <- keep(log, ~.x$role == "assistant")
+  if (length(bot_turns) == 0) return(NA_real_)
+  # Use OpenRouter-reported completion_tokens where available
+  toks <- map_dbl(bot_turns, function(t) {
+    if (!is.null(t$usage) && !is.null(t$usage$completion_tokens)) {
+      as.numeric(t$usage$completion_tokens)
+    } else {
+      # Fallback: char count / 4 as a proxy
+      nchar(t$content) / 4
+    }
+  })
+  mean(toks, na.rm = TRUE)
+}
+
+compute_bot_chars <- function(chat_log_str) {
+  if (is.na(chat_log_str) || chat_log_str == "") return(NA_real_)
+  log <- tryCatch(fromJSON(chat_log_str, simplifyVector = FALSE),
+                  error = function(e) NULL)
+  if (is.null(log)) return(NA_real_)
+  bot_turns <- keep(log, ~.x$role == "assistant")
+  if (length(bot_turns) == 0) return(NA_real_)
+  mean(map_dbl(bot_turns, ~nchar(.x$content)), na.rm = TRUE)
+}
+
+compute_user_chars <- function(chat_log_str) {
+  if (is.na(chat_log_str) || chat_log_str == "") return(NA_real_)
+  log <- tryCatch(fromJSON(chat_log_str, simplifyVector = FALSE),
+                  error = function(e) NULL)
+  if (is.null(log)) return(NA_real_)
+  user_turns <- keep(log, ~.x$role == "user")
+  if (length(user_turns) == 0) return(NA_real_)
+  mean(map_dbl(user_turns, ~nchar(.x$content)), na.rm = TRUE)
+}
+
+compute_user_total_chars <- function(chat_log_str) {
+  if (is.na(chat_log_str) || chat_log_str == "") return(NA_real_)
+  log <- tryCatch(fromJSON(chat_log_str, simplifyVector = FALSE),
+                  error = function(e) NULL)
+  if (is.null(log)) return(NA_real_)
+  user_turns <- keep(log, ~.x$role == "user")
+  if (length(user_turns) == 0) return(NA_real_)
+  sum(map_dbl(user_turns, ~nchar(.x$content)), na.rm = TRUE)
+}
+
+df_primary <- df_primary %>%
+  mutate(
+    bot_tokens_per_turn = map_dbl(chat_log, compute_bot_verbosity),
+    bot_chars_per_turn = map_dbl(chat_log, compute_bot_chars),
+    user_chars_per_turn = map_dbl(chat_log, compute_user_chars),
+    user_total_chars = map_dbl(chat_log, compute_user_total_chars)
+  )
+df_sensitivity <- df_sensitivity %>%
+  mutate(
+    bot_tokens_per_turn = map_dbl(chat_log, compute_bot_verbosity),
+    bot_chars_per_turn = map_dbl(chat_log, compute_bot_chars),
+    user_chars_per_turn = map_dbl(chat_log, compute_user_chars),
+    user_total_chars = map_dbl(chat_log, compute_user_total_chars)
+  )
+```
+
+## 7.2 Descriptive verbosity comparison (Prereg §8.3)
+
+```{r verbosity-compare}
+verbosity_test <- welch_full(df_primary, "bot_tokens_per_turn")
+verbosity_test %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kbl(caption = "Bot verbosity (mean completion tokens per turn) by condition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Bot character verbosity for comparison
+welch_full(df_primary, "bot_chars_per_turn") %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kbl(caption = "Bot characters per turn by condition (verification)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 7.3 Verbosity-adjusted DV regressions (Prereg §8.3)
+
+Each of the ten confirmatory *t*-tests is repeated as a linear regression of the DV on Condition (LowA = 0, HighA = 1) and mean bot completion tokens per turn (centered). The condition coefficient and verbosity coefficient are both reported.
+
+<!-- FIX 2026-09-30 (C1): document Type II partial eta² and the exact unadjusted comparison -->
+Partial η² for each term is computed from Type II sums of squares, so the condition η² is adjusted for verbosity (and vice versa). Each adjusted model is compared with the unadjusted model `DV ~ Condition` fit to the same rows: `raw_b` / `raw_eta2` are the unadjusted condition coefficient and partial η², and `pct_change_b` / `pct_change_eta` are the exact percentage changes. `interpretation_v` is a descriptive summary of these numbers and does not apply a robustness criterion. <!-- FIX 2026-09-30 (C1) -->
+
+```{r verbosity-adjusted}
+# Center verbosity for interpretability
+df_primary <- df_primary %>%
+  mutate(bot_tokens_c = bot_tokens_per_turn - mean(bot_tokens_per_turn, na.rm = TRUE),
+         cond_dummy = ifelse(condition_label == "HighA", 1L, 0L))
+
+# FIX 2026-09-30 (C1): helper — pull the partial eta² for one term from an effectsize table.
+# (effectsize names the column Eta2_partial for >1 term but Eta2 for a single-term model.)  # FIX 2026-09-30 (C1)
+pull_eta2 <- function(es_tbl, term) {                                          # FIX 2026-09-30 (C1)
+  es_tbl <- as.data.frame(es_tbl)                                                # FIX 2026-09-30 (C1)
+  col <- intersect(c("Eta2_partial", "Eta2"), names(es_tbl))[1]                 # FIX 2026-09-30 (C1)
+  stopifnot(!is.na(col), sum(es_tbl$Parameter == term) == 1)                    # FIX 2026-09-30 (C1): row must exist exactly once
+  es_tbl[[col]][es_tbl$Parameter == term]                                        # FIX 2026-09-30 (C1)
+}                                                                                # FIX 2026-09-30 (C1)
+# FIX 2026-09-30 (C1): exact partial eta² from Type II SS, used as an independent cross-check
+pe2_from_anova <- function(aov2, term) {                                         # FIX 2026-09-30 (C1)
+  ss <- aov2[["Sum Sq"]]; names(ss) <- rownames(aov2)                            # FIX 2026-09-30 (C1)
+  unname(ss[term] / (ss[term] + ss["Residuals"]))                                # FIX 2026-09-30 (C1)
+}                                                                                # FIX 2026-09-30 (C1)
+
+verbosity_adjusted_results <- map_dfr(confirmatory_dvs, function(dv) {
+  # FIX 2026-09-30 (C1): fit adjusted and unadjusted models on the SAME rows so the change is comparable
+  d_m <- df_primary %>% filter(!is.na(.data[[dv]]), !is.na(cond_dummy), !is.na(bot_tokens_c))  # FIX 2026-09-30 (C1)
+  f <- as.formula(glue("{dv} ~ cond_dummy + bot_tokens_c"))
+  m <- lm(f, data = d_m)                                                         # FIX 2026-09-30 (C1): data = d_m (same rows as before; no NA dropped differently)
+  m0 <- lm(as.formula(glue("{dv} ~ cond_dummy")), data = d_m)                    # FIX 2026-09-30 (C1): unadjusted model, same rows
+  coefs <- broom::tidy(m, conf.int = TRUE)
+  # FIX 2026-09-30 (C1): Type I eta² (condition entered first) is NOT adjusted for verbosity.
+  # Use Type II SS so each term's partial eta² is adjusted for the other term.  # FIX 2026-09-30 (C1)
+  aov2_m  <- car::Anova(m,  type = 2)                                            # FIX 2026-09-30 (C1)
+  aov2_m0 <- car::Anova(m0, type = 2)                                            # FIX 2026-09-30 (C1)
+  ph  <- effectsize::eta_squared(aov2_m,  partial = TRUE, ci = 0.95)             # FIX 2026-09-30 (C1): Type II partial eta²
+  ph0 <- effectsize::eta_squared(aov2_m0, partial = TRUE, ci = 0.95)             # FIX 2026-09-30 (C1): unadjusted model eta²
+
+  # Get condition row
+  c_row <- coefs %>% filter(term == "cond_dummy")
+  v_row <- coefs %>% filter(term == "bot_tokens_c")
+  c_eta <- pull_eta2(ph, "cond_dummy")                                           # FIX 2026-09-30 (C1): explicit cond_dummy row, Type II
+  v_eta <- pull_eta2(ph, "bot_tokens_c")                                         # FIX 2026-09-30 (C1): explicit bot_tokens_c row, Type II
+  r_eta <- pull_eta2(ph0, "cond_dummy")                                          # FIX 2026-09-30 (C1): exact raw partial eta² (m0)
+  stopifnot(isTRUE(all.equal(c_eta, pe2_from_anova(aov2_m,  "cond_dummy"))),    # FIX 2026-09-30 (C1): cross-check vs SS
+            isTRUE(all.equal(r_eta, pe2_from_anova(aov2_m0, "cond_dummy"))))     # FIX 2026-09-30 (C1): cross-check vs SS
+
+  # Compare to raw effect from results_primary
+  raw_d <- results_primary %>% filter(dv == !!dv) %>% pull(d)
+  raw_p <- results_primary %>% filter(dv == !!dv) %>% pull(p)
+
+  tibble(
+    dv = dv,
+    dv_label = dv_labels[dv],
+    raw_d = raw_d,
+    raw_p = raw_p,
+    cond_b = c_row$estimate, cond_se = c_row$std.error,
+    cond_t = c_row$statistic, cond_p = c_row$p.value,
+    cond_lo = c_row$conf.low, cond_hi = c_row$conf.high,
+    cond_eta2 = c_eta,
+    verb_b = v_row$estimate, verb_p = v_row$p.value, verb_eta2 = v_eta,
+    R2 = summary(m)$r.squared,  # FIX 2026-09-30 (C1)
+    n_model  = nrow(d_m),                                                        # FIX 2026-09-30 (C1): added — rows in both models
+    raw_b    = unname(coef(m0)["cond_dummy"]),                                   # FIX 2026-09-30 (C1): added — unadjusted condition b
+    raw_eta2 = r_eta                                                             # FIX 2026-09-30 (C1): added — exact unadjusted partial eta²
+  )
+})
+
+verbosity_adjusted_results <- verbosity_adjusted_results %>%
+  mutate(
+    q_bh_adj = p.adjust(cond_p, method = "BH")
+  )
+
+# FIX 2026-09-30 (C1): changes are now computed EXACTLY against the unadjusted model (m0).
+# raw_eta2_approx (d-to-eta² conversion) is retained unchanged for backward compatibility only.  # FIX 2026-09-30 (C1)
+# interpretation_v is now a purely descriptive, computed label; it takes no position on a  # FIX 2026-09-30 (C1)
+# robustness criterion.  # FIX 2026-09-30 (C1)
+verbosity_adjusted_results <- verbosity_adjusted_results %>%
+  mutate(
+    raw_eta2_approx = (raw_d^2) / (raw_d^2 + 4),  # approximate conversion for two groups (kept; not used below)  # FIX 2026-09-30 (C1)
+    pct_change_b   = (cond_b - raw_b) / raw_b * 100,                             # FIX 2026-09-30 (C1): added — % change in condition b
+    pct_change_eta = (cond_eta2 - raw_eta2) / raw_eta2 * 100,                    # FIX 2026-09-30 (C1): exact (was vs. d-converted approx)
+    interpretation_v = sprintf(                                                  # FIX 2026-09-30 (C1): descriptive label, no robustness rule
+      "%s (raw p = %s); adjusted b changes by %+.1f%% (%.3f -> %.3f); adjusted partial eta2 %.4f -> %.4f (%+.1f%%); adjusted p = %s; adjusted q_BH = %s",  # FIX 2026-09-30 (C1)
+      ifelse(raw_p < 0.05, "Raw effect p < .05", "Raw effect p >= .05"),         # FIX 2026-09-30 (C1)
+      fmt_p(raw_p), pct_change_b, raw_b, cond_b, raw_eta2, cond_eta2, pct_change_eta,  # FIX 2026-09-30 (C1)
+      fmt_p(cond_p), fmt_p(q_bh_adj))                                            # FIX 2026-09-30 (C1)
+  )  # FIX 2026-09-30 (C1)
+
+verbosity_adjusted_results %>%
+  select(dv_label, raw_d, raw_p, raw_b, cond_b, pct_change_b, cond_se, cond_p, q_bh_adj,  # FIX 2026-09-30 (C1): show raw_b / pct_change_b
+         raw_eta2, cond_eta2, pct_change_eta, verb_b, verb_p, verb_eta2, R2, interpretation_v) %>%  # FIX 2026-09-30 (C1): show raw_eta2 / pct_change_eta
+  mutate(across(where(is.numeric), ~round(., 3)),
+         raw_p = fmt_p(raw_p), cond_p = fmt_p(cond_p), q_bh_adj = fmt_p(q_bh_adj),
+         verb_p = fmt_p(verb_p)) %>%
+  kbl(caption = "Verbosity-adjusted DV regressions (primary sample)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(verbosity_adjusted_results, "05_verbosity_adjusted")
+```
+
+## 7.4 Side-by-side comparison plot
+
+```{r verbosity-side-by-side, fig.height=6}
+side_data <- bind_rows(
+  results_primary %>%
+    select(dv_label, d, d_lo, d_hi) %>%
+    mutate(model = "Raw (Welch t)"),
+  verbosity_adjusted_results %>%
+    transmute(dv_label,
+              # Convert adjusted eta² back to d-scale roughly for comparison
+              d = sign(cond_b) * 2 * sqrt(cond_eta2 / (1 - cond_eta2)),
+              d_lo = NA, d_hi = NA,
+              model = "Verbosity-adjusted (partial eta-sq)")
+)
+
+p_side <- side_data %>%
+  ggplot(aes(x = d, y = reorder(dv_label, d), color = model, shape = model)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(aes(xmin = d_lo, xmax = d_hi), height = 0.2,
+                 position = position_dodge(width = 0.4), na.rm = TRUE) +
+  scale_color_manual(values = c("Raw (Welch t)" = "#1E5BA8",
+                                 "Verbosity-adjusted (partial eta-sq)" = "#B45F06")) +
+  labs(title = "Effect of condition on each DV: raw vs. verbosity-adjusted",
+       subtitle = "Adjusted estimates use partial eta-sq converted to d-scale (CIs not shown for adjusted)",
+       x = "Effect size (Hedges' g or d-equivalent)", y = NULL,
+       color = NULL, shape = NULL)
+p_side
+save_fig(p_side, "03_raw_vs_verbosity_adjusted", w = 9, h = 6)
+```
+
+# 8. Behavioral DVs (Prereg §8.4)
+
+A parallel confirmatory family on observable engagement metrics, BH-FDR within the family of five.
+
+```{r behavioral-dvs}
+# Use char-count proxy for token DV5 if true tokenization unavailable
+df_primary <- df_primary %>%
+  mutate(user_tokens_per_turn = user_chars_per_turn / 4)
+df_sensitivity <- df_sensitivity %>%
+  mutate(user_tokens_per_turn = user_chars_per_turn / 4)
+
+behavioral_dvs <- c(
+  "chat_total_rounds", "chat_idle_pause_count",
+  "user_chars_per_turn", "user_total_chars", "user_tokens_per_turn"
+)
+
+behavioral_labels <- c(
+  chat_total_rounds = "Chat Total Rounds",
+  chat_idle_pause_count = "Idle Pauses",
+  user_chars_per_turn = "User Mean Chars/Turn",
+  user_total_chars = "User Total Chars",
+  user_tokens_per_turn = "User Mean Tokens/Turn (≈chars/4)"
+)
+
+behavioral_results <- map_dfr(behavioral_dvs, ~welch_full(df_primary, .x)) %>%
+  mutate(
+    dv_label = behavioral_labels[dv],
+    q_bh = p.adjust(p, method = "BH"),
+    bf_interp = bf_verbal(bf10),
+    confirmed = (q_bh < 0.05) & (bf10 >= 3)  # FIX 2026-09-30 (C4): BF10 >= 3 (was > 3)
+  )
+
+behavioral_results %>%
+  select(dv_label, n_ref, mean_ref, sd_ref, n_comp, mean_comp, sd_comp,
+         t, df, p, q_bh, d, d_lo, d_hi, bf10) %>%
+  mutate(across(c(mean_ref, sd_ref, mean_comp, sd_comp, t, df, d, d_lo, d_hi), ~round(., 2)),
+         p = fmt_p(p), q_bh = fmt_p(q_bh),
+         bf10 = fmt_bf(bf10)) %>%
+  kbl(caption = "Behavioral DVs: confirmatory family (BH-FDR within family of 5)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(behavioral_results, "06_behavioral_dvs")
+```
+
+# 9. Confirmatory Directional Hypothesis: Legal Expertise Moderator (Prereg RQ-E8, §9.1)
+
+## 9.1 Build the legal-expertise composite
+
+```{r legal-expertise}
+# d_training is a multi-select character; check actual format
+df_primary %>% count(d_training) %>% head(10)
+
+# Heuristic: d_training contains substring "law" or codes indicating legal training
+# Examine and adjust based on actual values
+df_primary <- df_primary %>%
+  mutate(
+    legal_training_law = str_detect(tolower(as.character(d_training)), "law"),
+    legal_training_law = replace_na(legal_training_law, FALSE),
+    jury_yes = (d_jury == 1) & !is.na(d_jury),
+    legal_knowledge_z = scale(d_legal_knowledge)[, 1],
+    legal_expertise = legal_knowledge_z +
+                      2 * as.numeric(legal_training_law) +
+                      0.5 * as.numeric(jury_yes)
+  )
+
+df_primary %>%
+  summarize(
+    `N with law training` = sum(legal_training_law, na.rm = TRUE),
+    `N with jury experience` = sum(jury_yes, na.rm = TRUE),
+    `Legal-knowledge mean (raw)` = mean(d_legal_knowledge, na.rm = TRUE),
+    `Legal-knowledge SD (raw)` = sd(d_legal_knowledge, na.rm = TRUE),
+    `Composite mean` = mean(legal_expertise, na.rm = TRUE),
+    `Composite SD` = sd(legal_expertise, na.rm = TRUE),
+    `Composite min` = min(legal_expertise, na.rm = TRUE),
+    `Composite max` = max(legal_expertise, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything()) %>%
+  kbl(caption = "Legal-expertise composite descriptives", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 9.2 H-Legal: One-tailed test of the interaction
+
+```{r h-legal-test}
+df_primary <- df_primary %>%
+  mutate(legal_expertise_z = scale(legal_expertise)[, 1],
+         cond_centered = ifelse(condition_label == "HighA", 0.5, -0.5))
+
+m_legal <- lm(liab_corp ~ cond_centered * legal_expertise_z, data = df_primary)
+m_legal_summary <- summary(m_legal)
+print(m_legal_summary)
+
+interaction_coef <- broom::tidy(m_legal, conf.int = TRUE) %>%
+  filter(term == "cond_centered:legal_expertise_z")
+interaction_coef
+
+# Convert two-tailed p to one-tailed (sign matters for directional prediction)
+# FIX 2026-09-30 (R4-C5a): prereg RQ-E8 predicts ATTENUATION (a smaller absolute condition effect at higher
+# FIX 2026-09-30 (R4-C5a)  legal expertise), not a sign. This notebook's one-tailed test assumes a NEGATIVE
+# FIX 2026-09-30 (R4-C5a)  interaction, which corresponds to attenuation only when the condition main effect is positive.
+two_tailed_p <- interaction_coef$p.value
+one_tailed_p <- if (interaction_coef$estimate < 0) {
+  two_tailed_p / 2
+} else {
+  1 - two_tailed_p / 2
+}
+
+# FIX 2026-09-30 (R4-C5a): live attenuation quantities from the fitted model (narrative only; one_tailed_p and
+# FIX 2026-09-30 (R4-C5a)  the 'supported' rule are unchanged). Condition simple slope at z = legal_expertise_z:
+# FIX 2026-09-30 (R4-C5a)  b_cond + z * b_int. |slope(+1)| < |slope(-1)| is the RQ-E8 attenuation criterion.
+hl_terms  <- c("cond_centered", "cond_centered:legal_expertise_z")                         # FIX 2026-09-30 (R4-C5a)
+hl_b_main <- unname(coef(m_legal)[hl_terms[1]])   # FIX 2026-09-30 (R4-C5a): condition effect at mean legal expertise (z = 0)
+hl_b_int  <- unname(coef(m_legal)[hl_terms[2]])                                            # FIX 2026-09-30 (R4-C5a)
+hl_V      <- vcov(m_legal)[hl_terms, hl_terms]                                              # FIX 2026-09-30 (R4-C5a)
+hl_tcrit  <- qt(0.975, df.residual(m_legal))                                                # FIX 2026-09-30 (R4-C5a)
+hl_slope  <- function(z) {                                                                  # FIX 2026-09-30 (R4-C5a)
+  est <- hl_b_main + z * hl_b_int                                                           # FIX 2026-09-30 (R4-C5a)
+  se  <- sqrt(hl_V[1, 1] + z^2 * hl_V[2, 2] + 2 * z * hl_V[1, 2])                           # FIX 2026-09-30 (R4-C5a)
+  c(est = est, lo = est - hl_tcrit * se, hi = est + hl_tcrit * se)                          # FIX 2026-09-30 (R4-C5a)
+}                                                                                           # FIX 2026-09-30 (R4-C5a)
+hl_s_lo <- hl_slope(-1); hl_s_hi <- hl_slope(1)                                             # FIX 2026-09-30 (R4-C5a)
+hl_attenuated <- abs(hl_s_hi[["est"]]) < abs(hl_s_lo[["est"]])                              # FIX 2026-09-30 (R4-C5a)
+hl_main_sign  <- if (hl_b_main > 0) "positive" else if (hl_b_main < 0) "negative" else "zero"  # FIX 2026-09-30 (R4-C5a)
+hl_int_sign   <- if (interaction_coef$estimate > 0) "positive" else if (interaction_coef$estimate < 0) "negative" else "zero"  # FIX 2026-09-30 (R4-C5a)
+hl_int_ci_txt <- sprintf("b = %.3f, 95%% CI [%.3f, %.3f]", interaction_coef$estimate,      # FIX 2026-09-30 (R4-C5a)
+                         interaction_coef$conf.low, interaction_coef$conf.high)             # FIX 2026-09-30 (R4-C5a)
+hl_slopes_txt <- sprintf(paste0("Condition simple slope at -1 SD of legal_expertise_z = %.3f [95%% CI %.3f, %.3f]; ",  # FIX 2026-09-30 (R4-C5a)
+                                "at +1 SD = %.3f [95%% CI %.3f, %.3f]"),                     # FIX 2026-09-30 (R4-C5a)
+                         hl_s_lo[["est"]], hl_s_lo[["lo"]], hl_s_lo[["hi"]],               # FIX 2026-09-30 (R4-C5a)
+                         hl_s_hi[["est"]], hl_s_hi[["lo"]], hl_s_hi[["hi"]])               # FIX 2026-09-30 (R4-C5a)
+hl_attn_txt <- sprintf(paste0("|slope(+1 SD)| = %.3f %s |slope(-1 SD)| = %.3f, so the RQ-E8 attenuation ",  # FIX 2026-09-30 (R4-C5a)
+                              "criterion (|slope(+1 SD)| < |slope(-1 SD)|, point estimates) is %s"),  # FIX 2026-09-30 (R4-C5a)
+                       abs(hl_s_hi[["est"]]), if (hl_attenuated) "<" else ">=",             # FIX 2026-09-30 (R4-C5a)
+                       abs(hl_s_lo[["est"]]), if (hl_attenuated) "met" else "not met")      # FIX 2026-09-30 (R4-C5a)
+hl_onetail_txt <- sprintf(paste0("The one-tailed test assumes a negative interaction, which corresponds to ",  # FIX 2026-09-30 (R4-C5a)
+                                 "attenuation only when the condition main effect is positive; here the ",  # FIX 2026-09-30 (R4-C5a)
+                                 "condition main effect (at mean legal expertise) is %s (b = %.3f)"),  # FIX 2026-09-30 (R4-C5a)
+                          hl_main_sign, hl_b_main)                                          # FIX 2026-09-30 (R4-C5a)
+
+cat(glue(
+  "\nH-Legal directional test:\n",
+  "  Interaction β = {round(interaction_coef$estimate, 4)}\n",
+  "  SE = {round(interaction_coef$std.error, 4)}\n",
+  "  t = {round(interaction_coef$statistic, 3)}\n",
+  "  Two-tailed p = {round(two_tailed_p, 4)}\n",
+  "  One-tailed p (H-Legal) = {round(one_tailed_p, 4)}\n",
+  "  Interaction observed: {hl_int_sign} ({hl_int_ci_txt})\n",  # FIX 2026-09-30 (R4-C5a): was "Direction predicted: NEGATIVE"
+  "  One-tailed test: assumes a NEGATIVE interaction (this notebook's operationalization of RQ-E8)\n",  # FIX 2026-09-30 (R4-C5a)
+  "  Condition main effect (at mean legal expertise): b = {sprintf('%.3f', hl_b_main)} ({hl_main_sign});\n",  # FIX 2026-09-30 (R4-C5a)
+  "    a negative interaction corresponds to attenuation only when this main effect is positive\n",  # FIX 2026-09-30 (R4-C5a)
+  "  {hl_slopes_txt}\n",  # FIX 2026-09-30 (R4-C5a)
+  "  {hl_attn_txt}\n",  # FIX 2026-09-30 (R4-C5a)
+  "  H-Legal supported (p < .05, one-tailed): {ifelse(one_tailed_p < 0.05 & interaction_coef$estimate < 0, 'YES', 'NO')}\n"
+))
+
+save_table(broom::tidy(m_legal, conf.int = TRUE), "07_h_legal_regression")
+```
+
+## 9.3 Simple slopes at ±1 SD of legal expertise
+
+```{r simple-slopes}
+ss <- interactions::sim_slopes(m_legal, pred = cond_centered, modx = legal_expertise_z,
+                               modx.values = c(-1, 0, 1),
+                               confint = TRUE, johnson_neyman = TRUE)
+print(ss)
+# FIX 2026-09-30 (R4-C5a): cross-check the slopes used in the H-Legal narrative against sim_slopes
+ss_z <- ss$slopes[["Value of legal_expertise_z"]]                                          # FIX 2026-09-30 (R4-C5a)
+stopifnot(isTRUE(all.equal(unname(ss$slopes$Est.[ss_z == -1]), unname(hl_s_lo[["est"]]))),  # FIX 2026-09-30 (R4-C5a)
+          isTRUE(all.equal(unname(ss$slopes$Est.[ss_z ==  1]), unname(hl_s_hi[["est"]]))))  # FIX 2026-09-30 (R4-C5a)
+cat("[R4-C5a check] H-Legal narrative slopes match sim_slopes at -1 / +1 SD\n")            # FIX 2026-09-30 (R4-C5a)
+
+# Plot interaction
+p_interact <- interactions::interact_plot(
+  m_legal, pred = legal_expertise_z, modx = cond_centered,
+  modx.values = c(-0.5, 0.5),
+  modx.labels = c("LowA (-0.5)", "HighA (+0.5)"),
+  interval = TRUE, int.width = 0.95,
+  colors = c("LowA (-0.5)" = cond_colors["LowA"],
+             "HighA (+0.5)" = cond_colors["HighA"]),
+  legend.main = "Condition",
+  x.label = "Legal Expertise (z)", y.label = "Corporate Liability"
+) +
+  labs(title = "Condition × Legal Expertise on Corporate Liability",
+       subtitle = "H-Legal: legal expertise predicted to attenuate condition effect")
+p_interact
+save_fig(p_interact, "04_h_legal_interaction", w = 7.5, h = 5)
+```
+
+## 9.4 Tertile-split robustness check
+
+```{r legal-tertile}
+df_primary <- df_primary %>%
+  mutate(legal_tertile = cut(legal_expertise,
+                             breaks = quantile(legal_expertise,
+                                                probs = c(0, 1/3, 2/3, 1),
+                                                na.rm = TRUE),
+                             labels = c("Low", "Mid", "High"),
+                             include.lowest = TRUE))
+
+m_tertile <- lm(liab_corp ~ condition_label * legal_tertile, data = df_primary)
+anova_tertile <- car::Anova(m_tertile, type = 3)
+print(anova_tertile)
+
+# Simple effects of condition within each tertile
+em <- emmeans::emmeans(m_tertile, ~ condition_label | legal_tertile)
+contrasts_tertile <- pairs(em)
+print(contrasts_tertile)
+
+save_table(broom::tidy(anova_tertile), "08_legal_tertile_anova")
+```
+
+## 9.5 H-Legal extensions to other liability DVs
+
+```{r h-legal-extensions}
+extension_dvs <- c("liab_chat", "liab_user", "liab_harm")
+extensions <- map_dfr(extension_dvs, function(dv) {
+  f <- as.formula(glue("{dv} ~ cond_centered * legal_expertise_z"))
+  m <- lm(f, data = df_primary)
+  coef <- broom::tidy(m, conf.int = TRUE) %>%
+    filter(term == "cond_centered:legal_expertise_z") %>%
+    mutate(dv = dv, dv_label = dv_labels[dv])
+  coef
+})
+
+extensions %>%
+  mutate(across(where(is.numeric), ~round(., 4)),
+         p.value = fmt_p(p.value)) %>%
+  select(dv_label, estimate, std.error, statistic, p.value, conf.low, conf.high) %>%
+  kbl(caption = "H-Legal extensions to other liability DVs (exploratory)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(extensions, "09_h_legal_extensions")
+```
+
+## 9.6 H-Legal: power and interpretive note
+
+H-Legal is the preregistered exploratory question RQ-E8: whether legal expertise attenuates the condition effect on Corporate Liability, i.e., whether the absolute condition effect is smaller at higher legal expertise. The note below reports the sample composition and the fitted quantities relevant to interpreting the result: <!-- FIX 2026-09-30 (R4-C5b): was "predicted that legal expertise would moderate ... Two facts ... limit the interpretation of any H-Legal result" (fixed interpretive claim) -->
+
+```{r h-legal-power-note}
+# Sample-size summary for legal-expertise components
+legal_n_summary <- df_primary %>%
+  summarize(
+    `N total in primary sample` = n(),
+    `N with formal legal training (d_training contains 'law')` = sum(legal_training_law, na.rm = TRUE),
+    `N with prior jury experience (d_jury == 1)` = sum(jury_yes, na.rm = TRUE),
+    `N in upper tertile of legal-expertise composite` =
+       sum(legal_tertile == "High", na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value")
+
+legal_n_summary %>%
+  kbl(caption = "Legal-expertise sample composition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Main effect on Corp Liability (from results_primary)
+corp_liab_main <- results_primary %>% filter(dv == "liab_corp")
+
+# FIX 2026-09-30 (C5): direction / significance text is now built from the fitted interaction
+# (previously hard-coded as "directionally consistent ... (negative coefficient)").  # FIX 2026-09-30 (C5)
+hlegal_b         <- interaction_coef$estimate                                                   # FIX 2026-09-30 (C5)
+hlegal_dir_txt   <- hl_int_sign   # FIX 2026-09-30 (R4-C5a): sign only (was "in the predicted (negative) direction" / "OPPOSITE to the predicted direction")
+hlegal_ci_max    <- max(abs(c(interaction_coef$conf.low, interaction_coef$conf.high)))   # FIX 2026-09-30 (R4-C5b)
+hlegal_sig_txt   <- if (one_tailed_p < 0.05 & hlegal_b < 0) "reached" else "did not reach"       # FIX 2026-09-30 (C5)
+corp_main_txt    <- if (corp_liab_main$p >= 0.05) "is not significant" else "is significant"     # FIX 2026-09-30 (C5)
+
+cat(glue::glue(
+  "\n--- H-Legal interpretive note ---\n",
+  "1. The number of participants with formal legal training is small (N = ",
+  "{sum(df_primary$legal_training_law, na.rm = TRUE)}). ",  # FIX 2026-09-30 (C5): removed false hard-coded claim that law-trained participants drive the upper tertile
+  "{sum(df_primary$legal_training_law & df_primary$legal_tertile == 'High', na.rm = TRUE)} of the ",  # FIX 2026-09-30 (C5): live count of law-trained in upper tertile
+  "{sum(df_primary$legal_tertile == 'High', na.rm = TRUE)} participants in the upper tertile of the\n",  # FIX 2026-09-30 (C5): live upper-tertile n
+  "   legal-expertise composite have formal legal training; interaction SE = ",  # FIX 2026-09-30 (C5)
+  "{sprintf('%.3f', interaction_coef$std.error)}, 95% CI [{sprintf('%.3f', interaction_coef$conf.low)}, ",  # FIX 2026-09-30 (C5): live SE/CI (was hard-coded "correspondingly wide")
+  "{sprintf('%.3f', interaction_coef$conf.high)}].\n\n",  # FIX 2026-09-30 (C5)
+  "2. The main effect of condition on Corporate Liability {corp_main_txt} in the primary sample\n",  # FIX 2026-09-30 (C5): live
+  "   (d = {round(corp_liab_main$d, 3)}, p = {round(corp_liab_main$p, 3)}, ",
+  "BF10 = {round(corp_liab_main$bf10, 3)}). H-Legal was framed as a moderator of\n",
+  "   the condition effect on Corporate Liability; see the value above for whether there is\n",  # FIX 2026-09-30 (C5)
+  "   a main effect to moderate.\n\n",                                                             # FIX 2026-09-30 (C5)
+  "The H-Legal interaction is {hlegal_dir_txt} ({hl_int_ci_txt}, two-tailed p = {sprintf('%.3f', two_tailed_p)}).\n",  # FIX 2026-09-30 (R4-C5a)
+  "The notebook's one-tailed test, which assumes a negative interaction, gives one-tailed p = ",  # FIX 2026-09-30 (R4-C5a)
+  "{sprintf('%.3f', one_tailed_p)}\n",  # FIX 2026-09-30 (R4-C5a)
+  "and the interaction {hlegal_sig_txt} one-tailed significance.\n",  # FIX 2026-09-30 (R4-C5a)
+  "{hl_slopes_txt}.\n",  # FIX 2026-09-30 (R4-C5a)
+  "{hl_attn_txt}.\n",  # FIX 2026-09-30 (R4-C5a)
+  "{hl_onetail_txt}.\n",  # FIX 2026-09-30 (R4-C5a)
+  "We report this result as a preregistered exploratory question (RQ-E8); the one-tailed test is this\n",  # FIX 2026-09-30 (R4-C5b): was "as preregistered"
+  "notebook's operationalization. The 95% CI for the interaction, [{sprintf('%.3f', interaction_coef$conf.low)}, ",  # FIX 2026-09-30 (R4-C5b): replaces fixed "underpowered and uninterpretable ... rather than as a substantive null"
+  "{sprintf('%.3f', interaction_coef$conf.high)}], is compatible with absolute interactions of up to about ",  # FIX 2026-09-30 (R4-C5b)
+  "{sprintf('%.3f', hlegal_ci_max)} scale points.\n",  # FIX 2026-09-30 (R4-C5b)
+  "Legal expertise is analysed only here (RQ-E8); it is not part of the Section 12.1\n",          # FIX 2026-09-30 (C5): removed false claim that legal expertise is in the §12.1 battery
+  "exploratory moderator battery (Prereg §9.1 routes it to this separate analysis).\n"           # FIX 2026-09-30 (C5)
+))
+```
+
+# 10. Internal Consistency Reliability (Prereg §8.5)
+
+```{r reliability}
+reliability_results <- tibble(
+  Scale = character(),
+  N_items = integer(),
+  alpha = numeric(),
+  alpha_lo = numeric(),
+  alpha_hi = numeric(),
+  omega = numeric()
+)
+
+scale_items <- list(
+  PSR_total = paste0("psr_", 1:12),
+  PSR_connection = paste0("psr_", 1:4),
+  PSR_desire = paste0("psr_", 5:8),
+  PSR_caring = paste0("psr_", 9:12),
+  EC = paste0("ec_", 1:5),
+  Trust = paste0("tr_", 1:4),
+  Experience_Taking = paste0("et_", 1:8),
+  Moral_Agency = paste0("ma_", 1:8),
+  Moral_Patiency = paste0("mp_", 1:8),
+  Liability_Corporate = paste0("liab_", 1:5),
+  Liability_Chatbot = paste0("liab_", 6:8),
+  Liability_User = paste0("liab_", 9:10),
+  Liability_Harm = paste0("liab_", 11:12),
+  GAAIS_Positive = c(paste0("gaais_", 1:9), "gaais_10_r"),  # placeholder
+  GAAIS_Negative = c(paste0("gaais_", 11:18), "gaais_19_r", "gaais_20_r"),
+  PHQ4 = paste0("phq4_", 1:4)
+)
+
+# Prepare reverse-coded GAAIS items
+df_rel <- df_primary %>%
+  mutate(gaais_10_r = 6 - gaais_10,
+         gaais_19_r = 6 - gaais_19,
+         gaais_20_r = 6 - gaais_20)
+
+reliability_results <- map_dfr(names(scale_items), function(scale_name) {
+  items <- scale_items[[scale_name]]
+  available <- intersect(items, names(df_rel))
+  if (length(available) < 2) {
+    return(tibble(Scale = scale_name, N_items = length(available),
+                  alpha = NA, alpha_lo = NA, alpha_hi = NA, omega = NA))
+  }
+
+  X <- df_rel[, available, drop = FALSE]
+  X <- X[complete.cases(X), , drop = FALSE]
+
+  set.seed(42)  # FIX 2026-09-30 (R4-R1): reseed before each stochastic psych::alpha bootstrap
+  alpha_obj <- tryCatch(psych::alpha(X, check.keys = FALSE,
+                                      n.iter = 1000, warnings = FALSE),
+                        error = function(e) NULL)
+  alpha_val <- if (!is.null(alpha_obj)) alpha_obj$total$raw_alpha else NA_real_
+  alpha_ci <- if (!is.null(alpha_obj) && !is.null(alpha_obj$boot.ci)) {
+    alpha_obj$boot.ci
+  } else c(NA, NA, NA)
+
+  omega_val <- tryCatch({
+    if (length(available) >= 3) {
+      o <- psych::omega(X, nfactors = 1, plot = FALSE, warnings = FALSE)
+      o$omega.tot
+    } else NA_real_
+  }, error = function(e) NA_real_)
+
+  tibble(
+    Scale = scale_name,
+    N_items = length(available),
+    alpha = alpha_val,
+    alpha_lo = alpha_ci[1],
+    alpha_hi = alpha_ci[3],
+    omega = omega_val
+  )
+})
+
+reliability_results <- reliability_results %>%
+  mutate(flag = case_when(
+    N_items < 2 ~ "—",
+    alpha < 0.60 ~ "⚠ <0.60 (treat as exploratory)",
+    alpha < 0.70 ~ "Borderline",
+    TRUE ~ "Acceptable"
+  ))
+
+reliability_results %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kbl(caption = "Internal consistency reliability: Cronbach's α (with bootstrap 95% CI) and McDonald's ω") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Live exploratory-flag list for the manuscript
+exploratory_scales <- reliability_results %>%
+  filter(!is.na(alpha), alpha < 0.60) %>% pull(Scale)
+borderline_scales <- reliability_results %>%
+  filter(!is.na(alpha), alpha >= 0.60, alpha < 0.70) %>% pull(Scale)
+
+if (length(exploratory_scales) > 0 || length(borderline_scales) > 0) {
+  cat("\n--- Reliability flags for manuscript ---\n")
+  if (length(exploratory_scales) > 0) {
+    cat(glue::glue("Below 0.60 (treat as exploratory; flag in manuscript): ",
+                   "{paste(exploratory_scales, collapse = ', ')}\n"))
+  }
+  if (length(borderline_scales) > 0) {
+    cat(glue::glue("Borderline (0.60-0.70; report with caveat): ",
+                   "{paste(borderline_scales, collapse = ', ')}\n"))
+  }
+}
+
+save_table(reliability_results, "10_reliability")
+```
+
+# 11. Item-Level Analyses with Forest Plots (Exploratory item-level supplement; see Prereg RQ-E3)
+
+For each multi-item DV composite and subscale, item-level Welch's *t*-tests with BH-FDR applied within scale.
+
+## 11.1 Run item-level tests for all DVs
+
+```{r item-level-tests}
+item_specs <- list(
+  PSR_full = paste0("psr_", 1:12),
+  PSR_connection = paste0("psr_", 1:4),
+  PSR_desire = paste0("psr_", 5:8),
+  PSR_caring = paste0("psr_", 9:12),
+  EC = paste0("ec_", 1:5),
+  Trust = paste0("tr_", 1:4),
+  Experience_Taking = paste0("et_", 1:8),
+  Moral_Agency = paste0("ma_", 1:8),
+  Moral_Patiency = paste0("mp_", 1:8),
+  Liability_Corporate = paste0("liab_", 1:5),
+  Liability_Chatbot = paste0("liab_", 6:8),
+  Liability_User = paste0("liab_", 9:10),
+  Liability_Harm = paste0("liab_", 11:12)
+)
+
+item_level <- imap_dfr(item_specs, function(items, scale_name) {
+  map_dfr(items, ~welch_full(df_primary, .x)) %>%
+    mutate(scale = scale_name) %>%
+    mutate(q_bh_within = p.adjust(p, method = "BH"))
+})
+
+item_level <- item_level %>%
+  mutate(
+    sig_within_scale = q_bh_within < 0.05,
+    direction = ifelse(d > 0, "HighA > LowA", "LowA > HighA")
+  )
+
+# DIF descriptive: SD of effect sizes within each scale
+dif_summary <- item_level %>%
+  group_by(scale) %>%
+  summarize(n_items = n(),
+            mean_d = mean(d, na.rm = TRUE),
+            sd_d = sd(d, na.rm = TRUE),
+            min_d = min(d, na.rm = TRUE),
+            max_d = max(d, na.rm = TRUE),
+            n_sig = sum(sig_within_scale, na.rm = TRUE))
+
+dif_summary %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kbl(caption = "Differential item functioning summary: within-scale SD of item-level effect sizes") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(item_level, "11_item_level")
+save_table(dif_summary, "11_dif_summary")
+```
+
+## 11.2 Forest plots per scale
+
+```{r forest-per-scale, fig.height=10, fig.width=10}
+make_forest <- function(scale_name, item_data) {
+  d <- item_data %>%
+    filter(scale == scale_name) %>%
+    mutate(item = factor(dv, levels = dv[order(d)]))
+
+  ggplot(d, aes(x = d, y = item)) +
+    geom_vline(xintercept = 0, color = "grey50") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "grey80") +
+    geom_errorbarh(aes(xmin = d_lo, xmax = d_hi), height = 0.2, color = "grey30") +
+    geom_point(aes(fill = sig_within_scale), shape = 21, size = 3, color = "black") +
+    scale_fill_manual(values = c("TRUE" = "#1A7E3A", "FALSE" = "white"),
+                      name = "Sig (within-scale FDR)",
+                      labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+    labs(title = scale_name, x = "Hedges' g", y = NULL) +
+    theme(plot.title = element_text(size = 11, face = "bold"))
+}
+
+# Generate forest plots for the larger scales
+forest_plots <- map(names(item_specs), make_forest, item_data = item_level)
+names(forest_plots) <- names(item_specs)
+
+# Compose into a grid
+top_row <- forest_plots$PSR_full +
+  (forest_plots$Experience_Taking) +
+  plot_layout(widths = c(1, 1))
+
+mind_row <- forest_plots$Moral_Agency + forest_plots$Moral_Patiency
+
+liab_row <- forest_plots$Liability_Corporate +
+  (forest_plots$Liability_Chatbot / forest_plots$Liability_Harm) +
+  plot_layout(widths = c(1.5, 1))
+
+ec_trust_row <- forest_plots$EC + forest_plots$Trust + forest_plots$Liability_User
+
+# Save individual forest plots
+for (sc in names(forest_plots)) {
+  save_fig(forest_plots[[sc]], glue("forest_{sc}"), w = 6, h = 4)
+}
+
+# Display a few key ones
+print(forest_plots$PSR_full)
+print(forest_plots$Moral_Patiency)
+print(forest_plots$Liability_Corporate)
+```
+
+## 11.3 PSR subscales formal test
+
+```{r psr-subscales}
+psr_subscale_results <- map_dfr(c("psr_connection", "psr_desire", "psr_caring"),
+                                ~welch_full(df_primary, .x)) %>%
+  mutate(q_bh_within = p.adjust(p, method = "BH"),
+         sig = q_bh_within < 0.05)
+
+psr_subscale_results %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         p = fmt_p(p), q_bh_within = fmt_p(q_bh_within),
+         bf10 = fmt_bf(bf10)) %>%
+  kbl(caption = "PSR subscales (BH-FDR within family of 3)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(psr_subscale_results, "12_psr_subscales")
+```
+
+## 11.4 Confirmatory findings — pointer to synthesis
+
+A consolidated synthesis of all confirmatory and exploratory findings (Findings #1–#8) is provided at the end of the notebook (§14), after all relevant models have been fit. Placing the synthesis after §12 (Exploratory) and §13 (Sample Description) lets it pull live values from M1, M3, m_tipi_ma, and the moderator battery, instead of fallback "not yet fit" placeholders.
+
+The high-level pattern, quantified live (details in §14): `r sum(results_primary$confirmed[results_primary$dv %in% c("psr_total", "ec_total", "trust_total")])` of the three bonding measures (PSR, EC, Trust) and `r sum(results_primary$confirmed[results_primary$dv %in% c("liab_corp", "liab_chat", "liab_user", "liab_harm")])` of the four liability measures meet the confirmation rule (*q*~BH~ < .05 and BF₁₀ ≥ 3). The mediation, mind-perception, personality-matching, and free-speech-moderator analyses to follow address whether any pathway from condition to liability emerges below the level of the primary main effect. <!-- FIX 2026-09-30 (C5): replaced hard-coded "reliably moves ... does not move" takeaway with live counts -->
+
+---
+
+# 12. Exploratory Analyses (Prereg §9)
+
+## 12.1 Individual difference moderators (Prereg §9.1)
+
+For brevity, the interaction tests are summarized in a single results table. Significant interactions get follow-up simple-slopes plots.
+
+```{r moderators}
+# FIX 2026-09-30 (C2): recode non-substantive codes to NA before they enter the battery.
+# Codes verified against experiment/experiment.js (Study 1 & 2 identical):  # FIX 2026-09-30 (C2)
+#   d_politics:    1 = Very liberal ... 7 = Very conservative; 8 = "Prefer not to say / Not applicable"  # FIX 2026-09-30 (C2)
+#   d_religiosity: 1 = Not at all ... 5 = Extremely religious/spiritual; 6 = "Prefer not to say"  # FIX 2026-09-30 (C2)
+#   d_age: free numeric entry (HTML min 18 / max 100 not enforced); impossible values (e.g., 1821) -> NA,  # FIX 2026-09-30 (C2)
+#          using the same 16-100 rule as d_age_clean in §13 (which is created later in the notebook).  # FIX 2026-09-30 (C2)
+df_primary <- df_primary %>%  # FIX 2026-09-30 (C2)
+  mutate(  # FIX 2026-09-30 (C2)
+    d_age_mod         = ifelse(d_age > 100 | d_age < 16, NA_real_, d_age),  # FIX 2026-09-30 (C2): impossible ages -> NA
+    d_politics_mod    = na_if(d_politics, 8),                                # FIX 2026-09-30 (C2): 8 = prefer not to say / N.A. -> NA
+    d_religiosity_mod = na_if(d_religiosity, 6)                              # FIX 2026-09-30 (C2): 6 = prefer not to say -> NA
+  )  # FIX 2026-09-30 (C2)
+cat(glue::glue(                                                              # FIX 2026-09-30 (C2): report recodes
+  "Moderator recodes: d_age -> NA for {sum(is.na(df_primary$d_age_mod) & !is.na(df_primary$d_age))} case(s); ",  # FIX 2026-09-30 (C2)
+  "d_politics code 8 -> NA for {sum(df_primary$d_politics == 8, na.rm = TRUE)} case(s); ",  # FIX 2026-09-30 (C2)
+  "d_religiosity code 6 -> NA for {sum(df_primary$d_religiosity == 6, na.rm = TRUE)} case(s).\n"))  # FIX 2026-09-30 (C2)
+
+moderator_set <- list(
+  PHQ4_total = "phq4_total",
+  PHQ4_anxiety = "phq4_anx",
+  PHQ4_depression = "phq4_dep",
+  TIPI_self_agree = "tipi_self_agree",
+  Chatbot_experience = "d_chatbot_experience",
+  GAAIS_positive = "gaais_pos",
+  GAAIS_negative = "gaais_neg",
+  Politics = "d_politics_mod",        # FIX 2026-09-30 (C2): was d_politics (code 8 scored as a scale point)
+  Religiosity = "d_religiosity_mod",  # FIX 2026-09-30 (C2): was d_religiosity (code 6 scored as a scale point)
+  FreeSpeech = NULL,  # composite below
+  Age = "d_age_mod"                   # FIX 2026-09-30 (C2): was raw d_age (contained 1821)
+)
+
+# Build free-speech composite (mean of the two items)
+df_primary <- df_primary %>%
+  mutate(free_speech_avg = (d_free_speech_1 + d_free_speech_2) / 2)
+moderator_set$FreeSpeech <- "free_speech_avg"
+
+run_moderator <- function(dv, mod_var, mod_name) {
+  if (is.null(mod_var) || !mod_var %in% names(df_primary)) {                 # FIX 2026-09-30 (C2): never drop a moderator silently
+    stop(glue("run_moderator(): moderator column '{mod_var}' ({mod_name}) not found in df_primary"))  # FIX 2026-09-30 (C2)
+  }  # FIX 2026-09-30 (C2)
+  m_data <- df_primary %>%
+    filter(!is.na(.data[[dv]]), !is.na(.data[[mod_var]])) %>%
+    mutate(mod_z = scale(.data[[mod_var]])[, 1],
+           cond = ifelse(condition_label == "HighA", 0.5, -0.5))
+  if (nrow(m_data) < 20) {                                                   # FIX 2026-09-30 (C2): warn instead of silent drop
+    msg <- glue("run_moderator(): {mod_name} x {dv} skipped (n = {nrow(m_data)} < 20)")  # FIX 2026-09-30 (C2)
+    cat("[C2 WARNING]", msg, "\n"); warning(msg)                                          # FIX 2026-09-30 (C2): visible despite warning = FALSE
+    return(NULL)  # FIX 2026-09-30 (C2)
+  }  # FIX 2026-09-30 (C2)
+  f <- as.formula(glue("{dv} ~ cond * mod_z"))
+  m <- lm(f, data = m_data)
+  coef <- broom::tidy(m, conf.int = TRUE) %>%
+    filter(term == "cond:mod_z") %>%
+    transmute(dv = dv, dv_label = dv_labels[dv],
+              moderator = mod_name,
+              interaction_b = estimate, interaction_se = std.error,
+              interaction_p = p.value,
+              ci_lo = conf.low, ci_hi = conf.high,
+              n = nrow(m_data))
+  coef
+}
+
+moderator_results <- expand.grid(dv = confirmatory_dvs,
+                                  mod_name = names(moderator_set),
+                                  stringsAsFactors = FALSE) %>%
+  pmap_dfr(function(dv, mod_name) {
+    run_moderator(dv, moderator_set[[mod_name]], mod_name)
+  })
+
+# FIX 2026-09-30 (C2): every moderator x DV test must be present; report n used per moderator
+missing_tests <- nrow(expand.grid(confirmatory_dvs, names(moderator_set))) - nrow(moderator_results)  # FIX 2026-09-30 (C2)
+if (missing_tests > 0) {                                                                              # FIX 2026-09-30 (C2)
+  cat("[C2 WARNING]", missing_tests, "moderator x DV test(s) were not run\n")                          # FIX 2026-09-30 (C2): visible
+  warning(glue("{missing_tests} moderator x DV test(s) were not run"))                                 # FIX 2026-09-30 (C2)
+} else cat("[C2 check] all", nrow(moderator_results), "moderator x DV tests were run.\n")             # FIX 2026-09-30 (C2)
+print(moderator_results %>% group_by(moderator) %>%  # FIX 2026-09-30 (C2)
+        summarize(n_min = min(n), n_max = max(n), .groups = "drop"))                                  # FIX 2026-09-30 (C2)
+
+# Highlight notable interactions
+moderator_results <- moderator_results %>%
+  mutate(notable = interaction_p < 0.05)
+
+moderator_results %>%
+  arrange(interaction_p) %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         interaction_p = fmt_p(interaction_p)) %>%
+  head(25) %>%
+  kbl(caption = "Top 25 condition × moderator interactions (sorted by p)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(moderator_results, "13_moderators")
+```
+
+### 12.1.1 Follow-up on theoretically-notable moderator clusters
+
+<!-- FIX 2026-09-30 (C5): replaced hard-coded claims ("opposite-signed effects across DVs"; "TIPI-Self Agreeableness × Moral Agency is the strongest interaction in the table") with a neutral description; the characterization is computed live in the chunks below. -->
+Two moderator clusters are followed up beyond the omnibus exploratory listing. What each one shows in the final sample is computed from the live moderator table in the chunks below, not asserted here. All moderator tests are exploratory and uncorrected. <!-- FIX 2026-09-30 (C5) -->
+
+**Free-speech attitudes.** Flagged as a candidate cluster during data collection (a possible reading in which participants higher in free-speech endorsement treat bot warmth as engineered persuasion, which would predict lower bonding *and* higher corporate-responsibility attributions). The chunk below reports whether any free-speech × condition interaction reaches p < .05 and whether the signs split between bonding and liability DVs. <!-- FIX 2026-09-30 (C5) -->
+
+**Personality matching (TIPI-Self Agreeableness × condition).** Participant agreeableness is the self-report analogue of the manipulated trait. We plot its interaction with condition on Moral Agency and, separately, on whichever DV has the strongest TIPI-Self Agreeableness × condition interaction in the live moderator table. The Moral Agency follow-up was selected at an interim look during data collection, when it was the strongest TIPI-Self × condition interaction; it is not preregistered (Prereg §9.1 lists TIPI-Self Agreeableness as a moderator of every DV but names no Moral Agency follow-up). It is kept for continuity with earlier versions of this notebook and should be read as post hoc. <!-- FIX 2026-09-30 (C5): replaced unsupported "originally planned follow-up" provenance with the documented interim-look selection -->
+
+```{r moderator-followup-freespeech}
+# Free-speech moderator pattern across DVs
+fs_pattern <- moderator_results %>%
+  filter(moderator == "FreeSpeech") %>%
+  arrange(interaction_p) %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         interaction_p = fmt_p(interaction_p)) %>%
+  select(dv_label, interaction_b, interaction_se, interaction_p, ci_lo, ci_hi, n)
+
+fs_pattern %>%
+  kbl(caption = "Free-Speech × Condition interactions across all 10 DVs") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Data-driven characterization: pull live values, decide what to say based on what's actually there
+fs_raw <- moderator_results %>% filter(moderator == "FreeSpeech")
+
+bonding_dvs_set <- c("psr_total", "ec_total", "trust_total")
+liab_dvs_set    <- c("liab_corp", "liab_chat", "liab_user", "liab_harm")
+
+fs_bond <- fs_raw %>% filter(dv %in% bonding_dvs_set)
+fs_liab <- fs_raw %>% filter(dv %in% liab_dvs_set)
+
+n_sig_any  <- sum(fs_raw$interaction_p < 0.05, na.rm = TRUE)
+min_p      <- min(fs_raw$interaction_p, na.rm = TRUE)
+n_total    <- nrow(fs_raw)
+
+# Sign pattern (only meaningful if the magnitudes are not trivially small)
+median_bond_b <- median(fs_bond$interaction_b, na.rm = TRUE)
+median_liab_b <- median(fs_liab$interaction_b, na.rm = TRUE)
+opposite_signs <- (median_bond_b * median_liab_b) < 0
+
+cat("\n--- Free-speech moderator (data-driven characterization) ---\n")
+cat(glue::glue(
+  "Significant interactions (p < .05): {n_sig_any} of {n_total} DVs. ",
+  "Smallest p across DVs: {sprintf('%.3f', min_p)}.\n"
+))
+
+if (n_sig_any == 0) {
+  cat("No free-speech × condition interaction reaches conventional significance ",
+      "in the final analytic sample. ",  # FIX 2026-09-30 (C5): removed stale "Earlier knits at smaller N" history claim
+      "We do not pursue a substantive interpretation here.\n",  # FIX 2026-09-30 (C5)
+      sep = "")
+} else if (opposite_signs) {
+  cat(glue::glue(
+    "The free-speech moderator shows opposite-signed median interactions on ",
+    "bonding DVs (median b = {round(median_bond_b, 3)}) vs. liability DVs ",
+    "(median b = {round(median_liab_b, 3)}). With {n_sig_any}/{n_total} ",
+    "individual interactions reaching p < .05 (uncorrected), ",  # FIX 2026-09-30 (R4-C5c)
+    "we report the pattern descriptively.\n"  # FIX 2026-09-30 (R4-C5c): was "suggestive but not robustly supported" (fixed evaluative label)
+  ))
+} else {
+  cat(glue::glue(
+    "The free-speech moderator shows {n_sig_any}/{n_total} significant ",
+    "individual interactions (smallest p = {sprintf('%.3f', min_p)}). ",
+    "The median interactions on bonding DVs (b = {round(median_bond_b, 3)}) and liability DVs ",  # FIX 2026-09-30 (R4-C5c)
+    "(b = {round(median_liab_b, 3)}) have the same sign; we report results descriptively without ",  # FIX 2026-09-30 (R4-C5c): was "does not consolidate into a coherent split"
+    "substantive interpretation.\n"
+  ))
+}
+
+save_table(fs_pattern, "13b_freespeech_moderator_pattern")
+```
+
+```{r moderator-followup-tipi-agree}
+# TIPI-Self Agreeableness × Moral Agency: simple slopes
+df_primary <- df_primary %>%
+  mutate(tipi_self_agree_z = scale(tipi_self_agree)[, 1])
+
+m_tipi_ma <- lm(ma_total ~ cond_centered * tipi_self_agree_z, data = df_primary)
+print(summary(m_tipi_ma))
+
+ss_tipi <- interactions::sim_slopes(
+  m_tipi_ma, pred = cond_centered, modx = tipi_self_agree_z,
+  modx.values = c(-1, 0, 1),
+  confint = TRUE, johnson_neyman = FALSE
+)
+print(ss_tipi)
+
+p_tipi_ma <- interactions::interact_plot(
+  m_tipi_ma,
+  pred = tipi_self_agree_z,
+  modx = cond_centered,
+  modx.values = c(-0.5, 0.5),
+  modx.labels = c("LowA bot", "HighA bot"),
+  interval = TRUE, int.width = 0.95,
+  colors = c("LowA bot" = cond_colors["LowA"],
+             "HighA bot" = cond_colors["HighA"]),
+  legend.main = "Bot condition",
+  x.label = "Participant TIPI-Self Agreeableness (z)",
+  y.label = "Moral Agency Attribution"
+) +
+  labs(title = "Personality matching on moral agency",
+       subtitle = {                                                                         # FIX 2026-09-30 (C5): live subtitle (was a hard-coded claim)
+         ti <- broom::tidy(m_tipi_ma) %>% filter(term == "cond_centered:tipi_self_agree_z")  # FIX 2026-09-30 (C5)
+         sprintf("Condition x TIPI-Self Agreeableness interaction: b = %.2f, p = %.3f (exploratory, uncorrected)",  # FIX 2026-09-30 (C5)
+                 ti$estimate, ti$p.value)                                                   # FIX 2026-09-30 (C5)
+       })  # FIX 2026-09-30 (C5)
+p_tipi_ma
+save_fig(p_tipi_ma, "05_tipi_agree_x_cond_on_MA", w = 9, h = 5)
+
+# FIX 2026-09-30 (C5): data-driven personality-matching follow-up. The DV with the strongest
+# TIPI-Self Agreeableness x condition interaction is taken from the LIVE moderator table  # FIX 2026-09-30 (C5)
+# (not assumed to be Moral Agency), and fit with the same specification as m_tipi_ma.  # FIX 2026-09-30 (C5)
+pm_moderator <- "TIPI_self_agree"                                                           # FIX 2026-09-30 (C5)
+pm_z_var     <- "tipi_self_agree_z"                                                         # FIX 2026-09-30 (C5)
+pm_trait_lbl <- "Agreeableness"                                                             # FIX 2026-09-30 (C5)
+pm_rows <- moderator_results %>% filter(moderator == pm_moderator) %>% arrange(interaction_p)  # FIX 2026-09-30 (C5)
+stopifnot(nrow(pm_rows) == length(confirmatory_dvs))                                        # FIX 2026-09-30 (C5)
+pm_top_dv <- pm_rows$dv[1]                                                                  # FIX 2026-09-30 (C5)
+m_tipi_top <- lm(as.formula(glue("{pm_top_dv} ~ cond_centered * {pm_z_var}")), data = df_primary)  # FIX 2026-09-30 (C5)
+print(summary(m_tipi_top))                                                                  # FIX 2026-09-30 (C5)
+ss_tipi_top <- interactions::sim_slopes(                                                    # FIX 2026-09-30 (C5)
+  m_tipi_top, pred = cond_centered, modx = tipi_self_agree_z,  # FIX 2026-09-30 (C5)
+  modx.values = c(-1, 0, 1), confint = TRUE, johnson_neyman = FALSE  # FIX 2026-09-30 (C5)
+)  # FIX 2026-09-30 (C5)
+print(ss_tipi_top)                                                                          # FIX 2026-09-30 (C5)
+pm_top_int <- broom::tidy(m_tipi_top, conf.int = TRUE) %>%  # FIX 2026-09-30 (C5)
+  filter(term == glue("cond_centered:{pm_z_var}"))                                          # FIX 2026-09-30 (C5)
+if (!isTRUE(all.equal(pm_top_int$estimate, pm_rows$interaction_b[1], tolerance = 1e-6))) {  # FIX 2026-09-30 (C5): consistency check
+  cat("[C5 WARNING] follow-up interaction b differs from the moderator table\n")                  # FIX 2026-09-30 (C5): visible
+  warning("Follow-up interaction b differs from the moderator table (z-scoring on a different subset?)")  # FIX 2026-09-30 (C5)
+} else cat("[C5 check] follow-up interaction b matches the moderator table.\n")                  # FIX 2026-09-30 (C5)
+p_tipi_top <- interactions::interact_plot(                                                  # FIX 2026-09-30 (C5)
+  m_tipi_top, pred = tipi_self_agree_z, modx = cond_centered,  # FIX 2026-09-30 (C5)
+  modx.values = c(-0.5, 0.5), modx.labels = c("LowA bot", "HighA bot"),  # FIX 2026-09-30 (C5)
+  interval = TRUE, int.width = 0.95,  # FIX 2026-09-30 (C5)
+  colors = c("LowA bot" = cond_colors["LowA"], "HighA bot" = cond_colors["HighA"]),  # FIX 2026-09-30 (C5)
+  legend.main = "Bot condition",  # FIX 2026-09-30 (C5)
+  x.label = "Participant TIPI-Self Agreeableness (z)", y.label = unname(dv_labels[pm_top_dv])  # FIX 2026-09-30 (C5)
+) +  # FIX 2026-09-30 (C5)
+  labs(title = glue("Personality matching: strongest DV in the moderator table ({dv_labels[pm_top_dv]})"),  # FIX 2026-09-30 (C5)
+       subtitle = sprintf("Condition x TIPI-Self Agreeableness interaction: b = %.2f, p = %.3f (exploratory, uncorrected)",  # FIX 2026-09-30 (C5)
+                          pm_top_int$estimate, pm_top_int$p.value))                         # FIX 2026-09-30 (C5)
+p_tipi_top  # FIX 2026-09-30 (C5)
+save_fig(p_tipi_top, "05b_tipi_agree_x_cond_on_top_dv", w = 9, h = 5)                        # FIX 2026-09-30 (C5): new figure file
+```
+
+## 12.2 Mediation models M1–M5 (Prereg §9.2)
+
+```{r mediation-models}
+# Center condition (effect coding)
+df_primary <- df_primary %>%
+  mutate(cond_e = ifelse(condition_label == "HighA", 0.5, -0.5))
+
+# Build datasets that exclude rows missing any variable in the model
+build_med_data <- function(dv_set) {
+  df_primary %>% select(cond_e, all_of(dv_set)) %>% na.omit()
+}
+
+run_mediation <- function(model_syntax, data, model_name) {
+  set.seed(42)
+  fit <- tryCatch(
+    sem(model_syntax, data = data, se = "bootstrap", bootstrap = 5000,  # FIX 2026-09-30 (R4-R1)
+        iseed = 42),  # FIX 2026-09-30 (R4-R1): lavaan's own bootstrap seed (lavaan 0.6.21 supports iseed)
+    error = function(e) {
+      message(glue("Model {model_name} failed: {e$message}"))
+      NULL
+    }
+  )
+  if (is.null(fit)) return(NULL)
+  pe <- parameterEstimates(fit, ci = TRUE, level = 0.95, boot.ci.type = "bca.simple") %>%
+    as_tibble() %>%
+    mutate(model = model_name)
+  list(fit = fit, params = pe)
+}
+
+# M1: parallel relational mediators of Corporate Liability
+m1_syntax <- '
+  # Direct effect
+  liab_corp ~ c*cond_e
+  # Mediators
+  psr_total ~ a1*cond_e
+  ec_total ~ a2*cond_e
+  trust_total ~ a3*cond_e
+  liab_corp ~ b1*psr_total + b2*ec_total + b3*trust_total
+  # Indirect effects
+  ind_psr := a1 * b1
+  ind_ec := a2 * b2
+  ind_trust := a3 * b3
+  total_indirect := ind_psr + ind_ec + ind_trust
+  total := c + total_indirect
+'
+M1 <- run_mediation(m1_syntax,
+                    build_med_data(c("liab_corp", "psr_total", "ec_total", "trust_total")),
+                    "M1: Relational → Corp")
+
+# M2: parallel mind mediators
+m2_syntax <- '
+  liab_corp ~ c*cond_e
+  ma_total ~ a1*cond_e
+  mp_total ~ a2*cond_e
+  liab_corp ~ b1*ma_total + b2*mp_total
+  ind_ma := a1 * b1
+  ind_mp := a2 * b2
+  total_indirect := ind_ma + ind_mp
+  total := c + total_indirect
+'
+M2 <- run_mediation(m2_syntax,
+                    build_med_data(c("liab_corp", "ma_total", "mp_total")),
+                    "M2: Mind → Corp")
+
+# M3: serial litigation theory
+m3_syntax <- '
+  psr_total ~ a1*cond_e
+  mp_total ~ a2*cond_e + d*psr_total
+  liab_corp ~ c*cond_e + b1*psr_total + b2*mp_total
+  ind_serial := a1 * d * b2
+  ind_psr_only := a1 * b1
+  ind_mp_only := a2 * b2
+  total_indirect := ind_serial + ind_psr_only + ind_mp_only
+'
+M3 <- run_mediation(m3_syntax,
+                    build_med_data(c("liab_corp", "psr_total", "mp_total")),
+                    "M3: Serial PSR→MP→Corp")
+
+# M4: PSR → User responsibility
+m4_syntax <- '
+  psr_total ~ a*cond_e
+  liab_user ~ c*cond_e + b*psr_total
+  ind := a * b
+  total := c + ind
+'
+M4 <- run_mediation(m4_syntax,
+                    build_med_data(c("liab_user", "psr_total")),
+                    "M4: PSR → User Resp")
+
+# M5: ET → Corp
+m5_syntax <- '
+  et_total ~ a*cond_e
+  liab_corp ~ c*cond_e + b*et_total
+  ind := a * b
+  total := c + ind
+'
+M5 <- run_mediation(m5_syntax,
+                    build_med_data(c("liab_corp", "et_total")),
+                    "M5: ET → Corp")
+
+# Combine indirect-effect estimates
+mediation_indirects <- bind_rows(
+  M1$params %>% filter(label %in% c("ind_psr", "ind_ec", "ind_trust", "total_indirect", "c", "total")),
+  M2$params %>% filter(label %in% c("ind_ma", "ind_mp", "total_indirect", "c", "total")),
+  M3$params %>% filter(label %in% c("ind_serial", "ind_psr_only", "ind_mp_only", "total_indirect")),
+  M4$params %>% filter(label %in% c("ind", "c", "total")),
+  M5$params %>% filter(label %in% c("ind", "c", "total"))
+) %>%
+  mutate(supported = ifelse(ci.lower * ci.upper > 0 & label %in%
+                            c("ind_psr","ind_ec","ind_trust","ind_ma","ind_mp",
+                              "ind_serial","ind_psr_only","ind_mp_only","ind","total_indirect"),
+                            "✓ CI excludes 0", "—"))
+
+mediation_indirects %>%
+  select(model, label, est, se, z, pvalue, ci.lower, ci.upper, supported) %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         pvalue = fmt_p(pvalue)) %>%
+  kbl(caption = "Mediation: indirect effects across M1–M5 (bias-corrected 95% CI from 5000 bootstraps)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(mediation_indirects, "14_mediation_indirects")
+```
+
+### 12.2.1 Mediation interpretation for Models 1 and 3
+
+The mediation models test whether the condition effect on Corporate Liability operates through the bonding DVs (M1) or through the serial PSR → Moral Patiency path (M3). Two quantities frame these results (live values from §6.1): <!-- FIX 2026-09-30 (C5): stale "d = 0.73" / "essentially zero" / "large and credible" literals replaced by live values -->
+
+- The total effect of condition on Corporate Liability: *d* = `r sprintf("%.2f", results_primary$d[results_primary$dv == "liab_corp"])` [`r sprintf("%.2f", results_primary$d_lo[results_primary$dv == "liab_corp"])`, `r sprintf("%.2f", results_primary$d_hi[results_primary$dv == "liab_corp"])`], *p* = `r fmt_p(results_primary$p[results_primary$dv == "liab_corp"])`, BF₁₀ = `r fmt_bf(results_primary$bf10[results_primary$dv == "liab_corp"])`. <!-- FIX 2026-09-30 (C5) -->
+- The condition effect on PSR: *d* = `r sprintf("%.2f", results_primary$d[results_primary$dv == "psr_total"])` [`r sprintf("%.2f", results_primary$d_lo[results_primary$dv == "psr_total"])`, `r sprintf("%.2f", results_primary$d_hi[results_primary$dv == "psr_total"])`], *p* = `r fmt_p(results_primary$p[results_primary$dv == "psr_total"])`, BF₁₀ = `r fmt_bf(results_primary$bf10[results_primary$dv == "psr_total"])`. <!-- FIX 2026-09-30 (C5) -->
+
+The question for mediation is whether the bonding measures carry the condition effect into a downstream effect on liability. The chunk below pulls the actual indirect estimates for explicit reading. <!-- FIX 2026-09-30 (C5): removed "large" classification -->
+
+```{r mediation-interpretation, echo=TRUE}
+# Pull the relevant rows from M1
+m1_summary <- M1$params %>%
+  filter(label %in% c("c", "ind_psr", "ind_ec", "ind_trust", "total_indirect", "total")) %>%
+  select(label, est, ci.lower, ci.upper, pvalue) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+cat("=== Model M1: Parallel relational mediators of Corporate Liability ===\n")
+print(m1_summary)
+
+# Direct effect c' (residual after mediators)
+m1_direct <- M1$params %>%
+  filter(lhs == "liab_corp", rhs == "cond_e", op == "~") %>%
+  select(est, ci.lower, ci.upper, pvalue) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+cat("\nDirect effect of condition on Corporate Liability after partialling out mediators (c'):\n")
+print(m1_direct)
+
+# Pull individual paths to make the diagnostic precise
+m1_paths <- M1$params %>%
+  filter(op == "~") %>%
+  select(lhs, rhs, est, ci.lower, ci.upper, pvalue) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+cat("\nIndividual path estimates (a paths and b paths):\n")
+print(m1_paths)
+
+cat("\n--- Mediation interpretation (M1) ---\n")
+
+# Pull live values for interpretation
+ind_psr_row <- M1$params %>% filter(label == "ind_psr")
+ind_ec_row  <- M1$params %>% filter(label == "ind_ec")
+ind_trust_row <- M1$params %>% filter(label == "ind_trust")
+ind_total_row <- M1$params %>% filter(label == "total_indirect")
+direct_row <- M1$params %>% filter(label == "c")
+
+ci_excludes_zero <- function(row) row$ci.lower * row$ci.upper > 0
+
+# a-paths assessment (live)
+a_paths <- M1$params %>% filter(op == "~", rhs == "cond_e", lhs %in% c("psr_total", "ec_total", "trust_total"))
+a_significant <- a_paths %>% filter(pvalue < 0.05) %>% pull(lhs)
+
+# b-paths assessment (live)
+b_paths <- M1$params %>% filter(op == "~", rhs %in% c("psr_total", "ec_total", "trust_total"), lhs == "liab_corp")
+b_paths_strs <- map_chr(seq_len(nrow(b_paths)), function(i) {
+  r <- b_paths[i, ]
+  sprintf("%s b = %.3f [%.3f, %.3f], p = %.3f",
+          r$rhs, r$est, r$ci.lower, r$ci.upper, r$pvalue)
+})
+
+n_b_sig <- sum(b_paths$pvalue < 0.05, na.rm = TRUE)  # FIX 2026-09-30 (C5): live count of b-paths with p < .05
+# FIX 2026-09-30 (R4-C5c): live joint TOST x Bayes class for each bonding DV (replaces a fixed "null" claim)
+bond_dv_lbls <- unname(dv_labels[c("psr_total", "ec_total", "trust_total")])               # FIX 2026-09-30 (R4-C5c)
+bond_cls     <- tost_x_bf$null_evidence[match(bond_dv_lbls, tost_x_bf$dv_label)]            # FIX 2026-09-30 (R4-C5c)
+stopifnot(!anyNA(bond_cls))                                                                 # FIX 2026-09-30 (R4-C5c)
+bond_cls_txt <- paste(sprintf("%s: %s", bond_dv_lbls, bond_cls), collapse = "; ")           # FIX 2026-09-30 (R4-C5c)
+
+cat(glue::glue(
+  "\nThe a-paths (condition -> bonding mediators): ",  # FIX 2026-09-30 (C5): live, conditional (was "confirm the manipulation worked")
+  "{if (length(a_significant) > 0) paste0('condition significantly shifts ', paste(a_significant, collapse = ', '), ' in this sample.') else paste0('none of PSR, EC, or Trust is significantly shifted by condition at p < .05 in this sample (joint TOST x Bayes classes: ', bond_cls_txt, ').')}\n\n",  # FIX 2026-09-30 (R4-C5c)
+  "The b-paths (mediator -> Corporate Liability, controlling for condition and the\n",
+  "other mediators) are:\n  ",
+  "{paste(b_paths_strs, collapse = '\n  ')}\n\n",
+  "Indirect effects (a × b):\n",
+  "  ind_psr   = {round(ind_psr_row$est, 3)}, 95% CI [{round(ind_psr_row$ci.lower, 3)}, {round(ind_psr_row$ci.upper, 3)}] ",
+  "({if (ci_excludes_zero(ind_psr_row)) 'EXCLUDES zero' else 'includes zero'})\n",
+  "  ind_ec    = {round(ind_ec_row$est, 3)}, 95% CI [{round(ind_ec_row$ci.lower, 3)}, {round(ind_ec_row$ci.upper, 3)}] ",
+  "({if (ci_excludes_zero(ind_ec_row)) 'EXCLUDES zero' else 'includes zero'})\n",
+  "  ind_trust = {round(ind_trust_row$est, 3)}, 95% CI [{round(ind_trust_row$ci.lower, 3)}, {round(ind_trust_row$ci.upper, 3)}] ",
+  "({if (ci_excludes_zero(ind_trust_row)) 'EXCLUDES zero' else 'includes zero'})\n",
+  "  total_ind = {round(ind_total_row$est, 3)}, 95% CI [{round(ind_total_row$ci.lower, 3)}, {round(ind_total_row$ci.upper, 3)}] ",
+  "({if (ci_excludes_zero(ind_total_row)) 'EXCLUDES zero' else 'includes zero'})\n",
+  "  direct(c) = {round(direct_row$est, 3)}, 95% CI [{round(direct_row$ci.lower, 3)}, {round(direct_row$ci.upper, 3)}] ",
+  "({if (ci_excludes_zero(direct_row)) 'EXCLUDES zero' else 'includes zero'})\n\n",
+  "{if (any(c(ci_excludes_zero(ind_psr_row), ci_excludes_zero(ind_ec_row), ci_excludes_zero(ind_trust_row)))) ",
+  "  'At least one indirect path is credibly non-zero — see CI flags above.' else ",
+  "  'No individual indirect path is credibly non-zero (all CIs include zero).'}\n",
+  "{length(a_significant)}/3 a-paths and {n_b_sig}/3 b-paths (bonding -> Corporate Liability,\n",  # FIX 2026-09-30 (C5): live counts replace
+  "controlling for condition and the other mediators) reach p < .05.\n"                           # FIX 2026-09-30 (C5): hard-coded "bond is real ... independent variance"
+))
+
+# Same diagnostic for M3
+cat("\n\n=== Model M3: Serial PSR -> Moral Patiency -> Corporate Liability ===\n")
+m3_summary <- M3$params %>%
+  filter(label %in% c("ind_serial", "ind_psr_only", "ind_mp_only", "total_indirect")) %>%
+  select(label, est, ci.lower, ci.upper, pvalue) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+print(m3_summary)
+
+# Live interpretation for M3
+m3_any_excl <- m3_summary %>%
+  filter(label %in% c("ind_serial", "ind_psr_only", "ind_mp_only")) %>%
+  rowwise() %>%
+  mutate(excl = ci.lower * ci.upper > 0) %>%
+  pull(excl) %>% any()
+
+cat(glue::glue(
+  "\nM3 status: {if (m3_any_excl) 'at least one indirect path has a CI excluding zero — inspect the table above' ",
+  "else 'no indirect path has a CI excluding zero. The serial PSR -> Moral Patiency -> Corporate ",
+  "Liability path does not have a credibly non-zero indirect effect.'}\n"
+))
+
+save_table(m1_summary, "14b_M1_indirect_paths_summary")
+save_table(m3_summary, "14b_M3_serial_decomposition")
+save_table(m1_paths, "14c_M1_individual_paths")
+```
+
+## 12.3 Dose-response within condition (Prereg §9.3)
+
+```{r dose-response}
+dose_response <- map_dfr(confirmatory_dvs, function(dv) {
+  map_dfr(c("LowA", "HighA"), function(cond) {
+    sub <- df_primary %>% filter(condition_label == cond,
+                                  !is.na(.data[[dv]]), !is.na(tipi_bot_agree))
+    if (nrow(sub) < 5) return(NULL)
+    f <- as.formula(glue("{dv} ~ tipi_bot_agree"))
+    m <- lm(f, data = sub)
+    cf <- broom::tidy(m, conf.int = TRUE) %>%
+      filter(term == "tipi_bot_agree")
+    tibble(dv = dv, dv_label = dv_labels[dv], condition = cond,
+           slope = cf$estimate, se = cf$std.error,
+           p = cf$p.value, ci_lo = cf$conf.low, ci_hi = cf$conf.high,
+           R2 = summary(m)$r.squared, n = nrow(sub))
+  })
+})
+
+dose_response %>%
+  arrange(dv_label, condition) %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         p = fmt_p(p)) %>%
+  kbl(caption = "Dose-response: regression of each DV on TIPI-Bot Agreeableness, within each condition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(dose_response, "15_dose_response")
+```
+
+## 12.4 Temporal and cohort analyses (Prereg §9.4)
+
+```{r temporal}
+# Enrollment order: cb_slot
+enrollment_corr <- map_dfr(confirmatory_dvs, function(dv) {
+  d_sub <- df_primary %>% filter(!is.na(cb_slot), !is.na(.data[[dv]]))
+  if (nrow(d_sub) < 10) return(NULL)
+  ct <- cor.test(d_sub$cb_slot, d_sub[[dv]])
+  tibble(dv = dv, dv_label = dv_labels[dv], r = ct$estimate, p = ct$p.value)
+})
+
+enrollment_corr %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         p = fmt_p(p)) %>%
+  kbl(caption = "Enrollment-order correlations (cb_slot)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Time of day
+df_primary <- df_primary %>%
+  mutate(chat_hour = hour(ymd_hms(chat_start_time, quiet = TRUE)),
+         time_band = case_when(
+           chat_hour >= 6 & chat_hour < 12 ~ "Morning",
+           chat_hour >= 12 & chat_hour < 18 ~ "Afternoon",
+           chat_hour >= 18 & chat_hour < 24 ~ "Evening",
+           TRUE ~ "Late night"
+         ),
+         day_of_week = wday(ymd_hms(start_time, quiet = TRUE), label = TRUE))
+
+df_primary %>%
+  count(time_band, condition_label) %>%
+  pivot_wider(names_from = condition_label, values_from = n, values_fill = 0) %>%
+  kbl(caption = "Conversation time of day by condition") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(enrollment_corr, "16_enrollment_correlations")
+```
+
+## 12.5 Factor analyses (Prereg §9.6)
+
+```{r efa}
+# Bonding-item EFA: 29 items
+bonding_items <- c(paste0("psr_", 1:12), paste0("ec_", 1:5),
+                   paste0("tr_", 1:4), paste0("et_", 1:8))
+bonding_data <- df_primary[, bonding_items] %>% na.omit()
+
+if (nrow(bonding_data) >= 30) {
+  set.seed(42)  # FIX 2026-09-30 (R4-R1)
+  parallel_bond <- psych::fa.parallel(bonding_data, fa = "fa", n.iter = 100,
+                                       show.legend = TRUE, plot = FALSE)
+  cat("Bonding-item parallel analysis suggests", parallel_bond$nfact, "factors\n")
+}
+
+# Mind-perception EFA
+mind_items <- c(paste0("ma_", 1:8), paste0("mp_", 1:8))
+mind_data <- df_primary[, mind_items] %>% na.omit()
+if (nrow(mind_data) >= 30) {
+  set.seed(42)  # FIX 2026-09-30 (R4-R1)
+  parallel_mind <- psych::fa.parallel(mind_data, fa = "fa", n.iter = 100, plot = FALSE)
+  cat("Mind-perception parallel analysis suggests", parallel_mind$nfact, "factors\n")
+}
+
+# Liability EFA
+liab_items <- paste0("liab_", 1:12)
+liab_data <- df_primary[, liab_items] %>% na.omit()
+if (nrow(liab_data) >= 30) {
+  set.seed(42)  # FIX 2026-09-30 (R4-R1)
+  parallel_liab <- psych::fa.parallel(liab_data, fa = "fa", n.iter = 100, plot = FALSE)
+  cat("Liability parallel analysis suggests", parallel_liab$nfact, "factors\n")
+}
+```
+
+## 12.6 Convergent validity (Prereg §9.9)
+
+The prereg specifies convergent validity for the manipulation, not for the bonding scales: the TIPI-Bot subscale for the manipulated trait, the corresponding single-item manipulation check, and an NLP-derived behavioral index of the manipulated trait should converge within condition. We implement the first two within-condition correlations here and leave a placeholder for the NLP-derived behavioral index (added when the NLP coding output is available). We additionally retain the original self-report-bonding × behavioral-indices correlation matrix as exploratory because it speaks to a different construct (whether felt bonding maps onto behavior).
+
+```{r convergent-validity}
+# (a) Prereg-specified: TIPI-Bot Agreeableness × mc_agreeableness within each condition
+conv_manip <- df_primary %>%
+  filter(!is.na(tipi_bot_agree), !is.na(mc_agreeableness_score)) %>%
+  group_by(condition_label) %>%
+  summarize(
+    n = n(),
+    r_tipi_mc = cor(tipi_bot_agree, mc_agreeableness_score, use = "pairwise.complete.obs"),
+    .groups = "drop"
+  )
+
+conv_manip %>%
+  mutate(r_tipi_mc = round(r_tipi_mc, 3)) %>%
+  kbl(caption = "Manipulation convergent validity within condition: TIPI-Bot Agreeableness × single-item warmth/support check") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Pooled across conditions for completeness
+r_pooled <- cor(df_primary$tipi_bot_agree, df_primary$mc_agreeableness_score,
+                use = "pairwise.complete.obs")
+cat(glue::glue(
+  "Pooled across conditions: r(TIPI-Bot A, mc_agreeableness) = {round(r_pooled, 3)}.\n",
+  "An NLP-derived behavioral agreeableness index (from chat_log per-turn warmth coding) ",
+  "will be added to this matrix when the NLP coding output is available — see Section 10.1 ",
+  "of the preregistration. The current placeholder reflects two of the three convergent-validity ",
+  "indicators specified in §9.9.\n"
+))
+
+# (b) Exploratory: self-report bonding × behavior — retained from earlier draft
+conv <- df_primary %>%
+  select(psr_total, ec_total, trust_total, et_total,
+         user_chars_per_turn, user_total_chars, chat_total_rounds, chat_idle_pause_count) %>%
+  cor(use = "pairwise.complete.obs")
+conv %>%
+  round(2) %>%
+  kbl(caption = "Exploratory: self-report bonding scales × behavioral indices") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+save_table(conv_manip, "17_convergent_validity_manipulation")
+save_table(as.data.frame(conv), "17b_convergent_validity_self_report_x_behavior")
+```
+
+## 12.7 Demand characteristics: rough flag from open-ends (placeholder)
+
+This is the placeholder for the LLM-coded hypothesis-guessing variable. The full pipeline lives in the NLP notebook. For now we can flag participants who explicitly mention "personality" or "agreeableness" or "warm" as descriptors of the manipulation.
+
+```{r demand-rough}
+df_primary <- df_primary %>%
+  mutate(
+    oe_combined = paste(coalesce(oe_experience, ""),
+                        coalesce(d_final_thoughts, ""),
+                        coalesce(d_problems, ""), sep = " | "),
+    rough_hyp_guess = str_detect(tolower(oe_combined),
+                                  "personalit|agreeabl|warm vs|cold vs|manipul|bot type")
+  )
+
+df_primary %>%
+  count(rough_hyp_guess, condition_label) %>%
+  kbl(caption = "Rough hypothesis-guessing flag (NLP notebook will refine this)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 12.8 Response quality indices (Prereg §9.8)
+
+The prereg specifies two response-quality indices computed from the TIPI-Self battery: (a) within-person variance across reverse-scored vs. forward-scored items (low variance suggests careless straight-lining), and (b) Mahalanobis distance on TIPI-Self responses (multivariate outlier detection). Both are examined as moderators of the confirmed bonding effects (do effects differ between high-quality and low-quality responders?) and as a sensitivity-sample exclusion (high-quality only).
+
+```{r response-quality}
+# (a) Within-person reverse/forward variance
+# TIPI-Self forward items: 1, 3, 5, 7, 9; reverse items: 2, 4, 6, 8, 10
+forward_items <- paste0("tipi_self_", c(1, 3, 5, 7, 9))
+reverse_items <- paste0("tipi_self_", c(2, 4, 6, 8, 10))
+
+# Re-key reverse items so a careful responder's reverse and forward should have similar means
+df_primary <- df_primary %>%
+  rowwise() %>%
+  mutate(
+    tipi_forward_mean   = mean(c_across(all_of(forward_items)), na.rm = TRUE),
+    tipi_reverse_unkey  = mean(c_across(all_of(reverse_items)), na.rm = TRUE),
+    tipi_reverse_keyed  = 8 - tipi_reverse_unkey,
+    tipi_fwd_rev_diff   = abs(tipi_forward_mean - tipi_reverse_keyed),
+    # Within-person SD across all 10 items (after re-keying reverse items)
+    tipi_within_sd      = sd(c(c_across(all_of(forward_items)),
+                               sapply(c_across(all_of(reverse_items)), function(x) 8 - x)), na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# (b) Mahalanobis distance on TIPI-Self (10 items, rekeyed)
+tipi_matrix <- df_primary %>%
+  mutate(across(all_of(reverse_items), ~ 8 - .x, .names = "{.col}_keyed")) %>%
+  select(all_of(forward_items),
+         tipi_self_2_keyed, tipi_self_4_keyed, tipi_self_6_keyed,
+         tipi_self_8_keyed, tipi_self_10_keyed) %>%
+  as.matrix()
+
+# Drop rows with any NA for Mahalanobis
+complete_rows <- complete.cases(tipi_matrix)
+mahal <- rep(NA_real_, nrow(df_primary))
+if (sum(complete_rows) > 12) {  # need at least p+2 observations
+  m_center <- colMeans(tipi_matrix[complete_rows, ])
+  m_cov    <- cov(tipi_matrix[complete_rows, ])
+  mahal[complete_rows] <- mahalanobis(tipi_matrix[complete_rows, ], m_center, m_cov)
+}
+df_primary$tipi_mahal <- mahal
+
+# Descriptives
+quality_desc <- df_primary %>%
+  summarize(
+    n = n(),
+    `mean fwd-rev abs diff` = round(mean(tipi_fwd_rev_diff, na.rm = TRUE), 3),
+    `mean within-person SD` = round(mean(tipi_within_sd, na.rm = TRUE), 3),
+    `min within-person SD`  = round(min(tipi_within_sd, na.rm = TRUE), 3),
+    `n with within-SD < 0.5 (potential straight-lining)` = sum(tipi_within_sd < 0.5, na.rm = TRUE),
+    `mean Mahalanobis`      = round(mean(tipi_mahal, na.rm = TRUE), 2),
+    `n with Mahalanobis > chi2(.001, df=10)` =
+       sum(tipi_mahal > qchisq(0.999, df = 10), na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value")
+
+quality_desc %>%
+  kbl(caption = "Response-quality descriptives on TIPI-Self battery") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# (c) Quality as moderator of the three bonding DVs
+quality_moderation <- map_dfr(c("psr_total", "ec_total", "trust_total"), function(dv) {
+  bind_rows(
+    {
+      m1 <- lm(as.formula(glue::glue("{dv} ~ condition_label * tipi_within_sd")),
+               data = df_primary)
+      td <- broom::tidy(m1, conf.int = TRUE)
+      row <- td[td$term == "condition_labelHighA:tipi_within_sd", , drop = FALSE]
+      tibble(
+        dv = dv, dv_label = unname(dv_labels[dv]),
+        moderator = "TIPI within-person SD",
+        b = if (nrow(row) > 0) row$estimate else NA_real_,
+        p = if (nrow(row) > 0) row$p.value else NA_real_
+      )
+    },
+    {
+      m2 <- lm(as.formula(glue::glue("{dv} ~ condition_label * tipi_mahal")),
+               data = df_primary)
+      td <- broom::tidy(m2, conf.int = TRUE)
+      row <- td[td$term == "condition_labelHighA:tipi_mahal", , drop = FALSE]
+      tibble(
+        dv = dv, dv_label = unname(dv_labels[dv]),
+        moderator = "Mahalanobis distance",
+        b = if (nrow(row) > 0) row$estimate else NA_real_,
+        p = if (nrow(row) > 0) row$p.value else NA_real_
+      )
+    }
+  )
+})
+
+quality_moderation %>%
+  mutate(across(where(is.numeric), ~round(., 4)),
+         p = fmt_p(p)) %>%
+  kbl(caption = "Response quality as moderator of bonding effects") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# (d) Sensitivity exclusion: high-quality only (within-SD > 0.5 AND Mahalanobis ≤ chi2 cutoff)
+high_quality_threshold_mahal <- qchisq(0.999, df = 10)
+df_high_quality <- df_primary %>%
+  filter(!is.na(tipi_within_sd), tipi_within_sd >= 0.5,
+         !is.na(tipi_mahal),     tipi_mahal <= high_quality_threshold_mahal)
+
+cat(glue::glue(
+  "\nHigh-quality sensitivity sample: N = {nrow(df_high_quality)} ",
+  "(excluded {nrow(df_primary) - nrow(df_high_quality)} on response-quality grounds).\n"
+))
+
+if (nrow(df_high_quality) >= 30) {
+  hq_results <- map_dfr(c("psr_total", "ec_total", "trust_total"),
+                        ~welch_full(df_high_quality, .x))
+  hq_results %>%
+    mutate(across(where(is.numeric), ~round(., 3)),
+           p = fmt_p(p), bf10 = fmt_bf(bf10),
+           dv_label = unname(dv_labels[dv])) %>%
+    select(dv_label, n_ref, n_comp, t, df, p, d, d_lo, d_hi, bf10) %>%
+    kbl(caption = glue::glue(
+          "High-quality sensitivity sample (N = {nrow(df_high_quality)}): bonding DVs")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+  save_table(hq_results, "19_high_quality_sensitivity")
+}
+
+save_table(quality_moderation, "19b_quality_as_moderator")
+```
+
+## 12.9 High-engagement sensitivity sample (Prereg §7.7)
+
+Prereg §7.7 specifies three sensitivity samples: (a) the full sample (no participant exclusions other than incomplete sessions and pilot), already reported in §6.2 as `df_sensitivity`; (b) the high-engagement sample (≥ 12 messages); (c) the clean sample (no contamination flag, no AI-tool self-report). The high-engagement subset is computed below; the clean sample collapses to the primary analytic sample because the relevant exclusions are already applied at the participant-level.
+
+```{r high-engagement-sensitivity}
+# chat_total_rounds is the prereg's "≥ 12 messages" criterion (rounds = paired turns)
+# We use ≥ 12 user messages (i.e., chat_total_rounds ≥ 12) as the criterion
+df_high_engagement <- df_primary %>% filter(chat_total_rounds >= 12)
+
+cat(glue::glue(
+  "High-engagement sensitivity sample: N = {nrow(df_high_engagement)} ",
+  "({sum(df_high_engagement$condition_label == 'HighA')} HighA / ",
+  "{sum(df_high_engagement$condition_label == 'LowA')} LowA). ",
+  "Excluded {nrow(df_primary) - nrow(df_high_engagement)} participants with < 12 chat rounds.\n"
+))
+
+if (nrow(df_high_engagement) >= 30) {
+  he_results <- map_dfr(confirmatory_dvs, ~welch_full(df_high_engagement, .x)) %>%
+    mutate(dv_label = unname(dv_labels[dv]),
+           q_bh = p.adjust(p, method = "BH"))
+
+  # Side-by-side comparison with the primary
+  he_compare <- bind_rows(
+    results_primary %>% mutate(sample = "Primary (all)") %>%
+      select(dv_label, sample, t, p, q_bh, d, bf10),
+    he_results %>% mutate(sample = "High-engagement (≥ 12 rounds)") %>%
+      select(dv_label, sample, t, p, q_bh, d, bf10)
+  ) %>%
+    pivot_wider(names_from = sample, values_from = c(t, p, q_bh, d, bf10),
+                names_glue = "{sample}_{.value}")
+
+  he_compare %>%
+    mutate(across(where(is.numeric), ~round(., 3)),
+           across(matches("(p|q_bh)$"), fmt_p),
+           across(matches("bf10$"), fmt_bf)) %>%
+    kbl(caption = glue::glue(
+          "Primary vs. high-engagement sensitivity (N_high-engagement = {nrow(df_high_engagement)})"),
+        booktabs = TRUE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+  save_table(he_results, "20_high_engagement_results")
+  save_table(he_compare, "20b_primary_vs_high_engagement")
+}
+```
+
+# 13. Sample Description and Demographics
+
+```{r demographics}
+# Age sanity check first — d_age occasionally has out-of-range or birth-year entries
+age_diagnostic <- df_primary %>%
+  filter(!is.na(d_age)) %>%
+  summarize(
+    n = n(),
+    min_age = min(d_age),
+    max_age = max(d_age),
+    n_under_18 = sum(d_age < 18),
+    n_over_30 = sum(d_age > 30),
+    n_over_100 = sum(d_age > 100),
+    n_birthyear_like = sum(d_age >= 1900 & d_age <= 2010)
+  )
+print(age_diagnostic)
+
+if (any(df_primary$d_age > 100, na.rm = TRUE)) {
+  cat("\n[WARNING] At least one d_age value > 100 detected. ",
+      "These are likely birth-year entries (e.g., '1990' instead of '20').\n",
+      "Inspect:\n")
+  df_primary %>% filter(d_age > 100) %>%
+    select(sona_id, condition_label, d_age) %>% print()
+  cat("\nAge will be flagged with a sentinel column (`d_age_clean`) for ",
+      "downstream analyses; the raw `d_age` is preserved.\n")
+}
+
+# Build a cleaned age variable (NA out anything > 100 since UCLA undergrads aren't centenarians)
+df_primary <- df_primary %>%
+  mutate(d_age_clean = ifelse(d_age > 100 | d_age < 16, NA_real_, d_age))
+
+demo_summary <- tibble(
+  Statistic = c("N total", "N HighA", "N LowA",
+                "Mean age (raw)", "SD age (raw)", "Median age (raw)",
+                "Mean age (cleaned, ages 16-100)", "SD age (cleaned)", "Median age (cleaned)",
+                "N excluded by age cleaning"),
+  Value = c(
+    as.character(nrow(df_primary)),
+    as.character(sum(df_primary$condition_label == "HighA")),
+    as.character(sum(df_primary$condition_label == "LowA")),
+    sprintf("%.1f", mean(df_primary$d_age, na.rm = TRUE)),
+    sprintf("%.1f", sd(df_primary$d_age, na.rm = TRUE)),
+    as.character(median(df_primary$d_age, na.rm = TRUE)),
+    sprintf("%.1f", mean(df_primary$d_age_clean, na.rm = TRUE)),
+    sprintf("%.1f", sd(df_primary$d_age_clean, na.rm = TRUE)),
+    as.character(median(df_primary$d_age_clean, na.rm = TRUE)),
+    as.character(sum(is.na(df_primary$d_age_clean) & !is.na(df_primary$d_age)))
+  )
+)
+demo_summary %>%
+  kbl(caption = "Sample description (raw vs. cleaned age)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Demographic balance: use cleaned age for the t-test
+balance_results <- list(
+  age = t.test(d_age_clean ~ condition_label, data = df_primary),
+  phq4 = t.test(phq4_total ~ condition_label, data = df_primary),
+  gaais_pos = t.test(gaais_pos ~ condition_label, data = df_primary),
+  gaais_neg = t.test(gaais_neg ~ condition_label, data = df_primary),
+  tipi_self_agree = t.test(tipi_self_agree ~ condition_label, data = df_primary)
+)
+balance_table <- map_dfr(names(balance_results), function(n) {
+  tt <- balance_results[[n]]
+  tibble(
+    variable = n,
+    t = unname(tt[["statistic"]]),
+    df = unname(tt[["parameter"]]),
+    p = tt[["p.value"]],
+    mean_LowA = unname(tt[["estimate"]][1]),
+    mean_HighA = unname(tt[["estimate"]][2])
+  )
+})
+balance_table %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         p = fmt_p(p)) %>%
+  kbl(caption = "Demographic balance check (random-assignment validity; age cleaned)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+save_table(balance_table, "18_demographic_balance")
+```
+
+## 13.1 Robustness check: imbalanced covariates
+
+The randomization check above flags any covariate where the conditions diverge at p < .05. When such an imbalance appears, we refit each confirmed bonding DV controlling for the imbalanced covariate to verify that the condition effect survives. We also include enrollment-order (`cb_slot`) as a covariate, as a routine check for drift over the recruitment window (final-sample enrollment-order correlations from §12.4: PSR *r* = `r sprintf("%.2f", enrollment_corr$r[enrollment_corr$dv == "psr_total"])`, *p* = `r fmt_p(enrollment_corr$p[enrollment_corr$dv == "psr_total"])`; EC *r* = `r sprintf("%.2f", enrollment_corr$r[enrollment_corr$dv == "ec_total"])`, *p* = `r fmt_p(enrollment_corr$p[enrollment_corr$dv == "ec_total"])`). <!-- FIX 2026-09-30 (C5): replaced stale "hovered near p ≈ .05 across recent knits" with live values -->
+
+```{r balance-sensitivity}
+# Identify imbalanced covariates (p < .05) from the table above.
+# Use dplyr::filter explicitly to avoid any masking surprises from later-loaded packages.
+imbalanced <- balance_table %>%
+  dplyr::filter(!is.na(p), p < 0.05) %>%
+  dplyr::pull(variable)
+
+# Always include enrollment-order in the sensitivity model (separate concern from balance).
+# These two checks are reported together for compactness.
+
+bonding_dvs_for_sensitivity <- c("psr_total", "ec_total", "trust_total")
+
+# Map balance-table variable names to the actual data column names
+balance_var_map <- c(
+  age = "d_age_clean",
+  phq4 = "phq4_total",
+  gaais_pos = "gaais_pos",
+  gaais_neg = "gaais_neg",
+  tipi_self_agree = "tipi_self_agree"
+)
+
+if (length(imbalanced) > 0) {
+  imbalanced_cols <- unname(balance_var_map[imbalanced])
+  cat(glue::glue(
+    "Imbalanced covariate(s) flagged: {paste(imbalanced, collapse = ', ')}. ",
+    "Refitting bonding DVs with these as covariates plus enrollment-order (cb_slot).\n\n"
+  ))
+} else {
+  imbalanced_cols <- character(0)
+  cat("No covariates flagged as imbalanced at p < .05. Sensitivity model still includes ",
+      "enrollment-order (cb_slot) as a routine robustness check.\n\n", sep = "")
+}
+
+# Build the sensitivity model formula
+covariate_terms <- c(imbalanced_cols, "cb_slot")
+covariate_terms <- covariate_terms[!is.na(covariate_terms) & nzchar(covariate_terms)]
+covariate_str <- paste(covariate_terms, collapse = " + ")
+
+# Helper: pull a single coefficient row safely. If the term isn't in the model
+# (e.g., a covariate dropped due to collinearity), return NA-filled placeholders
+# rather than crashing the whole pipeline.
+extract_coef <- function(model, term_name) {
+  td <- broom::tidy(model, conf.int = TRUE)
+  row <- td[td$term == term_name, , drop = FALSE]
+  if (nrow(row) == 0) {
+    return(list(estimate = NA_real_, std.error = NA_real_, p.value = NA_real_,
+                conf.low = NA_real_, conf.high = NA_real_))
+  }
+  list(
+    estimate  = row$estimate[1],
+    std.error = row$std.error[1],
+    p.value   = row$p.value[1],
+    conf.low  = row$conf.low[1],
+    conf.high = row$conf.high[1]
+  )
+}
+
+sensitivity_results <- purrr::map_dfr(bonding_dvs_for_sensitivity, function(dv) {
+  raw_f <- as.formula(glue::glue("{dv} ~ condition_label"))
+  m_raw <- lm(raw_f, data = df_primary)
+  raw_coef <- extract_coef(m_raw, "condition_labelHighA")
+
+  adj_f <- as.formula(glue::glue("{dv} ~ condition_label + {covariate_str}"))
+  m_adj <- lm(adj_f, data = df_primary)
+  adj_coef <- extract_coef(m_adj, "condition_labelHighA")
+
+  # Pre-extract every scalar BEFORE the tibble() call, so the data-masking
+  # in tibble() can't shadow `raw_coef` / `adj_coef`. (A previous version
+  # named these locals `raw_b` / `adj_b`, which collided with the column
+  # names below — tibble() rebinds the name after each `=`, so the next
+  # `raw_b$std.error` saw an atomic and crashed.)
+  raw_b_val  <- raw_coef$estimate
+  raw_se_val <- raw_coef$std.error
+  raw_p_val  <- raw_coef$p.value
+  raw_lo_val <- raw_coef$conf.low
+  raw_hi_val <- raw_coef$conf.high
+  adj_b_val  <- adj_coef$estimate
+  adj_se_val <- adj_coef$std.error
+  adj_p_val  <- adj_coef$p.value
+  adj_lo_val <- adj_coef$conf.low
+  adj_hi_val <- adj_coef$conf.high
+
+  pct_change <- if (!is.na(raw_b_val) && !is.na(adj_b_val) && raw_b_val != 0) {
+    (adj_b_val - raw_b_val) / raw_b_val * 100
+  } else NA_real_
+
+  tibble::tibble(
+    dv           = dv,
+    dv_label     = unname(dv_labels[dv]),
+    raw_b        = raw_b_val,
+    raw_se       = raw_se_val,
+    raw_p        = raw_p_val,
+    raw_lo       = raw_lo_val,
+    raw_hi       = raw_hi_val,
+    adj_b        = adj_b_val,
+    adj_se       = adj_se_val,
+    adj_p        = adj_p_val,
+    adj_lo       = adj_lo_val,
+    adj_hi       = adj_hi_val,
+    pct_change_b = pct_change,
+    survives     = !is.na(adj_p_val) && adj_p_val < 0.05
+  )
+})
+
+sensitivity_results %>%
+  mutate(across(where(is.numeric), ~round(., 3)),
+         raw_p = fmt_p(raw_p), adj_p = fmt_p(adj_p),
+         survives = ifelse(survives, "✓", "✗")) %>%
+  kbl(caption = glue::glue(
+        "Bonding DVs: raw vs. covariate-adjusted condition effects ",
+        "(adjusting for: {covariate_str})")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+
+# Live verdict for the manuscript
+n_survive <- sum(sensitivity_results$adj_p < 0.05, na.rm = TRUE)
+n_total_sens <- nrow(sensitivity_results)
+max_pct_change <- suppressWarnings(max(abs(sensitivity_results$pct_change_b), na.rm = TRUE))
+
+cat(glue::glue(
+  "\n--- Sensitivity verdict ---\n",
+  "{n_survive}/{n_total_sens} bonding DVs retain p < .05 after adjusting for ",
+  "{covariate_str}. Maximum absolute change in condition coefficient: ",
+  "{ifelse(is.finite(max_pct_change), sprintf('%.1f%%', max_pct_change), 'NA')}.\n"
+))
+
+if (n_survive == n_total_sens) {
+  cat("All bonding effects survive. The headline bonding finding is not driven by the imbalanced covariate(s) or by enrollment-order drift.\n")
+} else if (n_survive == 0) {
+  cat("None of the bonding effects survive adjustment. The headline bonding finding may be confounded by the imbalanced covariate(s) and/or enrollment-order drift. Inspect individual rows.\n")
+} else {
+  cat(glue::glue(
+    "Mixed pattern: {n_survive}/{n_total_sens} bonding DVs survive. The DVs that no longer reach p < .05 after adjustment should be flagged in the manuscript with a sensitivity-driven caveat.\n"
+  ))
+}
+
+save_table(sensitivity_results, "18b_balance_sensitivity")
+```
+
+# 14. Synthesis of All Findings
+
+This is the wrap-up table. Every value pulls live from objects fit earlier in the notebook (`results_primary`, `M1`, `M3`, `m_tipi_ma`, `ss_tipi`, `m_legal`, `verbosity_adjusted_results`, `moderator_results`). Re-knitting at any sample size reproduces a current snapshot of the eight findings without any hard-coded numbers.
+
+```{r key-findings-summary}
+# Pull live values for each DV
+get_dv <- function(dv_name, col) {
+  results_primary %>% filter(dv == dv_name) %>% pull(!!sym(col))
+}
+
+# Confirmation-status helpers
+n_confirmed_bonding <- results_primary %>%
+  filter(dv %in% c("psr_total", "ec_total", "trust_total")) %>%
+  pull(confirmed) %>% sum()
+
+n_partial_bonding <- results_primary %>%
+  filter(dv %in% c("psr_total", "ec_total", "trust_total")) %>%
+  pull(partially_supported) %>% sum()
+
+# Format helpers
+fmt_d_ci <- function(d, lo, hi) sprintf("d = %.2f [%.2f, %.2f]", d, lo, hi)
+fmt_bf_str <- function(bf) {
+  if (bf >= 100) sprintf("BF10 = %.0f", bf)
+  else if (bf >= 10) sprintf("BF10 = %.1f", bf)
+  else if (bf >= 1) sprintf("BF10 = %.2f", bf)
+  else sprintf("BF10 = 1/%.1f", 1/bf)
+}
+
+# Mediation values from M1 (now exists — fit in §12.2)
+m1_paths_live <- if (exists("M1") && !is.null(M1)) {
+  M1$params %>% filter(label %in% c("ind_psr", "ind_ec", "ind_trust", "total_indirect", "c"))
+} else {
+  NULL
+}
+
+# Personality-matching interaction from m_tipi_ma (fit in §12.1)
+tipi_ma_live <- if (exists("m_tipi_ma")) {
+  broom::tidy(m_tipi_ma, conf.int = TRUE) %>%
+    filter(term == "cond_centered:tipi_self_agree_z")
+} else {
+  NULL
+}
+ss_high_slope <- if (exists("ss_tipi")) {
+  ss_tipi$slopes %>% filter(`Value of tipi_self_agree_z` == 1)
+} else {
+  NULL
+}
+
+# Build synthesis table
+
+# FIX 2026-09-30 (C5): live helpers — every evidence class below is read from the joint
+# TOST x Bayes table (tost_x_bf); nothing is hard-coded.  # FIX 2026-09-30 (C5)
+cls_of   <- function(lbl) tost_x_bf$null_evidence[tost_x_bf$dv_label == lbl]              # FIX 2026-09-30 (C5)
+cls_list <- function(cl) {                                                                  # FIX 2026-09-30 (C5)
+  x <- tost_x_bf$dv_label[tost_x_bf$null_evidence == cl]  # FIX 2026-09-30 (C5)
+  if (length(x) == 0) "none" else paste(x, collapse = ", ")  # FIX 2026-09-30 (C5)
+}  # FIX 2026-09-30 (C5)
+ev_classes <- c("Evidence of absence", "TOST-only equivalence", "Bayesian-only null",  # FIX 2026-09-30 (C5)
+                "Evidence of presence", "Inconclusive")                                     # FIX 2026-09-30 (C5)
+finding2_txt <- paste(map_chr(ev_classes, ~ glue::glue("{.x}: {cls_list(.x)}")),  # FIX 2026-09-30 (C5)
+                      collapse = "; ")                                                      # FIX 2026-09-30 (C5)
+liab_lbls <- unname(dv_labels[c("liab_corp", "liab_chat", "liab_user", "liab_harm")])      # FIX 2026-09-30 (C5)
+finding2_ev <- paste(map_chr(liab_lbls, function(l) {                                       # FIX 2026-09-30 (C5)
+  r   <- tost_x_bf %>% filter(dv_label == l)  # FIX 2026-09-30 (C5)
+  dvn <- names(dv_labels)[dv_labels == l]  # FIX 2026-09-30 (C5)
+  sprintf("%s: SMD = %.2f [90%% CI %.2f, %.2f], TOST p = %.4f, %s -> %s",  # FIX 2026-09-30 (C5): 4 dp so p = .0497 is not shown as .050
+          l, r$smd, r$smd_lo90, r$smd_hi90, r$tost_p_max,  # FIX 2026-09-30 (C5)
+          fmt_bf_str(get_dv(dvn, "bf10")), r$null_evidence)  # FIX 2026-09-30 (C5)
+}), collapse = "; ")  # FIX 2026-09-30 (C5)
+
+# Helper for §5 mind-perception split label/text
+ma_d   <- get_dv("ma_total", "d");   ma_bf <- get_dv("ma_total", "bf10")
+mp_d   <- get_dv("mp_total", "d");   mp_bf <- get_dv("mp_total", "bf10")
+# FIX 2026-09-30 (C5): MP/MA labels are now fully data-driven. The old MA label put a fixed
+# "directional" prefix on every branch (e.g. "directional, moderate evidence for null"), and  # FIX 2026-09-30 (C5)
+# the old MP label fell through to "inconclusive" even if BF10 >= 3. Direction is now  # FIX 2026-09-30 (C5)
+# reported only when BF10 >= 3, from the sign of d (comp = HighA, ref = LowA).  # FIX 2026-09-30 (C5)
+bf_evidence_label <- function(bf, d, hi_lbl, lo_lbl) {                                     # FIX 2026-09-30 (C5)
+  if (is.na(bf)) return("Bayes factor not computed")                                        # FIX 2026-09-30 (C5)
+  dir_txt <- sprintf("%s %s %s", hi_lbl, ifelse(d > 0, ">", "<"), lo_lbl)                   # FIX 2026-09-30 (C5)
+  if (bf >= 10)  return(sprintf("strong evidence for an effect (BF10 >= 10; %s)", dir_txt))    # FIX 2026-09-30 (C5)
+  if (bf >= 3)   return(sprintf("moderate evidence for an effect (BF10 >= 3; %s)", dir_txt))   # FIX 2026-09-30 (C5)
+  if (bf > 1)    return("anecdotal evidence for an effect")                                 # FIX 2026-09-30 (C5)
+  if (bf < 1/10) return("strong evidence for the null")                                     # FIX 2026-09-30 (C5)
+  if (bf < 1/3)  return("moderate evidence for the null")                                   # FIX 2026-09-30 (C5)
+  if (bf < 1)    return("anecdotal evidence for the null")                                  # FIX 2026-09-30 (C5)
+  "inconclusive"                                                                            # FIX 2026-09-30 (C5)
+}                                                                                          # FIX 2026-09-30 (C5)
+mp_label_text <- bf_evidence_label(mp_bf, mp_d, "HighA", "LowA")                             # FIX 2026-09-30 (C5)
+ma_label_text <- bf_evidence_label(ma_bf, ma_d, "HighA", "LowA")                             # FIX 2026-09-30 (C5)
+
+# FIX 2026-09-30 (C5): §8 personality-matching label now reads the LIVE moderator table
+# (pm_rows, fit in §12.1.1) across all ten DVs, instead of framing the finding on Moral Agency.  # FIX 2026-09-30 (C5)
+pm_sig    <- pm_rows %>% filter(interaction_p < 0.05)                                       # FIX 2026-09-30 (C5)
+pm_ma_row <- pm_rows %>% filter(dv == "ma_total")                                           # FIX 2026-09-30 (C5)
+pm_ma_desc <- "the follow-up selected at an interim look; not preregistered"                 # FIX 2026-09-30 (C5): was "the originally planned follow-up" (unsupported by prereg §9.1)
+top_slopes <- ss_tipi_top$slopes                                                            # FIX 2026-09-30 (C5)
+top_hi <- top_slopes[top_slopes[[paste0("Value of ", pm_z_var)]] == 1, ]                    # FIX 2026-09-30 (C5)
+top_lo <- top_slopes[top_slopes[[paste0("Value of ", pm_z_var)]] == -1, ]                   # FIX 2026-09-30 (C5)
+pm_label_text <- if (nrow(pm_sig) > 0) {                                                    # FIX 2026-09-30 (C5)
+  glue::glue("Personality matching (exploratory): TIPI-Self {pm_trait_lbl} x condition interaction ",  # FIX 2026-09-30 (C5)
+             "reaches p < .05 (uncorrected) on {nrow(pm_sig)}/{nrow(pm_rows)} DVs ",  # FIX 2026-09-30 (C5)
+             "({paste(pm_sig$dv_label, collapse = ', ')})")  # FIX 2026-09-30 (C5)
+} else {
+  glue::glue("Personality matching (exploratory): TIPI-Self {pm_trait_lbl} x condition interaction ",  # FIX 2026-09-30 (C5)
+             "does not reach p < .05 (uncorrected) on any of the {nrow(pm_rows)} DVs")  # FIX 2026-09-30 (C5)
+}
+
+# FIX 2026-09-30 (C5): H-Legal label/evidence built from the fitted interaction (was hard-coded
+# "directionally consistent" / "Interaction sign correct (negative)").  # FIX 2026-09-30 (C5)
+hlegal_dir_short <- sprintf(paste0("interaction %s; condition slope %.3f at -1 SD vs %.3f at +1 SD of legal expertise; ",  # FIX 2026-09-30 (R4-C5a)
+                                   "attenuation criterion |slope(+1 SD)| < |slope(-1 SD)| %s"),  # FIX 2026-09-30 (R4-C5a)
+                            hl_int_ci_txt, hl_s_lo[["est"]], hl_s_hi[["est"]],               # FIX 2026-09-30 (R4-C5a)
+                            if (hl_attenuated) "met" else "not met")                         # FIX 2026-09-30 (R4-C5a)
+hlegal_supported <- (one_tailed_p < 0.05) & (interaction_coef$estimate < 0)                 # FIX 2026-09-30 (C5)
+
+# FIX 2026-09-30 (C1/C5): verbosity summary uses the corrected (Type II / exact) columns and
+# reports the change in b as well as in partial eta².  # FIX 2026-09-30 (C1/C5)
+v_bond <- verbosity_adjusted_results %>%  # FIX 2026-09-30 (C1)
+  filter(dv %in% c("psr_total", "ec_total", "trust_total"))                                # FIX 2026-09-30 (C1)
+i_b <- which.max(abs(v_bond$pct_change_b)); i_e <- which.max(abs(v_bond$pct_change_eta))   # FIX 2026-09-30 (C1)
+
+key_findings <- tibble(
+  Finding = c(
+    glue::glue("1. Bonding effects: {n_confirmed_bonding}/3 of PSR/EC/Trust confirmed (q<.05 AND BF10 ≥ 3); ",  # FIX 2026-09-30 (C4): label BF10 ≥ 3
+               "{n_partial_bonding}/3 partially supported (one criterion only)"),
+    glue::glue("2. Joint TOST x Bayes classification (SESOI ±0.40) — {finding2_txt}"),     # FIX 2026-09-30 (C5): live (was hard-coded class lists)
+    {
+      # FIX 2026-09-30 (C1): corrected columns; change in b AND in partial eta² reported
+      n_persist <- sum(v_bond$cond_p < 0.05, na.rm = TRUE)
+      glue::glue("3. Verbosity sensitivity: {n_persist}/3 bonding DVs have condition p < .05 after ",  # FIX 2026-09-30 (C1)
+                 "controlling for bot verbosity (mean completion tokens per turn). Largest absolute ",  # FIX 2026-09-30 (C1)
+                 "change vs. the unadjusted model: condition b {sprintf('%+.0f%%', v_bond$pct_change_b[i_b])} ",  # FIX 2026-09-30 (C1)
+                 "({v_bond$dv_label[i_b]}); condition partial eta² {sprintf('%+.0f%%', v_bond$pct_change_eta[i_e])} ",  # FIX 2026-09-30 (C1)
+                 "({v_bond$dv_label[i_e]}).")  # FIX 2026-09-30 (C1)
+    },
+    "4. Mediation: indirect paths from condition through bonding to Corporate Liability",
+    glue::glue("5a. Moral Patiency: ", mp_label_text),
+    glue::glue("5b. Moral Agency: ", ma_label_text),
+    glue::glue("6. Experience-Taking: {cls_of('Experience-Taking')} ",  # FIX 2026-09-30 (C5)
+               "({tost_x_bf$bf10_class[tost_x_bf$dv_label == 'Experience-Taking']})"),       # FIX 2026-09-30 (C5): live (was "evidence for the null")
+    glue::glue("7. H-Legal (RQ-E8): {hlegal_dir_short}; ",  # FIX 2026-09-30 (R4-C5a)
+               "one-tailed negative-interaction test {if (hlegal_supported) 'supported' else 'not supported'}; ",  # FIX 2026-09-30 (R4-C5a)
+               "n with formal legal training = {sum(df_primary$legal_training_law, na.rm = TRUE)}"),  # FIX 2026-09-30 (C5): live
+    paste0("8. ", pm_label_text)
+  ),
+  Evidence = c(
+    glue::glue("PSR {fmt_d_ci(get_dv('psr_total','d'), get_dv('psr_total','d_lo'), get_dv('psr_total','d_hi'))}, ",
+               "{fmt_bf_str(get_dv('psr_total','bf10'))}, q={sprintf('%.3f', get_dv('psr_total','q_bh'))}; ",
+               "EC {fmt_d_ci(get_dv('ec_total','d'), get_dv('ec_total','d_lo'), get_dv('ec_total','d_hi'))}, ",
+               "{fmt_bf_str(get_dv('ec_total','bf10'))}, q={sprintf('%.3f', get_dv('ec_total','q_bh'))}; ",
+               "Trust {fmt_d_ci(get_dv('trust_total','d'), get_dv('trust_total','d_lo'), get_dv('trust_total','d_hi'))}, ",
+               "{fmt_bf_str(get_dv('trust_total','bf10'))}, q={sprintf('%.3f', get_dv('trust_total','q_bh'))}"),
+    paste0(finding2_ev, ". Evidence of absence = TOST equivalent (±0.40) AND BF10 < 1/3. ",  # FIX 2026-09-30 (C5)
+           "See §6.4 joint table for all ten DVs."),                                        # FIX 2026-09-30 (C5): live
+    {
+      # FIX 2026-09-30 (C1): b and partial eta² before/after adjustment (was raw d vs adjusted b)
+      v_strs <- map_chr(seq_len(nrow(v_bond)), function(i) {
+        r <- v_bond[i, ]
+        sprintf("%s b %.2f -> %.2f (%+.0f%%), partial eta² %.3f -> %.3f (%+.0f%%), raw p=%s, adj p=%s, adj q_BH=%s",  # FIX 2026-09-30 (C1)
+                unname(dv_labels[r$dv]),
+                r$raw_b, r$cond_b, r$pct_change_b,  # FIX 2026-09-30 (C1)
+                r$raw_eta2, r$cond_eta2, r$pct_change_eta,  # FIX 2026-09-30 (C1)
+                fmt_p(r$raw_p), fmt_p(r$cond_p), fmt_p(r$q_bh_adj))  # FIX 2026-09-30 (C1)
+      })
+      paste(v_strs, collapse = "; ")
+    },
+    if (!is.null(m1_paths_live)) {
+      ind_psr <- m1_paths_live %>% filter(label == "ind_psr") %>% pull(est)
+      ind_psr_lo <- m1_paths_live %>% filter(label == "ind_psr") %>% pull(ci.lower)
+      ind_psr_hi <- m1_paths_live %>% filter(label == "ind_psr") %>% pull(ci.upper)
+      ind_ec <- m1_paths_live %>% filter(label == "ind_ec") %>% pull(est)
+      ind_ec_lo <- m1_paths_live %>% filter(label == "ind_ec") %>% pull(ci.lower)
+      ind_ec_hi <- m1_paths_live %>% filter(label == "ind_ec") %>% pull(ci.upper)
+      ind_trust <- m1_paths_live %>% filter(label == "ind_trust") %>% pull(est)
+      ind_trust_lo <- m1_paths_live %>% filter(label == "ind_trust") %>% pull(ci.lower)
+      ind_trust_hi <- m1_paths_live %>% filter(label == "ind_trust") %>% pull(ci.upper)
+      # Flag whichever indirect paths cross zero
+      psr_excl <- (ind_psr_lo * ind_psr_hi) > 0
+      ec_excl  <- (ind_ec_lo * ind_ec_hi) > 0
+      trust_excl <- (ind_trust_lo * ind_trust_hi) > 0
+      n_excl <- sum(c(psr_excl, ec_excl, trust_excl))
+      glue::glue("M1 indirect effects: ind_psr = {round(ind_psr,2)} [{round(ind_psr_lo,2)}, {round(ind_psr_hi,2)}]; ",
+                 "ind_ec = {round(ind_ec,2)} [{round(ind_ec_lo,2)}, {round(ind_ec_hi,2)}]; ",
+                 "ind_trust = {round(ind_trust,2)} [{round(ind_trust_lo,2)}, {round(ind_trust_hi,2)}]. ",
+                 "{n_excl}/3 indirect paths have CIs that exclude zero.")
+    } else "M1 not yet fit (mediation chunk did not run successfully)",
+    # 5a. Moral Patiency on its own line
+    # FIX 2026-09-30 (C5): removed hard-coded "Means are essentially identical ... warmth does not shift";
+    # report the live means and joint TOST x Bayes class instead.  # FIX 2026-09-30 (C5)
+    glue::glue("Moral Patiency {fmt_d_ci(get_dv('mp_total','d'), get_dv('mp_total','d_lo'), get_dv('mp_total','d_hi'))}, ",
+               "{fmt_bf_str(get_dv('mp_total','bf10'))}; M = {sprintf('%.2f', get_dv('mp_total','mean_comp'))} (HighA) vs ",  # FIX 2026-09-30 (C5)
+               "{sprintf('%.2f', get_dv('mp_total','mean_ref'))} (LowA); joint TOST x Bayes class: {cls_of('Moral Patiency')}."),  # FIX 2026-09-30 (C5)
+    # 5b. Moral Agency on its own line, with personality-matching cross-reference
+    # FIX 2026-09-30 (C5): removed hard-coded "moderation by participant agreeableness drives the asymmetric pattern"
+    glue::glue("Moral Agency {fmt_d_ci(get_dv('ma_total','d'), get_dv('ma_total','d_lo'), get_dv('ma_total','d_hi'))}, ",  # FIX 2026-09-30 (C5)
+               "{fmt_bf_str(get_dv('ma_total','bf10'))}; joint TOST x Bayes class: {cls_of('Moral Agency')}; ",  # FIX 2026-09-30 (C5)
+               "condition x TIPI-Self {pm_trait_lbl} interaction on Moral Agency b = {sprintf('%.2f', pm_ma_row$interaction_b)}, ",  # FIX 2026-09-30 (C5)
+               "p = {sprintf('%.3f', pm_ma_row$interaction_p)} (see finding 8)."),                                           # FIX 2026-09-30 (C5)
+    glue::glue("ET {fmt_d_ci(get_dv('et_total','d'), get_dv('et_total','d_lo'), get_dv('et_total','d_hi'))}, ",
+               "{fmt_bf_str(get_dv('et_total','bf10'))}; TOST p = ",  # FIX 2026-09-30 (C5)
+               "{sprintf('%.4f', tost_x_bf$tost_p_max[tost_x_bf$dv_label == 'Experience-Taking'])}"),  # FIX 2026-09-30 (C5): add TOST p
+    glue::glue("Condition x legal-expertise interaction on Corporate Liability b = {sprintf('%.3f', interaction_coef$estimate)} ",  # FIX 2026-09-30 (C5)
+               "[{sprintf('%.3f', interaction_coef$conf.low)}, {sprintf('%.3f', interaction_coef$conf.high)}], ",  # FIX 2026-09-30 (C5)
+               "two-tailed p = {sprintf('%.3f', two_tailed_p)}, one-tailed p (test assumes a negative interaction) = {sprintf('%.3f', one_tailed_p)}. ",  # FIX 2026-09-30 (R4-C5a)
+               "{hl_slopes_txt}. {hl_onetail_txt}."),  # FIX 2026-09-30 (R4-C5a)
+    # FIX 2026-09-30 (C5): evidence for finding 8 from the live moderator table + follow-up model
+    glue::glue("Strongest: {pm_rows$dv_label[1]} b = {sprintf('%.2f', pm_rows$interaction_b[1])} ",  # FIX 2026-09-30 (C5)
+               "[{sprintf('%.2f', pm_rows$ci_lo[1])}, {sprintf('%.2f', pm_rows$ci_hi[1])}], ",  # FIX 2026-09-30 (C5)
+               "p = {sprintf('%.3f', pm_rows$interaction_p[1])}, n = {pm_rows$n[1]}; condition slope on this DV at ",  # FIX 2026-09-30 (C5)
+               "+1 SD {tolower(pm_trait_lbl)} = {sprintf('%.2f', top_hi$Est.)} [{sprintf('%.2f', top_hi$`2.5%`)}, {sprintf('%.2f', top_hi$`97.5%`)}], ",  # FIX 2026-09-30 (C5)
+               "p = {fmt_p(top_hi$p)}; at -1 SD = {sprintf('%.2f', top_lo$Est.)} ",  # FIX 2026-09-30 (C5)
+               "[{sprintf('%.2f', top_lo$`2.5%`)}, {sprintf('%.2f', top_lo$`97.5%`)}], p = {fmt_p(top_lo$p)}. ",  # FIX 2026-09-30 (C5)
+               "Moral Agency ({pm_ma_desc}): b = {sprintf('%.2f', pm_ma_row$interaction_b)}, ",  # FIX 2026-09-30 (C5)
+               "p = {sprintf('%.3f', pm_ma_row$interaction_p)}. One of {nrow(moderator_results)} uncorrected ",  # FIX 2026-09-30 (C5)
+               "exploratory moderator x DV tests.")  # FIX 2026-09-30 (C5)
+  )
+)
+
+key_findings %>%
+  kbl(caption = glue::glue("Synthesis of confirmatory and exploratory findings (N = {nrow(df_primary)})")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "35%") %>%
+  column_spec(2, width = "65%")
+
+save_table(key_findings, "00_key_findings_synthesis")
+```
+
+```{r synthesis-prose, results='asis'}
+# FIX 2026-09-30 (C5): every sentence below is built from live objects (results_primary,
+# tost_x_bf, M1, M3, moderator_results / pm_rows, ss_tipi_top). Previously the  # FIX 2026-09-30 (C5)
+# dissociation, mediation, and personality-matching sentences were hard-coded.  # FIX 2026-09-30 (C5)
+pm_top_row <- pm_rows[1, ]                                                                  # FIX 2026-09-30 (C5)
+pm_strength <- if (nrow(pm_sig) > 0) {                                                      # FIX 2026-09-30 (C5)
+  paste0("An exploratory personality-matching pattern appears on **", pm_top_row$dv_label, "**: ",  # FIX 2026-09-30 (C5)
+         "the condition × TIPI-Self ", pm_trait_lbl, " interaction is b = ",  # FIX 2026-09-30 (C5)
+         sprintf("%.2f", pm_top_row$interaction_b), ", p = ", sprintf("%.3f", pm_top_row$interaction_p),  # FIX 2026-09-30 (C5)
+         " (uncorrected; one of ", nrow(moderator_results), " exploratory moderator tests). ",  # FIX 2026-09-30 (C5)
+         "The condition effect on this DV is ", sprintf("%.2f (p = %s)", top_hi$Est., fmt_p(top_hi$p)),  # FIX 2026-09-30 (C5)
+         " at +1 SD and ", sprintf("%.2f (p = %s)", top_lo$Est., fmt_p(top_lo$p)),  # FIX 2026-09-30 (C5)
+         " at −1 SD of participant ", tolower(pm_trait_lbl), ". ",  # FIX 2026-09-30 (C5)
+         if (nrow(pm_sig) > 1) paste0("Other DVs with p < .05: ",  # FIX 2026-09-30 (C5)
+                                     paste(pm_sig$dv_label[-1], collapse = ", "), ". ") else "",  # FIX 2026-09-30 (C5)
+         "On Moral Agency (", pm_ma_desc, ") the interaction is b = ",  # FIX 2026-09-30 (C5)
+         sprintf("%.2f, p = %.3f", pm_ma_row$interaction_b, pm_ma_row$interaction_p), ".")  # FIX 2026-09-30 (C5)
+} else {
+  paste0("The personality-matching probe (TIPI-Self ", pm_trait_lbl, " × condition) does not reach ",  # FIX 2026-09-30 (C5)
+         "p < .05 on any of the ten DVs (smallest p = ", sprintf("%.3f", pm_top_row$interaction_p),  # FIX 2026-09-30 (C5)
+         ", ", pm_top_row$dv_label, "). We retain the analysis for transparency but do not treat it ",  # FIX 2026-09-30 (C5)
+         "as a substantive finding.")  # FIX 2026-09-30 (C5)
+}
+
+# FIX 2026-09-30 (C5): takeaway from the live confirmation flags (q_BH < .05 AND BF10 >= 3)
+bond_rows <- results_primary %>% filter(dv %in% c("psr_total", "ec_total", "trust_total"))           # FIX 2026-09-30 (C5)
+liab_rows <- results_primary %>% filter(dv %in% c("liab_corp", "liab_chat", "liab_user", "liab_harm"))  # FIX 2026-09-30 (C5)
+n_bond_moved <- sum(bond_rows$confirmed, na.rm = TRUE)                                                # FIX 2026-09-30 (C5)
+n_liab_moved <- sum(liab_rows$confirmed, na.rm = TRUE)                                                # FIX 2026-09-30 (C5)
+liab_cls_txt <- paste(sprintf("%s: %s", liab_lbls, map_chr(liab_lbls, cls_of)), collapse = "; ")     # FIX 2026-09-30 (C5)
+
+takeaway <- if (n_bond_moved > 0 && n_liab_moved == 0) {                                    # FIX 2026-09-30 (C5)
+  paste0("The dominant pattern is a **bonding-vs-liability dissociation**: ", n_bond_moved,  # FIX 2026-09-30 (C5)
+         "/3 bonding measures (", paste(bond_rows$dv_label[bond_rows$confirmed], collapse = ", "),  # FIX 2026-09-30 (C5)
+         ") meet the confirmation rule (q_BH < .05 and BF10 ≥ 3), while none of the four liability ",  # FIX 2026-09-30 (C5)
+         "measures does (joint TOST × Bayes classes — ", liab_cls_txt, "). ")  # FIX 2026-09-30 (C5)
+} else if (n_bond_moved == 0 && n_liab_moved == 0) {  # FIX 2026-09-30 (C5)
+  paste0("None of the bonding measures (PSR, EC, Trust) and none of the liability measures meets the ",  # FIX 2026-09-30 (C5)
+         "confirmation rule (q_BH < .05 and BF10 ≥ 3); liability joint TOST × Bayes classes — ",  # FIX 2026-09-30 (C5)
+         liab_cls_txt, ". ")  # FIX 2026-09-30 (C5)
+} else {  # FIX 2026-09-30 (C5)
+  paste0("The downstream pattern is mixed (", n_bond_moved, "/3 bonding and ", n_liab_moved,  # FIX 2026-09-30 (C5)
+         "/4 liability measures meet the confirmation rule, q_BH < .05 and BF10 ≥ 3); see the ",  # FIX 2026-09-30 (C5)
+         "synthesis table and §6 for per-DV detail. ")  # FIX 2026-09-30 (C5)
+}  # FIX 2026-09-30 (C5)
+
+# FIX 2026-09-30 (C5): mediation sentence from live CI flags (M1 parallel, M3 serial)
+ci_excl_lbl <- function(params, lbl) {                                                      # FIX 2026-09-30 (C5)
+  r <- params %>% filter(label == lbl); isTRUE(r$ci.lower * r$ci.upper > 0)  # FIX 2026-09-30 (C5)
+}  # FIX 2026-09-30 (C5)
+m1_excl <- c(PSR = ci_excl_lbl(M1$params, "ind_psr"), EC = ci_excl_lbl(M1$params, "ind_ec"),  # FIX 2026-09-30 (C5)
+             Trust = ci_excl_lbl(M1$params, "ind_trust"))                                   # FIX 2026-09-30 (C5)
+m3_excl <- ci_excl_lbl(M3$params, "ind_serial")                                             # FIX 2026-09-30 (C5)
+med_txt <- if (!any(m1_excl) && !m3_excl) {                                                 # FIX 2026-09-30 (C5)
+  paste0("Mediation analyses do not reveal credible indirect paths from condition through bonding ",  # FIX 2026-09-30 (C5)
+         "to Corporate Liability: none of the M1 indirect effects (via PSR, EC, or Trust) and not the ",  # FIX 2026-09-30 (C5)
+         "serial PSR → Moral Patiency → Corporate Liability path (M3) has a 95% bootstrap CI excluding ",  # FIX 2026-09-30 (C5)
+         "zero; ", n_b_sig, "/3 bonding → Corporate Liability b-paths in M1 reach p < .05. ")  # FIX 2026-09-30 (C5)
+} else {  # FIX 2026-09-30 (C5)
+  paste0("Mediation: indirect path(s) with a 95% bootstrap CI excluding zero — ",  # FIX 2026-09-30 (C5)
+         paste(c(if (any(m1_excl)) paste0("M1 via ", names(m1_excl)[m1_excl]),  # FIX 2026-09-30 (C5)
+                 if (m3_excl) "M3 serial PSR → Moral Patiency → Corporate Liability"),  # FIX 2026-09-30 (C5)
+               collapse = "; "), " (see §12.2). ")  # FIX 2026-09-30 (C5)
+}  # FIX 2026-09-30 (C5)
+
+cat(takeaway,                                                                               # FIX 2026-09-30 (C5)
+    med_txt,  # FIX 2026-09-30 (C5)
+    pm_strength,
+    " These results and the open-ended responses from participants motivate the NLP analyses to follow.\n",  # FIX 2026-09-30 (C5)
+    sep = "")  # FIX 2026-09-30 (C5)
+```
+
+---
+
+# 15. Save Processed Data for Downstream Notebooks
+
+```{r save-processed}
+# Composite scores file (one row per participant, scale composites + key covariates)
+composite_scores <- df_primary %>%
+  select(
+    sona_id, condition_label, cb_slot,
+    # TIPI-Self
+    starts_with("tipi_self_") & matches("(extra|agree|consc|emostab|open)$"),
+    # TIPI-Bot
+    starts_with("tipi_bot_") & matches("(extra|agree|consc|emostab|open)$"),
+    # MC items
+    starts_with("mc_"),
+    # Composites
+    psr_total, psr_connection, psr_desire, psr_caring,
+    ec_total, trust_total, et_total, ma_total, mp_total,
+    liab_corp, liab_chat, liab_user, liab_harm,
+    phq4_total, phq4_anx, phq4_dep,
+    gaais_pos, gaais_neg,
+    # Behavioral
+    chat_total_rounds, chat_idle_pause_count,
+    bot_tokens_per_turn, bot_chars_per_turn,
+    user_chars_per_turn, user_total_chars,
+    # Moderators / covariates
+    legal_expertise, legal_training_law, jury_yes,
+    free_speech_avg, d_chatbot_experience, d_age, d_politics,
+    d_religiosity, d_education, d_gender, d_race,  # FIX 2026-09-30 (C2)
+    d_age_mod, d_politics_mod, d_religiosity_mod  # FIX 2026-09-30 (C2): added cleaned moderator versions (raw columns kept)
+  )
+write_csv(composite_scores, here("data", "processed", "composite_scores.csv"))
+
+# Full analytic dataset
+analytic_data <- df_primary
+write_csv(analytic_data, here("data", "processed", "analytic_data.csv"))
+
+# Item-level long-form (for NLP notebook integration)
+item_level_long <- df_primary %>%
+  select(sona_id, condition_label,
+         starts_with("psr_") & matches("^psr_\\d+$"),
+         starts_with("ec_") & matches("^ec_\\d+$"),
+         starts_with("tr_") & matches("^tr_\\d+$"),
+         starts_with("et_") & matches("^et_\\d+$"),
+         starts_with("ma_") & matches("^ma_\\d+$"),
+         starts_with("mp_") & matches("^mp_\\d+$"),
+         starts_with("liab_") & matches("^liab_\\d+$")) %>%
+  pivot_longer(-c(sona_id, condition_label), names_to = "item", values_to = "response")
+write_csv(item_level_long, here("data", "processed", "item_level_long.csv"))
+
+# Open-ended responses for the NLP notebook
+oe_data <- df_primary %>%
+  select(sona_id, condition_label, cb_slot,
+         oe_experience, oe_person_or_tool, oe_responsibility, oe_compensation,
+         d_final_thoughts, d_problems, chat_log)
+write_csv(oe_data, here("data", "processed", "oe_and_chat.csv"))
+
+cat("Saved:\n")
+cat(glue("  data/processed/composite_scores.csv ({nrow(composite_scores)} × {ncol(composite_scores)})\n"))
+cat(glue("  data/processed/analytic_data.csv ({nrow(analytic_data)} columns minus list-cols)\n"))
+cat(glue("  data/processed/item_level_long.csv ({nrow(item_level_long)} item-rows)\n"))
+cat(glue("  data/processed/oe_and_chat.csv ({nrow(oe_data)} × {ncol(oe_data)})\n"))
+```
+
+# 16. Session Info
+
+```{r session}
+sessionInfo()
+```
+
+---
+
+*End of core quantitative notebook.*
