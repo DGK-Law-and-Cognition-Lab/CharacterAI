@@ -1,0 +1,17 @@
+# Never commit credentials or participant data
+**/pavlovia_upload/
+**/data/
+*.csv
+!**/registered_files/*.csv
+*_token*.txt
+.env
+.wrangler/
+wrangler.toml
+
+# Test and build outputs
+**/test/output/
+**/test/screenshots/
+**/mock_outputs/
+node_modules/
+__pycache__/
+.DS_Store

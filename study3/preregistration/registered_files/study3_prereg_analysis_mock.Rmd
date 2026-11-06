@@ -1,0 +1,1597 @@
+---
+title: "Study 3: Preregistered Analysis Plan, Executable Mock Run"
+subtitle: "Warmth x Extraversion (2 x 2). Implements the Study 3 preregistration as posted on OSF (Study3_Preregistration_FINAL): §6-§9, §0.5-§0.6, §10-§11.2 and Appendix C. SYNTHETIC DATA ONLY."
+author: "DGK Lab, UCLA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+params:
+  analysis_root: !r Sys.getenv("STUDY3_ANALYSIS_ROOT", normalizePath(file.path("..", "..")))   # the lab's Analysis folder; render from this folder or set STUDY3_ANALYSIS_ROOT
+  data_mode: "mock"
+  effects: "planted"
+  sim_seed: 42
+  raw_dir: ""
+  tone_file: ""
+  nlp_turn_file: ""
+  nlp_flag_file: ""
+  nlp_reliability_file: ""
+  out_dir: !r normalizePath("mock_outputs", mustWork = FALSE)
+  n_boot: 5000
+  bf_iter: 100000
+  profile_bf_iter: 100000
+  lavaan_boot: 5000
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+    number_sections: false
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, dpi = 110)
+options(scipen = 999, digits = 4)
+T_START <- Sys.time()
+```
+
+# Overview
+
+**What this is.** The complete Study 3 analysis, written from the Study 3 preregistration as posted on OSF (`Docs/Preregistration/Study3_Preregistration_FINAL.md`), before any Study 3 data exist. In `data_mode = "mock"` it runs on **synthetic** data from `study3_mock_generator.R`: Pavlovia session records with the v0.3 staging build's column names, built from Study 1-2 numeric item responses (re-randomised to the four Study 3 cells) with **known planted effects** (`effects = "planted"`) or with every persona effect set to zero (`effects = "null"`). No participant text is used; all chat and open-ended text is placeholder text, and no text field is printed.
+
+**How the code is organised.** Each section cites the revision-3 section it implements. Every registered decision rule is written once as a small function (section 0.2) and checked on constructed inputs (section 0.3), so each outcome label that revision 3 names (§8.14) can be produced, including outcomes these two synthetic runs do not reach. Where revision 3 does not determine a computation, the notebook makes a choice, says so in place, and logs it with `amb()`; the log, printed at the end and written to `mock_outputs/`, contains only items that revision 3 still leaves open. Changes from the revision-2 notebook are listed in `CHANGES_rev3.md`. When the real data arrive, set `data_mode = "real"` and point `raw_dir`, `tone_file` and the NLP files at them; no analysis code changes.
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(tidyverse); library(glue); library(jsonlite); library(BayesFactor); library(effectsize)
+  library(psych); library(TOSTER); library(sandwich); library(lmtest); library(lme4); library(lavaan)
+  library(knitr)
+})
+stopifnot(requireNamespace("ordinal", quietly = TRUE))   # §8.8 ordinal::clmm (not attached: ordinal::slice would mask dplyr::slice)
+set.seed(42)
+options(mc.cores = 1)
+S3R <- file.path(params$analysis_root, "Study 3", "R")
+OUT <- params$out_dir; dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+TAG <- if (params$data_mode == "mock") paste0("mock_", params$effects) else "real"
+save_tab <- function(x, name) { readr::write_csv(x, file.path(OUT, paste0(TAG, "_", name, ".csv"))); invisible(x) }
+AMB <- tibble(id = character(), section = character(), issue = character(), choice_made = character(), affects_decision = character())
+amb <- function(id, section, issue, choice, affects = "no") {
+  if (startsWith(id, "B")) return(invisible(NULL))   # B01-B07 were open in the draft and are resolved in the posted preregistration text
+  if (!id %in% AMB$id) AMB <<- bind_rows(AMB, tibble(id = id, section = section, issue = issue, choice_made = choice, affects_decision = affects))
+  invisible(NULL)
+}
+FAIL <- tibble(analysis = character(), problem = character())
+fail <- function(a, p) { FAIL <<- bind_rows(FAIL, tibble(analysis = a, problem = p)); invisible(NULL) }
+TIMES <- tibble(section = character(), t = as.POSIXct(character()))
+tick <- function(s) TIMES <<- bind_rows(TIMES, tibble(section = s, t = Sys.time()))
+tick("start")
+f2 <- function(x) ifelse(is.na(x), "NA", sprintf("%.2f", x))
+f3 <- function(x) ifelse(is.na(x), "NA", sprintf("%.3f", x))
+fp <- function(p) ifelse(is.na(p), "NA", ifelse(p < .001, "<.001", sprintf("%.3f", p)))
+fbf <- function(bf) ifelse(is.na(bf), "NA", ifelse(bf >= 1, sprintf("%.2f", bf), sprintf("1/%.2f", 1 / bf)))
+catg <- function(..., .envir = parent.frame()) cat(glue::glue(..., .envir = .envir), "\n", sep = "")   # glue drops a trailing newline
+```
+
+## 0.1 Helper functions (Prereg §7.1 conventions)
+
+```{r helpers}
+# HC3 inference for one coefficient (sandwich::vcovHC type HC3; t on the residual df, as lmtest::coeftest)
+hc3 <- function(fit, term, level = .95) {
+  V <- sandwich::vcovHC(fit, type = "HC3")
+  b <- unname(coef(fit)[term]); se <- sqrt(V[term, term]); df <- df.residual(fit)
+  q <- qt(1 - (1 - level) / 2, df)
+  tibble(term = term, b = b, se = se, lo = b - q * se, hi = b + q * se, t = b / se, df = df,
+         p = 2 * pt(-abs(b / se), df), n = nobs(fit))
+}
+# §7.1 / §11.1: experiment_version enters the core model as a fixed covariate only if sessions ran under > 1 version
+vers_cov <- function(d) if ("experiment_version" %in% names(d) && n_distinct(d$experiment_version, na.rm = TRUE) > 1) "experiment_version" else NULL
+# Core model §7.1: lm(Y ~ A * E), A and E coded -0.5 / +0.5
+core <- function(d, y, extra = NULL) lm(reformulate(c("A", "E", "A:E", extra), y), data = d)
+# Hedges's g on the marginal groups (high - low), pooled across the other factor (§7.1)
+g_marg <- function(d, y, f, ci = .95) {
+  k <- !is.na(d[[y]]) & !is.na(d[[f]])
+  e <- effectsize::hedges_g(d[[y]][k & d[[f]] > 0], d[[y]][k & d[[f]] < 0], ci = ci)
+  tibble(g = e$Hedges_g, g_lo = e$CI_low, g_hi = e$CI_high)
+}
+# Fast Hedges's g (same formula as effectsize::hedges_g: pooled SD, exact small-sample correction) for bootstraps
+g_fast <- function(x1, x0) {
+  x1 <- x1[!is.na(x1)]; x0 <- x0[!is.na(x0)]
+  n1 <- length(x1); n0 <- length(x0); df <- n1 + n0 - 2
+  sp <- sqrt(((n1 - 1) * var(x1) + (n0 - 1) * var(x0)) / df)
+  (mean(x1) - mean(x0)) / sp * exp(lgamma(df / 2) - log(sqrt(df / 2)) - lgamma((df - 1) / 2))
+}
+# Factorial d = b / sqrt(MSE of lm(Y ~ A * E)) (§7.1); CI = HC3 CI of b divided by sigma
+fact_d <- function(fit, term) { s <- sigma(fit); h <- hc3(fit, term); tibble(d_fact = h$b / s, d_fact_lo = h$lo / s, d_fact_hi = h$hi / s) }
+# Registered Bayes factor (§7.1): lmBF(Y ~ A + E + A:E) / lmBF(Y ~ E + A:E), two-level factors, rscaleFixed = 0.5, 100,000 iterations, seed 42
+bf_reg <- function(d, y, f, iter = params$bf_iter) {
+  dd <- data.frame(y = d[[y]], Af = factor(d$A), Ef = factor(d$E)); dd <- dd[complete.cases(dd), ]
+  set.seed(42)
+  full <- lmBF(y ~ Af + Ef + Af:Ef, data = dd, rscaleFixed = 0.5, iterations = iter, progress = FALSE)
+  red  <- if (f == "A") lmBF(y ~ Ef + Af:Ef, data = dd, rscaleFixed = 0.5, iterations = iter, progress = FALSE) else
+                        lmBF(y ~ Af + Af:Ef, data = dd, rscaleFixed = 0.5, iterations = iter, progress = FALSE)
+  exp((full / red)@bayesFactor$bf)
+}
+# Marginal-group ttestBF (r = 0.707), and the directional BF+0 (nullInterval = c(0, Inf): favours high > low)
+bf_marg <- function(d, y, f, directional = FALSE) {
+  k <- !is.na(d[[y]]); x1 <- d[[y]][k & d[[f]] > 0]; x0 <- d[[y]][k & d[[f]] < 0]
+  set.seed(42)
+  b <- ttestBF(x = x1, y = x0, rscale = 0.707, nullInterval = if (directional) c(0, Inf) else NULL)
+  exp(b@bayesFactor$bf[1])
+}
+bf_cat <- function(bf) case_when(is.na(bf) ~ "NA", bf > 100 ~ "Extreme H1", bf > 30 ~ "Very strong H1",
+  bf > 10 ~ "Strong H1", bf > 3 ~ "Moderate H1", bf > 1 ~ "Anecdotal H1", bf > 1/3 ~ "Anecdotal H0",
+  bf > 1/10 ~ "Moderate H0", bf > 1/30 ~ "Strong H0", TRUE ~ "Very strong H0")
+# Welch TOST from summary statistics (TOSTER::tsum_TOST), raw or SMD bounds. p_t = the first test that
+# tsum_TOST reports (the two-sided Welch t test of the same contrast; used by the R2a/R2b 'contradicted' rule, §7.2).
+tost_welch <- function(x1, x0, bound, type = "raw") {
+  x1 <- x1[!is.na(x1)]; x0 <- x0[!is.na(x0)]
+  t <- TOSTER::tsum_TOST(m1 = mean(x1), sd1 = sd(x1), n1 = length(x1), m2 = mean(x0), sd2 = sd(x0), n2 = length(x0),
+                         low_eqbound = -bound, high_eqbound = bound, eqbound_type = type, alpha = .05, var.equal = FALSE)
+  stopifnot(identical(rownames(t$TOST), c("t-test", "TOST Lower", "TOST Upper")))
+  es <- t$effsize; sn <- setdiff(rownames(es), "Raw")
+  tibble(diff = es["Raw", "estimate"], diff_lo90 = es["Raw", "lower.ci"], diff_hi90 = es["Raw", "upper.ci"],
+         gav = es[sn, "estimate"], gav_lo90 = es[sn, "lower.ci"], gav_hi90 = es[sn, "upper.ci"],
+         p_t = t$TOST$p.value[1], p_lower = t$TOST$p.value[2], p_upper = t$TOST$p.value[3],
+         p_max = max(t$TOST$p.value[2:3]), equivalent = max(t$TOST$p.value[2:3]) < .05, bound = bound, type = type)
+}
+tost_f <- function(d, y, f, bound, type = "raw") tost_welch(d[[y]][d[[f]] > 0], d[[y]][d[[f]] < 0], bound, type)
+# TOST on a regression coefficient (§7.1, §8.8): two one-sided t tests with the HC3 SE and the residual df
+tost_coef <- function(fit, term, bound) {
+  h <- hc3(fit, term)
+  pl <- pt((h$b + bound) / h$se, h$df, lower.tail = FALSE); pu <- pt((h$b - bound) / h$se, h$df)
+  tibble(b = h$b, se = h$se, bound = bound, p_lower = pl, p_upper = pu, p_max = max(pl, pu), equivalent = max(pl, pu) < .05)
+}
+# Joint TOST x Bayes classification (§7.1; registered model-based BF10)
+joint_class <- function(equiv, bf10) case_when(
+  is.na(bf10) | is.na(equiv) ~ "NA",
+  equiv & bf10 < 1/3 ~ "evidence of absence",
+  equiv & bf10 >= 1/3 & bf10 < 3 ~ "TOST-only equivalence",
+  !equiv & bf10 < 1/3 ~ "Bayesian-only null",
+  !equiv & bf10 >= 3 ~ "evidence of presence",
+  TRUE ~ "inconclusive")
+# within-cell bootstrap indices (§8 intro: resampling participants within cells, 5,000 resamples, percentile CIs)
+boot_idx <- function(cell, B = params$n_boot, seed = 42) {
+  set.seed(seed); sp <- split(seq_along(cell), cell)
+  replicate(B, unlist(lapply(sp, function(i) i[sample.int(length(i), length(i), TRUE)]), use.names = FALSE), simplify = FALSE)
+}
+ols <- function(X, y) .lm.fit(X, y)$coefficients
+q95 <- function(x) quantile(x, c(.025, .975), na.rm = TRUE, names = FALSE)
+pooled_within_sd <- function(y, cell) { k <- !is.na(y); r <- y[k] - ave(y[k], cell[k]); sqrt(sum(r^2) / (sum(k) - length(unique(cell[k])))) }
+zs <- function(x) as.numeric(scale(x))
+paired_ci <- function(x, y, level = .95) { t <- t.test(x, y, paired = TRUE, conf.level = level); d <- x - y
+  tibble(diff = mean(d), lo = t$conf.int[1], hi = t$conf.int[2], p = t$p.value, dz = mean(d) / sd(d), n = length(d)) }
+kt <- function(x, cap = NULL, digits = 3) knitr::kable(x, caption = cap, digits = digits)
+```
+
+## 0.2 Registered decision rules (revision 3)
+
+```{r decision-rules}
+BOUND_R2  <- 0.40   # §7.2 R2a/R2b, Change 25: 0.40 x 1.00 (pooled within-group SD of Corporate Liability, Studies 1-2)
+BOUND_PSR <- 0.39   # §7.2 H2 step 1(c) and §8.13 O1: 0.40 x 0.975 (pooled within-group SD of PSR, Studies 1-2)
+P_G0 <- 0.17; P_T0 <- 0   # §7.2 H2 step 4b: fixed predictions (impression; tone)
+# H1 (§7.2): supported / contradicted / not supported
+dec_H1 <- function(b, p) if (b > 0 && p < .05) "supported" else if (b < 0 && p < .05) "contradicted" else "not supported"
+# R2a / R2b (§7.2, PI decision 10): supported if the raw-bound TOST is significant; contradicted if not and the Welch test p < .05
+dec_R2 <- function(tost_p_max, welch_p) if (tost_p_max < .05) "supported" else if (welch_p < .05) "contradicted" else "inconclusive"
+lab_R2 <- function(dec, bf10) if (dec == "inconclusive") "not supported (inconclusive)" else if (dec == "contradicted") "contradicted" else
+  if (bf10 < 1/3) "evidence of absence" else if (bf10 < 3) "equivalent (TOST-only)" else "equivalent (TOST), Bayes factor favors an effect"
+# H2 step 1 (§7.2): the four descriptions, checked in order, with the registered addition
+desc_H2 <- function(b, p, tost_eq) {
+  d <- if (b > 0 && p < .05) "positive effect detected" else if (b < 0 && p < .05) "negative effect detected" else
+       if (tost_eq) "effects as large as the smallest effect of interest excluded" else "not resolved at this N"
+  if (p < .05 && tost_eq) paste(d, "and smaller than the smallest effect of interest") else d
+}
+# H2 steps 4-5 (§7.2): 'closer' only if the CIs of D in steps 4 and 5 agree
+cmp_D <- function(lo, hi) if (hi < 0) "impression" else if (lo > 0) "tone" else "neither"
+dec_H2_closer <- function(s4, s5) if (s4 == "impression" && s5 == "impression") "the impression version's prediction is closer" else
+  if (s4 == "tone" && s5 == "tone") "the tone version's prediction is closer" else "not distinguished"
+# H2 step 4b (§7.2, PI decision 13)
+lr_4b <- function(bE, se, P0 = P_G0) exp((bE * P0 - P0^2 / 2) / se^2)
+dec_4b <- function(lr) if (lr >= 3) "the E effect is closer to the impression version's prediction" else
+  if (lr <= 1/3) "the E effect is closer to the tone version's prediction" else "not distinguished"
+# H4 (§8.6): lo_PG = 95% CI lower bounds of b(A|P) - b(A|G_halo); lo_GP = lower bounds of b(A|G_halo) - b(A|P)
+dec_H4 <- function(S_G, lo_PG, lo_GP) if (S_G >= .50 && all(lo_PG > 0)) "supported" else if (S_G < .50 && any(lo_GP > 0)) "contradicted" else "inconclusive"
+# D1 (§8.8): four-way decision with the scale-bound rule (per bound, at probe 1)
+dec_D1 <- function(b, p, tost_eq, scale_bound) {
+  sig <- p < .05
+  lab <- if (tost_eq && sig) (if (b > 0) "first impression, with small growth" else "first impression, with small narrowing") else
+         if (sig && b > 0) "accumulation" else if (sig && b < 0) "narrowing" else if (tost_eq) "first impression" else "inconclusive"
+  if (scale_bound) lab <- if (sig && b > 0) "accumulation" else if (lab == "inconclusive") lab else "not interpretable: scale bound"
+  lab
+}
+# R2c / R2d (§8.10, PI decision 16): contradicted if any BF10 > 3; supported if none and more than half have BF01 > 3
+dec_R2cd <- function(bf10) if (any(bf10 > 3)) "contradicted" else if (sum(1 / bf10 > 3) > length(bf10) / 2) "supported" else "inconclusive"
+# R3 (§8.9): contradicted checked first (both conditions cannot hold at N = 272: it would need SE(beta) < .028)
+dec_R3 <- function(hi90, lo95, bf_seg) if (lo95 > .20) "contradicted" else if (hi90 < .30 && bf_seg < 1) "supported" else "inconclusive"
+# R4 (§8.9, PI decisions 11-12): contradicted if BF10 > 3 or the bonding-composite coefficient >= .25 (checked first; see log)
+dec_R4 <- function(bf10, beta_B) if (bf10 > 3 || beta_B >= .25) "contradicted" else if (1 / bf10 > 3) "supported" else "inconclusive"
+# R6a (§8.11, PI decision 17)
+dec_R6a <- function(lo95, hi95) if (lo95 >= .40) "company-primary" else if (hi95 < .40) "Sylva comparable to the company" else "inconclusive"
+# §8.14 label sets for rules that state only a 'supported' outcome, and for checks that state only 'passes'
+sup  <- function(x) if (isTRUE(x)) "supported" else "not supported"
+pass <- function(x) if (isTRUE(x)) "passes" else "fails"
+```
+
+## 0.3 Decision rules checked on constructed inputs
+
+Every outcome label of §7.2, §8.6, §8.8-§8.11 and §8.14 is produced here from constructed statistics, including outcomes that the two synthetic runs do not reach (for example R2a "contradicted", H4 "contradicted", D1 "first impression, with small narrowing").
+
+```{r decision-tests}
+stopifnot(
+  dec_H1(.3, .01) == "supported", dec_H1(-.3, .01) == "contradicted", dec_H1(.3, .20) == "not supported",
+  dec_R2(.01, .60) == "supported", dec_R2(.20, .01) == "contradicted", dec_R2(.20, .30) == "inconclusive",
+  lab_R2("supported", .20) == "evidence of absence", lab_R2("supported", 1) == "equivalent (TOST-only)",
+  lab_R2("supported", 5) == "equivalent (TOST), Bayes factor favors an effect", lab_R2("inconclusive", 1) == "not supported (inconclusive)",
+  desc_H2(.30, .01, FALSE) == "positive effect detected", desc_H2(-.30, .01, FALSE) == "negative effect detected",
+  desc_H2(.02, .80, TRUE) == "effects as large as the smallest effect of interest excluded",
+  desc_H2(.10, .40, FALSE) == "not resolved at this N",
+  desc_H2(.12, .04, TRUE) == "positive effect detected and smaller than the smallest effect of interest",
+  desc_H2(-.12, .04, TRUE) == "negative effect detected and smaller than the smallest effect of interest",
+  dec_H2_closer("impression", "impression") == "the impression version's prediction is closer",
+  dec_H2_closer("tone", "tone") == "the tone version's prediction is closer",
+  dec_H2_closer("impression", "neither") == "not distinguished", dec_H2_closer("impression", "tone") == "not distinguished",
+  dec_4b(lr_4b(.30, .118)) == "the E effect is closer to the impression version's prediction",
+  dec_4b(lr_4b(-.10, .118)) == "the E effect is closer to the tone version's prediction",
+  dec_4b(lr_4b(.085, .118)) == "not distinguished", abs(lr_4b(.085, .118) - 1) < 1e-12,
+  dec_H4(.60, c(.1, .1, .1), c(-.3, -.3, -.3)) == "supported", dec_H4(.30, c(-.4, -.1, -.1), c(.05, -.2, -.2)) == "contradicted",
+  dec_H4(.60, c(.1, -.1, .1), c(-.3, -.1, -.3)) == "inconclusive", dec_H4(.30, c(-.1, -.1, -.1), c(-.1, -.1, -.1)) == "inconclusive",
+  dec_D1(.50, .01, FALSE, FALSE) == "accumulation", dec_D1(-.50, .01, FALSE, FALSE) == "narrowing",
+  dec_D1(.05, .60, TRUE, FALSE) == "first impression", dec_D1(.20, .03, TRUE, FALSE) == "first impression, with small growth",
+  dec_D1(-.20, .03, TRUE, FALSE) == "first impression, with small narrowing", dec_D1(.10, .50, FALSE, FALSE) == "inconclusive",
+  dec_D1(.50, .01, TRUE, TRUE) == "accumulation", dec_D1(.50, .01, FALSE, TRUE) == "accumulation",
+  dec_D1(-.50, .01, FALSE, TRUE) == "not interpretable: scale bound", dec_D1(.05, .60, TRUE, TRUE) == "not interpretable: scale bound",
+  dec_D1(-.20, .03, TRUE, TRUE) == "not interpretable: scale bound", dec_D1(.10, .50, FALSE, TRUE) == "inconclusive",
+  dec_R2cd(c(.2, .2, .2, .2, .5, .5)) == "supported", dec_R2cd(c(.2, .2, .2, .5, .5, .5)) == "inconclusive",
+  dec_R2cd(c(3.5, .2, .2, .2, .2, .2)) == "contradicted",
+  dec_R2cd(c(rep(.2, 5), .5, .5, .5)) == "supported", dec_R2cd(c(rep(.2, 4), rep(.5, 4))) == "inconclusive",
+  dec_R3(.25, -.05, .5) == "supported", dec_R3(.35, .22, .5) == "contradicted", dec_R3(.25, -.05, 2) == "inconclusive", dec_R3(.33, .02, .5) == "inconclusive",
+  dec_R4(.2, .10) == "supported", dec_R4(4, .10) == "contradicted", dec_R4(.2, .26) == "contradicted", dec_R4(1, .10) == "inconclusive",
+  dec_R6a(.45, 1.1) == "company-primary", dec_R6a(-.2, .35) == "Sylva comparable to the company", dec_R6a(.2, .7) == "inconclusive",
+  sup(TRUE) == "supported", sup(FALSE) == "not supported", sup(NA) == "not supported", pass(TRUE) == "passes", pass(FALSE) == "fails",
+  is.null(vers_cov(tibble(experiment_version = c("v1", "v1")))), vers_cov(tibble(experiment_version = c("v1", "v2"))) == "experiment_version")
+# the version covariate enters the H1 model when > 1 version (§7.2 H1, §11.1)
+toy <- tibble(A = rep(c(-.5, .5), 20), E = rep(c(-.5, -.5, .5, .5), 10), experiment_version = rep(c("v1", "v2"), each = 20), y = rnorm(40))
+stopifnot("experiment_versionv2" %in% names(coef(core(toy, "y", vers_cov(toy)))))
+cat("All decision-rule checks passed.\n")
+```
+
+# 1. Data (Prereg §6.12 fields; build v0.3 column names)
+
+```{r data-generate}
+tick("data")
+source(file.path(S3R, "study3_mock_generator.R"))   # also provides parse_prereg_materials() and harness_header()
+P <- s3_paths(params$analysis_root)
+stopifnot(grepl("Study3_Preregistration_FINAL", P$prereg))   # the posted preregistration is the specification
+MAT <- parse_prereg_materials(P$prereg)
+BUILD_HEADER <- harness_header(P$harness)
+# Appendix D.1 (revision 3): word counts and fixed frozen-probe scores of the scripted turns, and expected script hashes
+parse_d1 <- function(path) {
+  L <- readLines(path, encoding = "UTF-8", warn = FALSE)
+  map <- c("Warm, outgoing" = "HighA_HighE", "Warm, reserved" = "HighA_LowE", "Cold, outgoing" = "LowA_HighE", "Cold, reserved" = "LowA_LowE")
+  i <- grep("^\\| Cell \\| S0 words \\| S1 words \\| Warmth probe", L); stopifnot(length(i) == 1)
+  tab <- map_dfr(L[(i + 2):(i + 5)], function(r) {
+    f <- trimws(strsplit(r, "|", fixed = TRUE)[[1]][-1]); w <- as.numeric(strsplit(f[4], "/")[[1]]); rr <- as.numeric(strsplit(f[5], "/")[[1]])
+    tibble(cell = unname(map[sub(" \\(.*$", "", f[1])]), S0_words = as.numeric(f[2]), S1_words = as.numeric(f[3]),
+           W_S0 = w[1], W_S1 = w[2], W_mean = w[3], R_S0 = rr[1], R_S1 = rr[2]) })
+  h <- grep("^Expected `script_sha256`", L, value = TRUE); stopifnot(length(h) == 1)
+  m <- regmatches(h, gregexpr("(HighA|LowA)_(HighE|LowE) `[0-9a-f]{64}`", h))[[1]]
+  list(table = tab, script_sha = setNames(sub(".*`([0-9a-f]{64})`", "\\1", m), sub(" .*", "", m)))
+}
+D1MAT <- parse_d1(P$prereg)
+stopifnot(setequal(D1MAT$table$cell, CELLS), setequal(names(D1MAT$script_sha), CELLS))
+# ΔW_script (§8.8 D1 interpretation): warm - cold gap in the fixed probe-W scores of S0 and S1 (about .52)
+DW_SCRIPT <- with(D1MAT$table, mean(W_mean[startsWith(cell, "HighA")]) - mean(W_mean[startsWith(cell, "LowA")]))
+if (params$data_mode == "mock") {
+  EFF <- switch(params$effects, planted = planted_effects(), null = null_effects())
+  sim <- simulate_study3(EFF, params$analysis_root, seed = params$sim_seed)
+  raw_dir <- file.path(tempdir(), paste0("s3_raw_", params$effects))
+  unlink(raw_dir, recursive = TRUE); write_session_csvs(sim$records, raw_dir)
+  tone_turns <- sim$tone; nlp_turns <- sim$turns; nlp_flags <- sim$flags; nlp_rel <- sim$reliability
+  TRUTH <- population_truth(EFF, sim$donors)
+  catg("SYNTHETIC data: {length(sim$records)} session records ({params$effects} effects, generator seed {params$sim_seed}); ",
+           "{nrow(tone_turns)} scored model replies; {nrow(nlp_turns)} coded chat turns.")
+} else {
+  raw_dir <- params$raw_dir
+  tone_turns <- read.csv(params$tone_file, colClasses = c(sona_id = "character"))
+  nlp_turns  <- read.csv(params$nlp_turn_file, colClasses = c(sona_id = "character"))
+  nlp_flags  <- read.csv(params$nlp_flag_file, colClasses = c(sona_id = "character"))
+  nlp_rel    <- read.csv(params$nlp_reliability_file)
+  TRUTH <- NULL
+}
+catg("ΔW_script (Appendix D.1) = {f3(DW_SCRIPT)}.")
+set.seed(42)   # analysis seed (generation used its own stream)
+```
+
+```{r data-load}
+# One CSV per session (complete: ..._SESSION_<ts>.csv; partial: ..._PARTIAL.csv / _PARTIAL_MIN.csv). Every column read
+# as character with readr (hyphenated item_order_* names kept, §6.12); CRLF -> LF in every text field (§6.9).
+read_pavlovia <- function(dir) {
+  files <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
+  map_dfr(files, function(f) readr::read_csv(f, col_types = readr::cols(.default = readr::col_character()),
+                                             progress = FALSE, show_col_types = FALSE) %>% mutate(source_file = basename(f))) %>%
+    mutate(across(everything(), ~ gsub("\r\n", "\n", .x, fixed = TRUE)))
+}
+raw_dl <- read_pavlovia(raw_dir)
+# §9.2 criterion 10, applied first at download: a record reporting an age under 18 (d_age numeric and below 18) is
+# deleted before any other step; only the count is kept (CONSORT).
+age_dl <- suppressWarnings(as.numeric(raw_dl$d_age))
+minor <- !is.na(age_dl) & age_dl < 18
+N_DOWNLOAD <- nrow(raw_dl); N_MINOR <- sum(minor)
+raw <- raw_dl[!minor, ]; rm(raw_dl, age_dl, minor)
+to_lgl <- function(x) case_when(tolower(x) == "true" ~ TRUE, tolower(x) == "false" ~ FALSE, TRUE ~ NA)
+LGL <- c("completed", "captcha_pass", "attn1_pass", "attn1_retry_pass", "comprehension_correct", "is_test_session",
+         "system_prompt_sha256_match", "script_sha256_match", "cb_reused", "pid_mismatch", "pavlovia_pilot_mode",
+         "partial_slim", "partial_min", "chat_min_message_threshold_met")
+NUM <- c(grep("^(tipi_self|tipi_bot|gaais|phq4|psr|ec|tr|et|ma|mp|liab)_[0-9]+$", names(raw), value = TRUE),
+         "mc_extraversion", "mc_agreeableness", "mc_neuroticism", "mc_e_energetic", "mc_length",
+         paste0("ios_t", 1:3), paste0("ios_t", 1:3, "_elapsed"), paste0("ios_t", 1:3, "_round"), paste0("ios_t", 1:3, "_rt_ms"),
+         "chat_total_rounds", "chat_send_attempts", "chat_llm_rounds", "chat_api_error_count", "chat_idle_pause_count",
+         "chat_probe_seconds", "chat_after_end_replies", "chat_duration_seconds", "cb_slot", "study_id", "reload_count",
+         grep("^v2_(resp|cause|oblig)_|^v2_severity$|^v2_page_ms$|^v2_items_page_ms$", names(raw), value = TRUE),
+         "d_serious", "d_gender", "d_education", "d_politics", "d_ai_freq", "d_legal_knowledge", "d_jury",
+         "d_free_speech_1", "d_free_speech_2", "d_chatbot_experience", "d_social_media", "d_tech_comfort", "d_tech_trust",
+         "d_employment", "d_religiosity", "d_device", "d_distractions", "d_english_proficiency", "d_fullscreen",
+         "d_ai_used_in_study", "attn1", "attn1_retry", "total_duration_ms")
+raw <- raw %>% mutate(across(any_of(NUM), ~ suppressWarnings(as.numeric(.x))), across(any_of(LGL), to_lgl))
+ts_parse <- function(x) as.POSIXct(x, format = "%Y-%m-%dT%H:%M:%OSZ", tz = "UTC")
+# §9.2: a session is one session_uuid. If a session left more than one record, keep its completed record, else the latest partial.
+n_rec <- nrow(raw)
+if (!"checkpoint_ts" %in% names(raw)) raw$checkpoint_ts <- NA_character_
+if (!"checkpoint_stage" %in% names(raw)) raw$checkpoint_stage <- NA_character_
+raw <- raw %>% mutate(.row = row_number(), .ck = ts_parse(checkpoint_ts)) %>% group_by(session_uuid) %>%
+  arrange(desc(completed %in% TRUE), desc(.ck), .by_group = TRUE) %>% filter(row_number() == 1) %>% ungroup() %>%
+  arrange(.row) %>% select(-.row, -.ck)
+catg("Downloaded {N_DOWNLOAD} records; {N_MINOR} deleted at download (criterion 10); {n_rec} records = {nrow(raw)} sessions ",
+         "({sum(grepl('_PARTIAL', raw$source_file))} partial).")
+# §11.2 posting rule applied to the synthetic raw file: user_agent and the demographic free-text fields removed; sona_id and
+# pid_url replaced by random codes (system_prompt is also dropped, for size; its hash is kept). Chat transcripts and open-ended
+# answers are kept: with real data they are posted only after every identifying detail has been removed by hand (§11.2).
+if (params$data_mode == "mock") {
+  ids <- sort(unique(na.omit(c(raw$sona_id, raw$pid_url))))
+  set.seed(9042); code <- setNames(sprintf("R%05d", sample.int(99999, length(ids))), ids); set.seed(42)
+  public <- raw %>% select(-any_of(c("d_problems", "d_native_language", "d_country", "d_occupation", "d_religion",
+                                     "d_final_thoughts", "user_agent", "system_prompt", "source_file"))) %>%
+    mutate(sona_id = unname(code[sona_id]), pid_url = unname(code[pid_url]))
+  readr::write_csv(public, file.path(OUT, paste0(TAG, "_raw_sessions_synthetic.csv.gz")))
+  rm(public, ids, code)
+}
+```
+
+## 1.1 Data contract: revision-3 field names vs. the v0.3 build
+
+```{r contract}
+prereg_fields <- c(
+  # §5 manipulated variables and assignment metadata
+  "study_id", "study_mode", "cell", "condition_label", "condition_id", "a_level", "e_level", "a_block", "e_block", "n_block",
+  "order", "order_source", "script_version", "script_sha256", "cb_study_code", "cb_slot", "cb_source", "cb_req_id", "cb_error", "cb_reused",
+  # §6.8 screening
+  "captcha_pass", "spr1_rts", "spr2_rts", "spr1_understood", "spr2_understood", "attn1_pass", "attn1_retry_pass",
+  "comprehension_name", "comprehension_correct", "device_self_report", "user_agent", "atlas_detected",
+  # §6.9 and §6.12 instrumentation
+  "experiment_version", "system_prompt", "system_prompt_sha256", "chat_log", "chat_total_rounds", "chat_llm_rounds", "chat_send_attempts",
+  "chat_probe_seconds", "chat_api_error_count", "chat_idle_pause_count", "chat_duration_seconds", "chat_min_message_threshold_met",
+  "chat_start_time", "chat_timeout_time", "chat_end_time", "page_sequence", "page_timestamps", "page_ids", "max_tokens", "api_endpoint",
+  "model", "temperature", "start_time", "end_time", "total_duration_ms", "session_uuid", "reload_count", "pid_url", "pid_mismatch",
+  "consent_ts", "cb_fetch_ms", "cb_fetch_ts", "cb_first_session_uuid", "is_test_session", "system_prompt_sha256_match",
+  "script_sha256_match", "chat_opener", "chat_after_end_replies", "probe_format", "v2_version", "v2_severity_included",
+  "mc_e_items_included", "prior_sylva_included", "pavlovia_pilot_mode", "completed",
+  # §6.13 probes
+  paste0("ios_t", 1:3), paste0("ios_t", 1:3, "_shown_ts"), paste0("ios_t", 1:3, "_rt_ms"), paste0("ios_t", 1:3, "_elapsed"),
+  paste0("ios_t", 1:3, "_round"), "ios_t2_status",
+  # §6.14 vignette 2
+  "v2_resp_company", "v2_resp_sylva", "v2_resp_user", "v2_cause_company", "v2_cause_sylva", "v2_cause_user",
+  "v2_oblig_company", "v2_oblig_sylva", "v2_oblig_user", "v2_severity", "v2_page_ms", "v2_items_page_ms", "item_order_v2", "v2_item_order",
+  # §3.6 presented item orders
+  "item_order_tipi-s", "item_order_gaais1", "item_order_gaais2", "item_order_phq4", "item_order_psr", "item_order_ec", "item_order_tr",
+  "item_order_tipi-b", "item_order_mc", "item_order_et", "item_order_ma", "item_order_mp", "item_order_liab",
+  # §6.4, §6.6, §4.2
+  "mc_extraversion", "mc_agreeableness", "mc_neuroticism", "mc_e_energetic", "mc_length", "prior_sylva", "d_ai_used_in_study",
+  "d_serious", "d_age", "sona_id",
+  # §6.12 partial-record fields
+  "checkpoint_stage", "checkpoint_ts", "partial_slim", "partial_min")
+documented_never_written <- c("atlas_detected")                         # §6.8: never written to a record
+dyn <- c("attn1_retry_pass", "checkpoint_stage", "checkpoint_ts", "partial_slim", "partial_min")   # written only on some pages / records
+contract <- tibble(field = prereg_fields,
+                   in_build_header = field %in% BUILD_HEADER | field %in% dyn,
+                   in_this_data = field %in% names(raw),
+                   note = case_when(field %in% documented_never_written ~ "§6.8: never written (expected absent)",
+                                    field %in% dyn & !field %in% names(raw) ~ "written only in some records (none in these data)",
+                                    TRUE ~ ""))
+kt(contract %>% filter((!in_build_header | !in_this_data)), "Revision-3 raw fields absent from the build header or from these data")
+problems <- contract %>% filter((!in_build_header | !in_this_data) & note == "")
+if (nrow(problems)) fail("data contract", paste("fields missing:", paste(problems$field, collapse = ", ")))
+not_in_prereg <- setdiff(BUILD_HEADER, c(prereg_fields, grep("^(tipi_self|tipi_bot|gaais|phq4|psr|ec|tr|et|ma|mp|liab)_[0-9]+$|^(user|ai)_msg_|^d_|^oe_", BUILD_HEADER, value = TRUE)))
+cat("Build fields not named in revision 3 (not used by any analysis; n = ", length(not_in_prereg), "): ", paste(not_in_prereg, collapse = ", "), "\n", sep = "")
+stopifnot(all(na.omit(raw$e_block) %in% c("HIGH_E_S3", "LOW_E_S3")))   # §5: the code's names for the Study 3 blocks
+save_tab(contract, "data_contract")
+```
+
+## 1.2 Prompt and script integrity (§3.4, §6.9, §6.12, Appendix A, Appendix D.1)
+
+```{r hashes}
+sha <- function(x) vapply(x, function(s) if (is.na(s)) NA_character_ else as.character(openssl::sha256(enc2utf8(s))), character(1))
+d1_text_sha <- sha(map_chr(CELLS, ~ paste0(MAT$scripts[[.x]][["S0"]], "\n", MAT$scripts[[.x]][["S1"]])))
+names(d1_text_sha) <- CELLS
+kt(tibble(cell = CELLS, prompt_sha_recomputed_from_3.4 = unname(sha(unlist(MAT$prompts[CELLS]))) == unname(MAT$expected_prompt_sha[CELLS]),
+          script_sha_recomputed_from_D1_texts = unname(d1_text_sha) == unname(D1MAT$script_sha[CELLS])),
+   "Registered texts reproduce the registered hashes (Appendix A; Appendix D.1)")
+stopifnot(all(sha(unlist(MAT$prompts[CELLS])) == MAT$expected_prompt_sha[CELLS]), all(d1_text_sha == D1MAT$script_sha[CELLS]))
+integ <- raw %>% filter(!is.na(system_prompt)) %>%
+  transmute(session_uuid, cell, logged = system_prompt_sha256, recomputed_lf = sha(system_prompt),
+            logged_matches_appA = logged == unname(MAT$expected_prompt_sha[cell]), match_field = system_prompt_sha256_match,
+            script_logged_matches_D1 = script_sha256 == unname(D1MAT$script_sha[cell]), script_match_field = script_sha256_match)
+kt(integ %>% summarise(n = n(), logged_prompt_hash_in_appA = sum(logged_matches_appA), system_prompt_sha256_match_TRUE = sum(match_field %in% TRUE),
+                        recomputed_after_CRLF_normalisation = sum(sha(raw$system_prompt[!is.na(raw$system_prompt)]) == logged),
+                        script_hash_matches_D1 = sum(script_logged_matches_D1), script_sha256_match_TRUE = sum(script_match_field %in% TRUE)),
+   "Logged prompt and script hashes (sessions that store system_prompt)")
+stopifnot(identical(integ$logged_matches_appA, integ$match_field %in% TRUE))
+cat("Without the §6.9 CRLF normalisation the recomputed hash would match in",
+    sum(sha(gsub("\n", "\r\n", raw$system_prompt[!is.na(raw$system_prompt)], fixed = TRUE)) == integ$logged, na.rm = TRUE), "sessions (expected 0).\n")
+```
+
+# 2. Exclusions (Prereg §9.2) and samples
+
+```{r exclusions}
+tick("exclusions")
+ex <- raw %>% mutate(
+  t_first = ts_parse(consent_ts),                                   # rule 3: 'first' = earliest consent_ts
+  reached_chat = !is.na(chat_start_time) & chat_start_time != "",   # rule 3: reached the chat = chat_start_time non-empty
+  e1_test = grepl("^test", sona_id, ignore.case = TRUE) | cb_source %in% "test" | is_test_session %in% TRUE | pavlovia_pilot_mode %in% TRUE,
+  e2_incomplete = !(completed %in% TRUE))
+# Rule 3 (repeat participation): among records that reached the chat (complete or partial), only the SONA ID's first such
+# session is eligible, and only if complete; sessions that ended before the chat are ignored. sona_id is character.
+rep_rank <- ex %>% filter(!e1_test, reached_chat, !is.na(sona_id)) %>% arrange(sona_id, t_first) %>%
+  group_by(sona_id) %>% mutate(chat_rank = row_number(), n_chat_sessions = n()) %>% ungroup() %>%
+  select(session_uuid, chat_rank, n_chat_sessions)
+ex <- ex %>% left_join(rep_rank, by = "session_uuid") %>% mutate(
+  e3_repeat   = !is.na(chat_rank) & chat_rank > 1,
+  e4_attn     = (attn1_pass %in% FALSE) & (attn1_retry_pass %in% FALSE),
+  e5_comp     = comprehension_correct %in% FALSE,
+  e6_captcha  = captcha_pass %in% FALSE,
+  e7_ai       = d_ai_used_in_study %in% 1,
+  e8_serious  = d_serious %in% 1,
+  e9_prior    = prior_sylva %in% "Yes")
+rules <- c(e1_test = "1. TEST or pilot session", e2_incomplete = "2. Incomplete session", e3_repeat = "3. Repeat participation",
+           e4_attn = "4. Failed attention check (both attempts)", e5_comp = "5. Failed comprehension check",
+           e6_captcha = "6. Failed CAPTCHA", e7_ai = "7. Self-reported AI use", e8_serious = "8. Non-serious responding",
+           e9_prior = "9. Prior Sylva study")
+M <- as.matrix(ex[, names(rules)]); first_hit <- apply(M, 1, function(r) if (any(r)) names(rules)[which(r)[1]] else NA)
+ex$excl_first <- first_hit
+flow <- tibble(step = c("Records at download", "10. Reported age under 18 (deleted at download; applied first)", "Session records",
+                        unname(rules), "Analytic sample"),
+               n = c(N_DOWNLOAD, N_MINOR, nrow(ex), map_int(names(rules), ~ sum(first_hit == .x, na.rm = TRUE)), sum(is.na(first_hit))))
+kt(flow, "CONSORT flow (§9.2: criterion 10 first, then each record counted under the first criterion met)")
+save_tab(flow, "consort_flow")
+catg("Pilot-link sessions (pavlovia_pilot_mode = TRUE): {sum(ex$pavlovia_pilot_mode %in% TRUE)}; ",
+         "incomplete records whose last checkpoint was the debrief page (§9.2 rule 2): {sum(ex$e2_incomplete & grepl('debrief', coalesce(ex$checkpoint_stage, '')))}.")
+kt(ex %>% filter(!e1_test, sona_id %in% sona_id[duplicated(sona_id)]) %>% arrange(sona_id, t_first) %>%
+     transmute(sona_id = "(masked)", cell, completed, reached_chat, chat_rank, excl_first), "Records sharing a SONA ID (§9.2 rule 3), with cells")
+D0 <- ex %>% filter(is.na(excl_first))
+FULL <- ex %>% filter(!e1_test, !e2_incomplete, !e3_repeat)      # §9.1 check 3: only TEST/pilot, incomplete and repeat sessions removed
+catg("Analytic N = {nrow(D0)}; full sample (check 3) N = {nrow(FULL)}.")
+```
+
+```{r attrition}
+# E9 / §9.2 rules 2-3: incomplete non-TEST records by cell (after assignment); an earlier incomplete session of a repeat ID is included
+att <- ex %>% filter(!e1_test) %>% group_by(cell) %>%
+  summarise(records = n(), incomplete = sum(e2_incomplete), incomplete_after_chat_start = sum(e2_incomplete & reached_chat), .groups = "drop")
+kt(att, "Attrition by cell (partial records). The Worker slot log, matched on cb_req_id, is the second source (§6.12).")
+save_tab(att, "attrition_by_cell")
+```
+
+# 3. Recodes (§9.3), composites (§6), derived variables (§6.9-§6.15)
+
+```{r recodes-composites}
+tick("variables")
+age_num <- suppressWarnings(as.numeric(D0$d_age))
+D0$d_age_clean <- ifelse(!is.na(age_num) & age_num == round(age_num) & age_num >= 18 & age_num <= 100, age_num, NA_real_)
+catg("Age (§9.3): {sum(is.na(D0$d_age_clean) & !is.na(D0$d_age))} entr(ies) not a whole number from 18 to 100 set to missing.")
+pnts <- c(d_gender = 5, d_education = 8, d_politics = 8, d_jury = 3, d_employment = 9, d_religiosity = 6)
+for (v in names(pnts)) D0[[v]][D0[[v]] %in% pnts[[v]]] <- NA
+
+score <- function(d) d %>% mutate(
+  A = ifelse(a_level == "high", .5, -.5), E = ifelse(e_level == "high", .5, -.5),
+  O = ifelse(order == "bonding_first", .5, -.5), cell4 = paste0(a_level, "A_", e_level, "E"),
+  tipi_self_extra = (tipi_self_1 + 8 - tipi_self_6) / 2, tipi_self_agree = (8 - tipi_self_2 + tipi_self_7) / 2,
+  tipi_self_consc = (tipi_self_3 + 8 - tipi_self_8) / 2, tipi_self_emostab = (8 - tipi_self_4 + tipi_self_9) / 2,
+  tipi_self_open = (tipi_self_5 + 8 - tipi_self_10) / 2,
+  tipi_bot_extra = (tipi_bot_1 + 8 - tipi_bot_6) / 2, tipi_bot_agree = (8 - tipi_bot_2 + tipi_bot_7) / 2,
+  tipi_bot_consc = (tipi_bot_3 + 8 - tipi_bot_8) / 2, tipi_bot_emostab = (8 - tipi_bot_4 + tipi_bot_9) / 2,
+  tipi_bot_open = (tipi_bot_5 + 8 - tipi_bot_10) / 2,
+  G = (tipi_bot_extra + tipi_bot_agree + tipi_bot_consc + tipi_bot_emostab + tipi_bot_open) / 5,    # §6.15
+  G_halo = (tipi_bot_consc + tipi_bot_emostab + tipi_bot_open) / 3,                                 # §6.15
+  G_halo_E = (tipi_bot_3 + (8 - tipi_bot_8) + (8 - tipi_bot_4) + (8 - tipi_bot_10)) / 4,            # §6.15: without items 5 and 9
+  G_c_es = (tipi_bot_consc + tipi_bot_emostab) / 2, G_c_o = (tipi_bot_consc + tipi_bot_open) / 2,   # §8.6 composition
+  G_es_o = (tipi_bot_emostab + tipi_bot_open) / 2,
+  psr_total = rowMeans(across(paste0("psr_", 1:12))), psr_connection = rowMeans(across(paste0("psr_", 1:4))),
+  psr_desire = rowMeans(across(paste0("psr_", 5:8))), psr_caring = rowMeans(across(paste0("psr_", 9:12))),
+  ec_total = rowMeans(across(paste0("ec_", 1:5))), trust_total = rowMeans(across(paste0("tr_", 1:4))),
+  et_total = rowMeans(across(paste0("et_", 1:8))), ma_total = rowMeans(across(paste0("ma_", 1:8))),
+  ma_cap = rowMeans(across(paste0("ma_", c(1, 2, 3, 4, 6, 7)))),                                   # §6.15: without ma_5, ma_8
+  mp_total = rowMeans(across(paste0("mp_", 1:8))),
+  liab_corp = rowMeans(across(paste0("liab_", 1:5))), liab_chat = rowMeans(across(paste0("liab_", 6:8))),
+  liab_user = rowMeans(across(paste0("liab_", 9:10))), liab_harm = rowMeans(across(paste0("liab_", 11:12))),
+  # §6.15 bonding composite B: z-scored in the (analytic) sample, mean re-standardised
+  B = zs((zs(psr_total) + zs(ec_total) + zs(trust_total)) / 3),
+  phq4_total = phq4_1 + phq4_2 + phq4_3 + phq4_4, phq4_anx = phq4_1 + phq4_2, phq4_dep = phq4_3 + phq4_4,
+  gaais_pos = (gaais_1 + gaais_2 + gaais_3 + gaais_4 + gaais_5 + gaais_6 + gaais_7 + gaais_8 + gaais_9 + 6 - gaais_10) / 10,
+  gaais_neg = (gaais_11 + gaais_12 + gaais_13 + gaais_14 + gaais_15 + gaais_16 + gaais_17 + gaais_18 + 6 - gaais_19 + 6 - gaais_20) / 10,
+  v2_company = (v2_resp_company + v2_cause_company + v2_oblig_company) / 3,
+  v2_sylva = (v2_resp_sylva + v2_cause_sylva + v2_oblig_sylva) / 3,
+  v2_user = (v2_resp_user + v2_cause_user + v2_oblig_user) / 3,
+  gap_v1 = liab_1 - liab_6, gap_v2 = v2_resp_company - v2_resp_sylva,
+  disc_company = v2_cause_company - v2_resp_company, disc_sylva = v2_cause_sylva - v2_resp_sylva,
+  disc_user = v2_cause_user - v2_resp_user,
+  ios_change = ios_t3 - ios_t1)
+D0 <- score(D0); FULL <- score(FULL)
+```
+
+```{r chat-derived}
+# §6.9: computed from chat_log after removing system_error entries. Model-generated replies = assistant entries without the
+# scripted flag, round >= 2, excluding after_end = true & displayed = false (included: after_end = true & displayed = true).
+# Participant turns = role 'user' (the injected opener, 'user_scripted', excluded; failed sends included).
+chat_feats <- function(js) {
+  L <- if (is.na(js)) NULL else tryCatch(fromJSON(js, simplifyVector = FALSE), error = function(e) NULL)
+  if (is.null(L)) return(tibble(.ok = FALSE, incl_rounds = list(numeric(0))))
+  L <- Filter(function(e) !identical(e$role, "system_error"), L)
+  asst <- Filter(function(e) identical(e$role, "assistant") && !isTRUE(e$scripted) && as.numeric(e$round) >= 2, L)
+  nd <- map_lgl(asst, ~ isTRUE(.x$after_end) && identical(.x$displayed, FALSE))
+  bot <- asst[!nd]
+  usr <- Filter(function(e) identical(e$role, "user"), L)
+  wc <- function(s) length(strsplit(trimws(s), "\\s+")[[1]])
+  tok <- map_dbl(bot, ~ if (!is.null(.x$usage$completion_tokens)) as.numeric(.x$usage$completion_tokens) else NA_real_)
+  bw <- map_dbl(bot, ~ wc(.x$content)); rd <- map_dbl(bot, ~ as.numeric(.x$round))
+  fin <- map_chr(bot, ~ if (is.null(.x$finish_reason)) NA_character_ else as.character(.x$finish_reason))
+  u1 <- Filter(function(e) identical(as.numeric(e$round), 1), usr)
+  first <- if (length(bot)) which.min(rd) else integer(0)
+  tibble(.ok = TRUE, n_model_replies = length(bot), n_nondisplayed = sum(nd), n_no_usage = sum(is.na(tok)),
+         incl_rounds = list(rd),
+         bot_tokens_per_turn = if (all(is.na(tok))) NA_real_ else mean(tok, na.rm = TRUE),
+         bot_words_per_reply = if (length(bw)) mean(bw) else NA_real_,
+         first_reply_tokens = if (length(bot)) tok[first] else NA_real_,       # §8.4: earliest displayed model reply, any round
+         first_reply_words = if (length(bot)) bw[first] else NA_real_,
+         bot_q_per_reply = if (length(bot)) mean(map_dbl(bot, ~ str_count(.x$content, fixed("?")))) else NA_real_,
+         bot_excl_per_reply = if (length(bot)) mean(map_dbl(bot, ~ str_count(.x$content, fixed("!")))) else NA_real_,
+         bot_sent_per_reply = if (length(bot)) mean(map_dbl(bot, ~ max(1, str_count(.x$content, "[.!?]+")))) else NA_real_,
+         n_after_end = sum(map_lgl(bot, ~ isTRUE(.x$after_end))),
+         n_finish_not_stop = sum(is.na(fin) | fin != "stop"),                 # §6.9: a missing value counts as not 'stop'
+         n_finish_missing = sum(is.na(fin)), n_finish_length = sum(fin %in% "length"),
+         n_user_turns = length(usr),
+         user_chars_per_turn = if (length(usr)) mean(nchar(map_chr(usr, "content"))) else NA_real_,
+         user_total_chars = sum(nchar(map_chr(usr, "content"))),
+         user_words_per_turn = if (length(usr)) mean(map_dbl(usr, ~ wc(.x$content))) else NA_real_,
+         user_tokens_per_turn = if (length(usr)) mean(nchar(map_chr(usr, "content")) / 4) else NA_real_,
+         first_msg_question = if (length(u1)) grepl("?", u1[[1]]$content, fixed = TRUE) else NA)
+}
+add_chat <- function(d) {
+  cf <- map_dfr(d$chat_log, chat_feats)
+  d <- bind_cols(d, cf) %>% mutate(any_finish_not_stop = n_finish_not_stop > 0,
+                                   chat_wallclock_seconds = as.numeric(difftime(ts_parse(chat_end_time), ts_parse(chat_start_time), units = "secs")))
+  incl <- d %>% select(session_uuid, incl_rounds) %>% unnest_longer(incl_rounds, values_to = "turn_idx")
+  # §6.10.1: W, R, A = mean frozen-probe probability over the participant's model-generated replies (§6.9), joined on session_uuid
+  tp <- tone_turns %>% semi_join(incl, by = c("session_uuid", "turn_idx")) %>% group_by(session_uuid) %>%
+    summarise(W_bar = mean(W), R_bar = mean(R), A_bar = mean(A), n_scored = n(), .groups = "drop")
+  # §6.11: pct_emotional_self_disclosure = coded participant turns / participant turns (joined on session_uuid, §6.10)
+  nu <- nlp_turns %>% filter(role == "user") %>% group_by(session_uuid) %>%
+    summarise(pct_emotional_self_disclosure = mean(emotional_self_disclosure), .groups = "drop")
+  d %>% left_join(tp, by = "session_uuid") %>% left_join(nu, by = "session_uuid") %>%
+    left_join(nlp_flags %>% select(-sona_id), by = "session_uuid")
+}
+D0 <- add_chat(D0); FULL <- add_chat(FULL)
+D <- D0
+stopifnot(all(D$n_scored == D$n_model_replies, na.rm = TRUE))
+kt(D %>% group_by(cell) %>% summarise(n = n(), model_replies = sum(n_model_replies), excluded_displayed_false = sum(n_nondisplayed),
+                                      replies_without_usage = sum(n_no_usage), replies_without_finish_reason = sum(n_finish_missing),
+                                      participants_without_model_reply = sum(is.na(W_bar)), .groups = "drop"),
+   "§6.9 / §7.5 by cell: model-generated replies, excluded late replies (displayed = false), replies without token usage")
+catg("Analytic sample: N = {nrow(D)}; cells: {paste(names(table(D$cell)), table(D$cell), sep = ' = ', collapse = ', ')}; ",
+         "orders: {paste(names(table(D$order)), table(D$order), sep = ' = ', collapse = ', ')}.")
+kt(D %>% group_by(cell) %>% summarise(n = n(), PSR = mean(psr_total), Corp = mean(liab_corp), W_bar = mean(W_bar, na.rm = TRUE),
+                                      G_halo = mean(G_halo), G_halo_E = mean(G_halo_E), ios_t1 = mean(ios_t1),
+                                      tokens = mean(bot_tokens_per_turn, na.rm = TRUE), .groups = "drop"),
+   "Cell means (analytic sample)", 2)
+```
+
+# 4. Reliability (§9.4)
+
+```{r reliability}
+tick("reliability")
+rel_sets <- list(PSR = paste0("psr_", 1:12), PSR_connection = paste0("psr_", 1:4), PSR_desire = paste0("psr_", 5:8),
+  PSR_caring = paste0("psr_", 9:12), EC = paste0("ec_", 1:5), Trust = paste0("tr_", 1:4), ET = paste0("et_", 1:8),
+  MA = paste0("ma_", 1:8), MA_cap = paste0("ma_", c(1, 2, 3, 4, 6, 7)), MP = paste0("mp_", 1:8), Corp = paste0("liab_", 1:5),
+  Chat = paste0("liab_", 6:8), User = paste0("liab_", 9:10), Harm = paste0("liab_", 11:12), PHQ4 = paste0("phq4_", 1:4),
+  V2_company = c("v2_resp_company", "v2_cause_company", "v2_oblig_company"),
+  V2_sylva = c("v2_resp_sylva", "v2_cause_sylva", "v2_oblig_sylva"), V2_user = c("v2_resp_user", "v2_cause_user", "v2_oblig_user"),
+  G_traits = c("tipi_bot_extra", "tipi_bot_agree", "tipi_bot_consc", "tipi_bot_emostab", "tipi_bot_open"),
+  G_halo_traits = c("tipi_bot_consc", "tipi_bot_emostab", "tipi_bot_open"),
+  G_halo_E_items = c("tipi_bot_3", "tipi_bot_8_r", "tipi_bot_4_r", "tipi_bot_10_r"),
+  B_components = c("z_psr", "z_ec", "z_tr"))
+Drel <- D %>% mutate(g10r = 6 - gaais_10, g19r = 6 - gaais_19, g20r = 6 - gaais_20, z_psr = zs(psr_total), z_ec = zs(ec_total), z_tr = zs(trust_total),
+                     across(c(tipi_bot_6, tipi_bot_2, tipi_bot_8, tipi_bot_4, tipi_bot_10, tipi_self_6, tipi_self_2, tipi_self_8, tipi_self_4, tipi_self_10), ~ 8 - .x, .names = "{.col}_r"))
+rel_sets$GAAIS_pos <- c(paste0("gaais_", 1:9), "g10r"); rel_sets$GAAIS_neg <- c(paste0("gaais_", 11:18), "g19r", "g20r")
+for (k in list(c("extra", 1, "6_r"), c("agree", "2_r", 7), c("consc", 3, "8_r"), c("emostab", "4_r", 9), c("open", 5, "10_r"))) {
+  rel_sets[[paste0("TIPIbot_", k[1])]] <- paste0("tipi_bot_", k[2:3]); rel_sets[[paste0("TIPIself_", k[1])]] <- paste0("tipi_self_", k[2:3])
+}
+reliab <- map_dfr(names(rel_sets), function(s) {
+  X <- Drel[, rel_sets[[s]]]; X <- X[complete.cases(X), ]
+  set.seed(42)
+  a <- tryCatch(suppressWarnings(psych::alpha(X, check.keys = FALSE, n.iter = 1000, warnings = FALSE)), error = function(e) NULL)
+  om <- if (ncol(X) >= 3) tryCatch(suppressWarnings(psych::omega(X, nfactors = 1, plot = FALSE, warnings = FALSE))$omega.tot, error = function(e) NA_real_) else NA_real_
+  tibble(composite = s, k = ncol(X), alpha = if (is.null(a)) NA else a$total$raw_alpha,
+         alpha_lo = if (is.null(a) || is.null(a$boot.ci)) NA else a$boot.ci[1], alpha_hi = if (is.null(a) || is.null(a$boot.ci)) NA else a$boot.ci[3],
+         omega = om, r_items = if (ncol(X) == 2) cor(X[[1]], X[[2]]) else NA_real_)
+}) %>% mutate(flag = case_when(grepl("^V2_", composite) ~ "descriptive: mixes responsibility, cause and obligation (§9.4)",
+                               alpha < .70 ~ "alpha < .70: interpret with reliability stated", TRUE ~ ""))
+kt(reliab, "§9.4: Cronbach's alpha (1,000-resample bootstrap 95% CI); omega for k >= 3; inter-item r for k = 2; G, G_halo, G_halo_E and B over their components")
+save_tab(reliab, "reliability")
+```
+
+# 5. Manipulation checks (§8.1)
+
+```{r mc}
+tick("manipulation")
+mc_one <- function(y, f, d = D) { fit <- core(d, y); bind_cols(tibble(outcome = y, factor = f), hc3(fit, f) %>% select(b, lo, hi, p, n), g_marg(d, y, f)) }
+mc_primary <- bind_rows(mc_one("tipi_bot_agree", "A") %>% mutate(check = "MC-A"), mc_one("tipi_bot_extra", "E") %>% mutate(check = "MC-E")) %>%
+  mutate(pass = p < .05 & b > 0)
+mc_supp <- bind_rows(mc_one("mc_agreeableness", "A"), mc_one("mc_extraversion", "E")) %>% mutate(check = "supplemental", pass = p < .05 & b > 0)
+mc_desc <- bind_rows(mc_one("mc_e_energetic", "E"), mc_one("mc_length", "A"), mc_one("mc_length", "E")) %>% mutate(check = "descriptive", pass = NA)
+diffusion <- bind_rows(mc_one("tipi_bot_extra", "A"), mc_one("mc_extraversion", "A"), mc_one("tipi_bot_agree", "E"), mc_one("mc_agreeableness", "E"),
+                       mc_one("tipi_bot_emostab", "A"), mc_one("tipi_bot_emostab", "E"), mc_one("mc_neuroticism", "A"), mc_one("mc_neuroticism", "E")) %>%
+  mutate(check = "diffusion (Bonferroni .00625)", pass = NA, diffusion = p < .05 / 8)
+MC <- bind_rows(mc_primary, mc_supp, mc_desc, diffusion)
+kt(MC %>% select(check, outcome, factor, b, lo, hi, p, g, g_lo, g_hi, pass, diffusion), "Manipulation checks (core model, HC3)")
+MC_A_pass <- mc_primary$pass[mc_primary$check == "MC-A"]; MC_E_pass <- mc_primary$pass[mc_primary$check == "MC-E"]
+# Discriminant criterion: g(target subscale) - g(other manipulated trait's subscale), within-cell bootstrap (informative, not a gate)
+BI <- boot_idx(D$cell4)
+disc_stat <- function(d, f, tgt, oth) g_fast(d[[tgt]][d[[f]] > 0], d[[tgt]][d[[f]] < 0]) - g_fast(d[[oth]][d[[f]] > 0], d[[oth]][d[[f]] < 0])
+discrim <- map_dfr(list(c("A", "tipi_bot_agree", "tipi_bot_extra"), c("E", "tipi_bot_extra", "tipi_bot_agree")), function(z) {
+  est <- disc_stat(D, z[1], z[2], z[3]); bs <- map_dbl(BI, ~ disc_stat(D[.x, ], z[1], z[2], z[3]))
+  tibble(factor = z[1], diff_g = est, lo = q95(bs)[1], hi = q95(bs)[2], met = q95(bs)[1] > 0 | q95(bs)[2] < 0)
+})
+kt(discrim, "Discriminant criterion (informative, not a gate)")
+stopifnot(abs(g_fast(D$psr_total[D$A > 0], D$psr_total[D$A < 0]) - g_marg(D, "psr_total", "A")$g) < 1e-8)
+mc_by_order <- map_dfr(c("impression_first", "bonding_first"), function(o) bind_rows(
+  mc_one("tipi_bot_agree", "A", D[D$order == o, ]), mc_one("tipi_bot_extra", "E", D[D$order == o, ]),
+  mc_one("mc_agreeableness", "A", D[D$order == o, ]), mc_one("mc_extraversion", "E", D[D$order == o, ])) %>% mutate(order = o))
+kt(mc_by_order %>% select(order, outcome, factor, b, lo, hi, p, g), "Primary and supplemental checks by measurement order (§8.1: reported pooled and by order)")
+if (!MC_E_pass) cat("MC-E fails: H2 is reported as an estimate for the extraversion instruction, not for perceived extraversion; H5 is not computed (§8.1).\n")
+if (!MC_A_pass) cat("MC-A fails: H1 is reported as an estimate for the warmth instruction, not for perceived warmth (§8.1).\n")
+save_tab(MC, "manipulation_checks")
+```
+
+# 6. Primary hypotheses (§7.2)
+
+## 6.1 H1: warmth -> PSR
+
+```{r h1}
+tick("H1")
+VC <- vers_cov(D)   # §7.2 H1, §11.1: NULL unless sessions ran under more than one experiment_version
+if (!is.null(VC)) cat("More than one experiment_version: added to the H1, H2 and model-based R2 models as a fixed covariate (§11.1).\n")
+fitP <- core(D, "psr_total", VC)
+h1 <- hc3(fitP, "A"); g1 <- g_marg(D, "psr_total", "A"); fd1 <- fact_d(fitP, "A")
+bf1 <- bf_reg(D, "psr_total", "A"); bf1m <- bf_marg(D, "psr_total", "A"); bf1p <- bf_marg(D, "psr_total", "A", TRUE)
+tost1 <- tost_f(D, "psr_total", "A", .40, "SMD")
+H1_dec <- dec_H1(h1$b, h1$p)
+H1_strict <- h1$b > 0 & h1$p < .05 & bf1 >= 3   # pre-specified descriptor: the stricter joint criterion
+H1_tab <- bind_cols(h1, g1, fd1, tibble(BF10_registered = bf1, BF10_cat = bf_cat(bf1), BF10_ttest = bf1m, BF10_ttest_cat = bf_cat(bf1m), BFplus0 = bf1p,
+                    BFplus0_cat = bf_cat(bf1p), joint_class = joint_class(tost1$equivalent, bf1), decision = H1_dec, strict_joint_met = H1_strict))
+kt(H1_tab %>% select(-term, -t, -df), "H1: A coefficient of the core model on PSR")
+if (!is.null(VC)) kt(map_dfr(sort(unique(D$experiment_version)), function(v) { dv <- D[D$experiment_version == v, ]
+  bind_rows(hc3(core(dv, "psr_total"), "A") %>% mutate(test = "H1 b(A) on PSR"), hc3(core(dv, "psr_total"), "E") %>% mutate(test = "H2 b(E) on PSR"),
+            hc3(core(dv, "liab_corp"), "A") %>% mutate(test = "R2a b(A) on Corporate Liability"), hc3(core(dv, "liab_corp"), "E") %>% mutate(test = "R2b b(E) on Corporate Liability")) %>%
+    mutate(experiment_version = v) }) %>% select(experiment_version, test, b, lo, hi, p, n), "§11.1 sensitivity analyses: per-version estimates")
+# Interpretation conditional on the tone gap (M1): (a)-(d)
+fitW <- core(D, "W_bar"); dWA <- hc3(fitW, "A")
+pred_lo <- 1.8 * dWA$b; pred_hi <- 2.0 * dWA$b
+H1_tone <- tibble(dW_A = dWA$b, tone_pred_lo = pred_lo, tone_pred_hi = pred_hi,
+                  a_prediction_overlaps_CI_of_b = pred_hi >= h1$lo & pred_lo <= h1$hi,
+                  b_weak_tone_manipulation = dWA$b < .14 & H1_dec != "supported",
+                  c_counts_against_strong_form = dWA$b >= .28 & g1$g_hi < .25,
+                  c_factorial_d_alongside = fd1$d_fact_hi,
+                  d_only_through_a = dWA$b >= .14 & dWA$b < .28 & H1_dec != "supported")
+kt(H1_tone, "H1 interpretation conditional on M1 (§7.2 (a)-(d); (c) uses the 95% CI upper bound of Hedges's g, factorial d shown alongside)")
+if (H1_tone$b_weak_tone_manipulation) cat("H1 (b): a weak tone manipulation, not evidence against the tone version.\n")
+if (H1_tone$c_counts_against_strong_form) cat("H1 (c): counts against the tone version in its strong form only (§0.5).\n")
+if (H1_dec == "contradicted") cat("H1 is significant in the direction opposite to the prediction: reported as contradicting H1 (§2.2).\n")
+save_tab(H1_tab, "H1")
+```
+
+## 6.2 R2a / R2b: Corporate Liability equivalence
+
+```{r r2}
+tick("R2")
+fitC <- core(D, "liab_corp", VC)
+R2 <- map_dfr(c("A", "E"), function(f) {
+  tr <- tost_f(D, "liab_corp", f, BOUND_R2, "raw"); ts <- tost_f(D, "liab_corp", f, .40, "SMD")
+  h <- hc3(fitC, f); h90 <- hc3(fitC, f, .90); bf <- bf_reg(D, "liab_corp", f)
+  dec <- dec_R2(tr$p_max, tr$p_t); gm <- g_marg(D, "liab_corp", f)
+  tibble(hyp = ifelse(f == "A", "R2a", "R2b"), factor = f, diff = tr$diff, tost_raw_p = tr$p_max, welch_p = tr$p_t,
+         decision = dec, label = lab_R2(dec, bf), tost_smd_p = ts$p_max, b = h$b, p_hc3 = h$p, ci90_lo = h90$lo, ci90_hi = h90$hi,
+         ci90_within = h90$lo > -BOUND_R2 & h90$hi < BOUND_R2, g = gm$g, g_lo = gm$g_lo, g_hi = gm$g_hi,   # §7.2: g with 95% CI
+         gav = tr$gav, gav_lo90 = tr$gav_lo90, gav_hi90 = tr$gav_hi90,                                     # §7.1: g(av) with 90% CI (TOST)
+         BF10 = bf, BF10_cat = bf_cat(bf),
+         joint_class = joint_class(tr$equivalent, bf),                 # §7.1: the raw-bound TOST that decides R2
+         joint_class_smd_descriptive = joint_class(ts$equivalent, bf),
+         nonzero_but_small = tr$equivalent & tr$p_t < .05)
+})
+kt(R2 %>% select(-factor), "R2a/R2b: Welch TOST, raw bounds ±0.40 (decision), with companions")
+cat("Combined claim (RQ4): ", if (all(R2$decision == "supported")) "both R2a and R2b supported: Corporate Liability unaffected by both traits (average effects)" else
+    if (any(R2$decision == "supported")) paste("only", R2$hyp[R2$decision == "supported"], "supported") else "neither supported", "\n")
+if (any(R2$nonzero_but_small)) cat("Non-zero but smaller than the smallest effect of interest:", R2$hyp[R2$nonzero_but_small], "(still supported).\n")
+# Interaction guard
+hAEc <- hc3(fitC, "A:E")
+simple <- function(d, y, f, at_f, at_v, ci) { dd <- d[d[[at_f]] == at_v, ]; g_marg(dd, y, f, ci) %>% mutate(effect = paste0(f, " at ", at_f, ifelse(at_v > 0, " high", " low"))) }
+se_corp <- bind_rows(simple(D, "liab_corp", "A", "E", .5, .90), simple(D, "liab_corp", "A", "E", -.5, .90),
+                     simple(D, "liab_corp", "E", "A", .5, .90), simple(D, "liab_corp", "E", "A", -.5, .90))
+kt(bind_rows(tibble(effect = "A:E (HC3; raw b, 95% CI)", g = hAEc$b, g_lo = hAEc$lo, g_hi = hAEc$hi), se_corp), glue("Interaction guard: A:E (p = {fp(hAEc$p)}) and the four simple effects (g, 90% CI)"))
+cat(if (hAEc$p < .05) "A:E p < .05: R2 conclusions are restricted to the average (marginal) effect, and the abstract states that the simple effects differ.\n" else
+    "A:E not significant; this is not evidence that the simple effects are equivalent (power .38 at d = 0.40); R2a, R2b and the combined claim concern the average effect.\n")
+save_tab(R2, "R2")
+```
+
+# 7. Estimation questions (§7.2)
+
+## 7.1 H2: extraversion -> PSR and the model comparison
+
+```{r h2}
+tick("H2")
+# Step 1: total effect, on all cases with PSR
+h2 <- hc3(fitP, "E"); g2 <- g_marg(D, "psr_total", "E"); fd2 <- fact_d(fitP, "E"); bf2 <- bf_reg(D, "psr_total", "E")
+bf2m <- bf_marg(D, "psr_total", "E"); bf2p <- bf_marg(D, "psr_total", "E", TRUE)
+tost2 <- tost_f(D, "psr_total", "E", BOUND_PSR, "raw"); tost2s <- tost_f(D, "psr_total", "E", .40, "SMD")
+H2_desc <- desc_H2(h2$b, h2$p, tost2$equivalent)
+# Steps 2-5: the cases complete on PSR, W_bar and G_halo (G_halo_E is complete whenever G_halo is)
+DD <- D %>% filter(!is.na(psr_total), !is.na(W_bar), !is.na(G_halo), !is.na(G_halo_E))
+fitP_DD <- core(DD, "psr_total", vers_cov(DD)); h2_DD <- hc3(fitP_DD, "E"); tost2_DD <- tost_f(DD, "psr_total", "E", BOUND_PSR, "raw")
+H2_desc_DD <- desc_H2(h2_DD$b, h2_DD$p, tost2_DD$equivalent)
+# Step 2: the two inputs (core-model coefficients, HC3; bootstrap CIs below)
+fitW_DD <- core(DD, "W_bar"); fitG_DD <- core(DD, "G_halo")
+dWE <- hc3(fitW_DD, "E"); dWE90 <- hc3(fitW_DD, "E", .90); dGE <- hc3(fitG_DD, "E")
+dWE_about_zero <- dWE90$lo > -.07 & dWE90$hi < .07
+# Steps 3-5: within-cell slopes, each version's prediction, c', D; every quantity recomputed in each within-cell resample
+X <- cbind(1, DD$A, DD$E, DD$A * DD$E)
+h2_stats <- function(i) {
+  Xi <- X[i, , drop = FALSE]; y <- DD$psr_total[i]; w <- DD$W_bar[i]; g <- DD$G_halo[i]; ge <- DD$G_halo_E[i]
+  bE <- ols(Xi, y)[3]; dW <- ols(Xi, w)[3]; dG <- ols(Xi, g)[3]; dGEe <- ols(Xi, ge)[3]
+  fW <- ols(cbind(Xi, w), y); fG <- ols(cbind(Xi, g), y); fGE <- ols(cbind(Xi, ge), y)
+  PT <- fW[5] * dW; PG <- fG[5] * dG; PGE <- fGE[5] * dGEe
+  c(b_E = bE, dW_E = dW, dG_E = dG, dG_E_haloE = dGEe, b_W = fW[5], b_G = fG[5], b_G_haloE = fGE[5],
+    P_T = PT, P_G = PG, P_G_haloE = PGE, cprime_G = bE - PG, cprime_W = bE - PT,
+    D = abs(bE - PG) - abs(bE - PT),                                  # step 4: D = |c'_G| - |c'_W|
+    D_step5 = abs(bE - PGE) - abs(bE - 1.8 * dW),                     # step 5: b_W fixed at 1.8 and G_halo_E for P_G
+    cprime_G_direct = fG[3], cprime_W_direct = fW[3])
+}
+est2 <- h2_stats(seq_len(nrow(DD)))
+stopifnot(abs(est2[["cprime_G"]] - est2[["cprime_G_direct"]]) < 1e-10, abs(est2[["cprime_W"]] - est2[["cprime_W_direct"]]) < 1e-10)
+BI2 <- boot_idx(DD$cell4)
+bs2 <- t(vapply(BI2, h2_stats, numeric(length(est2))))
+H2_boot <- tibble(quantity = names(est2), estimate = unname(est2), lo = apply(bs2, 2, q95)[1, ], hi = apply(bs2, 2, q95)[2, ]) %>%
+  filter(!grepl("_direct$", quantity))
+qb <- function(q) H2_boot[H2_boot$quantity == q, ]
+s4 <- cmp_D(qb("D")$lo, qb("D")$hi); s5 <- cmp_D(qb("D_step5")$lo, qb("D_step5")$hi)
+H2_closer <- dec_H2_closer(s4, s5)
+# Step 4b: fixed-prediction comparison (P_G0 = .17, P_T0 = 0), b_E and its HC3 SE from step 1
+LR <- lr_4b(h2$b, h2$se); H2_4b <- dec_4b(LR)
+LR_DD <- lr_4b(h2_DD$b, h2_DD$se)
+if (dec_4b(LR) != dec_4b(LR_DD)) cat("NOTE: step 4b differs between all cases and the steps 2-5 sample (see log B02).\n")
+# §0.5 impression-version falsifier: ΔG_E 95% CI above 0 and c'_G bootstrap 95% CI entirely below 0
+IMP_falsifier <- dGE$lo > 0 & qb("cprime_G")$hi < 0
+IMP_falsifier_bootGE <- qb("dG_E")$lo > 0 & qb("cprime_G")$hi < 0
+if (IMP_falsifier != IMP_falsifier_bootGE) cat("NOTE: the impression falsifier differs between HC3 and bootstrap CIs of ΔG_E (see log B01).\n")
+H2_tab <- bind_cols(h2 %>% select(b, lo, hi, se, p, n), g2, fd2,
+                    tibble(BF10 = bf2, BF10_ttest = bf2m, BFplus0 = bf2p, joint_class = joint_class(tost2s$equivalent, bf2),
+                           tost_bound = BOUND_PSR, tost_p = tost2$p_max, description = H2_desc,
+                           description_steps2to5_sample = H2_desc_DD, n_steps2to5 = nrow(DD),
+                           dW_E = dWE$b, dW_E_lo = dWE$lo, dW_E_hi = dWE$hi, dW_E_lo90 = dWE90$lo, dW_E_hi90 = dWE90$hi, dW_E_about_zero = dWE_about_zero,
+                           dG_E = dGE$b, dG_E_lo = dGE$lo, dG_E_hi = dGE$hi,
+                           step4 = s4, step5 = s5, model_comparison = H2_closer, LR_4b = LR, step4b = H2_4b, LR_4b_steps2to5 = LR_DD,
+                           impression_falsifier_met = IMP_falsifier, diagnostic_case = dWE_about_zero & dGE$b > 0))
+kt(H2_tab %>% select(b, lo, hi, p, g, g_lo, g_hi, d_fact, d_fact_lo, d_fact_hi, BF10, BFplus0, joint_class, tost_p, description, description_steps2to5_sample, n_steps2to5),
+   "H2 step 1: total effect of E on PSR (all cases with PSR; and on the steps 2-5 sample)")
+kt(H2_tab %>% select(dW_E, dW_E_lo, dW_E_hi, dW_E_lo90, dW_E_hi90, dW_E_about_zero, dG_E, dG_E_lo, dG_E_hi),
+   "H2 step 2: ΔW_E and ΔG_E (core-model coefficients, HC3 CIs)")
+kt(H2_boot, glue("H2 steps 2-5: point estimates and within-cell bootstrap 95% CIs ({params$n_boot} resamples, seed 42; percentile)"))
+kt(H2_tab %>% select(step4, step5, model_comparison, LR_4b, step4b, LR_4b_steps2to5, impression_falsifier_met, diagnostic_case),
+   "H2 steps 4, 4b, 5 and the §0.5 impression-version falsifier")
+catg("H2: {H2_desc}. Model comparison (steps 4-5): {H2_closer}. Fixed-prediction comparison (step 4b): {H2_4b} (LR = {f2(LR)}).")
+cat("Caveat (§7.2): the slopes are within-cell associations of post-treatment measures; the comparison asks which version's prediction is closer, not whether either mediator causes PSR. G_halo and PSR are reported by the same participant and share method variance, and a positive E effect that W_bar does not capture (for example, expressed enthusiasm) would make the impression version's prediction look closer.\n")
+if (!MC_E_pass) cat("MC-E failed: H2 is an estimate for the extraversion instruction, not for perceived extraversion (§8.1).\n")
+amb("B01", "§7.2 H2 step 2; §0.5", "The CI type is not stated for 'ΔW_E is described as about zero if its 90% CI lies within ±.07' or for the falsifier's 'ΔG_E, 95% CI above 0': step 2 quantities are core-model coefficients (HC3 under §7.1), but step 3 says that 95% CIs come from the within-cell bootstrap that recomputes every quantity.",
+    "HC3 CIs decide; the bootstrap CIs are reported, and a disagreement between the two is printed.", "only if HC3 and bootstrap CIs disagree")
+amb("B02", "§7.2 H2 step 4b", "'With b_E and its HC3 standard error SE_E from step 1': step 1 is reported on all cases with PSR and again on the steps 2-5 sample, and step 4b sits inside steps 2-5, whose estimates use that sample.",
+    "All cases with PSR (step 1's primary estimate); the steps 2-5 version is reported and a disagreement is printed.", "only if the two samples differ")
+save_tab(H2_tab, "H2"); save_tab(H2_boot, "H2_bootstrap")
+```
+
+## 7.2 H3: A x E on PSR
+
+```{r h3}
+hAE <- hc3(fitP, "A:E"); s_p <- sigma(fitP)
+fitPG <- core(D, "psr_total", "G_halo"); hAEg <- hc3(fitPG, "A:E")
+H3_simple <- bind_rows(simple(D, "psr_total", "A", "E", .5, .95), simple(D, "psr_total", "A", "E", -.5, .95),
+                       simple(D, "psr_total", "E", "A", .5, .95), simple(D, "psr_total", "E", "A", -.5, .95))
+H3_tab <- tibble(b_AE = hAE$b, lo = hAE$lo, hi = hAE$hi, p = hAE$p, d_diff = hAE$b / s_p, d_diff_lo = hAE$lo / s_p, d_diff_hi = hAE$hi / s_p,
+                 b_AE_adj_Ghalo = hAEg$b, lo_adj = hAEg$lo, hi_adj = hAEg$hi, p_adj = hAEg$p,
+                 statement = ifelse(hAE$p < .05, "interaction detected; H1 concerns the average warmth effect",
+                                    "not significant; reported with its CI, not evidence of no interaction"))
+kt(H3_tab, "H3: A:E coefficient (raw, and in factorial-d units = A:E / sqrt(MSE) of the core model)")
+kt(H3_simple, "H3: the four simple effects (Hedges's g, 95% CI)")
+save_tab(H3_tab, "H3")
+```
+
+# 8. Secondary outcomes family (§7.3)
+
+```{r secondary}
+tick("secondary family")
+SEC <- c(ec_total = "Emotional Connection", trust_total = "Trust", et_total = "Experience-Taking", ma_total = "Moral Agency",
+         mp_total = "Moral Patiency", liab_chat = "Chatbot Responsibility", liab_user = "User Responsibility", liab_harm = "Harm Severity")
+SECF <- map_dfr(names(SEC), function(y) map_dfr(c("A", "E"), function(f) {
+  fit <- core(D, y); h <- hc3(fit, f); bf <- bf_reg(D, y, f); ts <- tost_f(D, y, f, .40, "SMD")
+  bind_cols(tibble(outcome = SEC[[y]], var = y, factor = f, b = h$b, p = h$p), g_marg(D, y, f), fact_d(fit, f),
+            tibble(BF10 = bf, joint_class = joint_class(ts$equivalent, bf)))
+})) %>% mutate(q_BH = p.adjust(p, "BH"), finding = q_BH < .05, label = ifelse(finding & BF10 < 3, "weak Bayesian evidence", ""))
+kt(SECF %>% select(-var), "Secondary family: 16 tests, BH-FDR (Harm Severity alpha stated with any result, §6.3)")
+save_tab(SECF, "secondary_family")
+```
+
+# 9. Secondary predictions (§8.2-§8.13)
+
+## 9.1 S1 (§8.2)
+
+```{r s1}
+tick("S1-U1-M2-M1")
+D$Aself_z <- zs(D$tipi_self_agree)
+fitS1 <- lm(psr_total ~ A * Aself_z + E, data = D); hS1 <- hc3(fitS1, "A:Aself_z")
+V <- vcovHC(fitS1, type = "HC3")
+S1_simple <- map_dfr(c(-1, 0, 1), function(z) { b <- coef(fitS1)["A"] + z * coef(fitS1)["A:Aself_z"]
+  se <- sqrt(V["A", "A"] + z^2 * V["A:Aself_z", "A:Aself_z"] + 2 * z * V["A", "A:Aself_z"]); q <- qt(.975, df.residual(fitS1))
+  tibble(Aself_z = z, b_A = unname(b), lo = unname(b - q * se), hi = unname(b + q * se)) })
+hS1r <- hc3(lm(psr_total ~ A * Aself_z + E + E:Aself_z + A:E, data = D), "A:Aself_z")
+kt(bind_rows(hS1 %>% mutate(model = "registered"), hS1r %>% mutate(model = "robustness (+E:Aself_z, A:E)")) %>% select(model, b, lo, hi, p), "S1: A x TIPI-Self Agreeableness on PSR (Holm with D2, §8.14)")
+kt(S1_simple, "S1: simple effects of A at -1 SD, the mean and +1 SD")
+```
+
+## 9.2 U1 (§8.3)
+
+```{r u1}
+rel_ok <- function(code) { r <- nlp_rel[nlp_rel$code == code, ]
+  nrow(r) == 1 && min(r$mean_pairwise_kappa, r$fleiss_kappa, r$kripp_alpha) >= .60 && r$human_human_kappa >= .60 && r$human_llm_kappa >= .60 }
+# Order of events (§8.3): the §7.4 criteria are evaluated (and recorded on OSF) before the U1a correlation is computed
+U1a_testable <- rel_ok("emotional_self_disclosure")
+U2_testable <- U1a_testable && rel_ok("mirroring_user_emotion")   # §8.12 / §7.4: U2 needs both codes (see log B07)
+kt(nlp_rel %>% mutate(meets_7.4 = map_lgl(code, rel_ok)), "§7.4 reliability tiers and human-validation criterion for the U1a/U2 codes")
+amb("B07", "§8.3 (order of events); §8.12; §7.4", "§8.3 says that if `emotional_self_disclosure` fails the §7.4 criteria, 'U1a is reported as not testable ... and U2 is tested alone at α = .05', but §8.12 ('Requires both codes') and §7.4 ('emotional_self_disclosure for U1a and U2') make the same code the U2 predictor, so U2 cannot be tested when it fails.",
+    "U2 is 'not testable' whenever `emotional_self_disclosure` fails (§8.12, §7.4); the α = .05 fallback is applied to U1a when only `mirroring_user_emotion` fails (§8.3, last sentence).", "only if the disclosure code fails §7.4")
+ct <- if (U1a_testable) cor.test(D$phq4_total, D$pct_emotional_self_disclosure) else NULL
+# U1b (estimation, no decision; PI decision 18): PHQ-4 coefficient, its BF10, and the indirect effect
+fitU1b <- core(D, "psr_total", "phq4_total"); hU <- hc3(fitU1b, "phq4_total")
+hUz <- hc3(lm(zs(psr_total) ~ A * E + zs(phq4_total), data = D), "zs(phq4_total)")
+dd <- D %>% filter(!is.na(psr_total), !is.na(phq4_total)) %>% transmute(y = psr_total, Af = factor(A), Ef = factor(E), phq = phq4_total)
+set.seed(42)
+bfU1b <- exp((lmBF(y ~ Af + Ef + Af:Ef + phq, data = dd, rscaleFixed = .5, rscaleCont = "medium", iterations = params$bf_iter, progress = FALSE) /
+              lmBF(y ~ Af + Ef + Af:Ef, data = dd, rscaleFixed = .5, iterations = params$bf_iter, progress = FALSE))@bayesFactor$bf)
+U1b_ind <- NULL
+if (U1a_testable) {
+  du <- D %>% transmute(phq = phq4_total, esd = pct_emotional_self_disclosure, psr = psr_total) %>% filter(complete.cases(.))
+  u1mod <- "esd ~ a*phq
+            psr ~ b*esd + c*phq
+            ind := a*b"
+  u1fit <- tryCatch(sem(u1mod, data = du, se = "bootstrap", bootstrap = params$lavaan_boot, iseed = 42), error = function(e) { fail("U1b lavaan", conditionMessage(e)); NULL })
+  if (!is.null(u1fit)) U1b_ind <- parameterEstimates(u1fit, boot.ci.type = "perc") %>% filter(label %in% c("a", "b", "c", "ind")) %>% select(label, est, ci.lower, ci.upper)
+}
+U1 <- tibble(U1a_testable = U1a_testable, r = if (U1a_testable) unname(ct$estimate) else NA, r_lo = if (U1a_testable) ct$conf.int[1] else NA,
+             r_hi = if (U1a_testable) ct$conf.int[2] else NA, p_U1a = if (U1a_testable) ct$p.value else NA,
+             U1b_b_phq = hU$b, U1b_lo = hU$lo, U1b_hi = hU$hi, U1b_beta_std = hUz$b, U1b_beta_lo = hUz$lo, U1b_beta_hi = hUz$hi,
+             U1b_BF10 = bfU1b, U1b = "estimate (no decision)",
+             U1b_indirect = if (is.null(U1b_ind)) NA else U1b_ind$est[U1b_ind$label == "ind"],
+             U1b_indirect_lo = if (is.null(U1b_ind)) NA else U1b_ind$ci.lower[U1b_ind$label == "ind"],
+             U1b_indirect_hi = if (is.null(U1b_ind)) NA else U1b_ind$ci.upper[U1b_ind$label == "ind"])
+if (U1a_testable) {
+  sp <- cor.test(D$phq4_total, D$pct_emotional_self_disclosure, method = "spearman", exact = FALSE)
+  # partial r controlling for cell (three dummies) and the number of participant turns (§6.9: role 'user' entries)
+  pr <- psych::partial.r(data.frame(phq = D$phq4_total, esd = D$pct_emotional_self_disclosure, c2 = D$cell4 == "highA_lowE",
+                                    c3 = D$cell4 == "lowA_highE", c4 = D$cell4 == "lowA_lowE", nturn = D$n_user_turns), 1:2, 3:6)[1, 2]
+  U1 <- U1 %>% mutate(spearman = unname(sp$estimate), partial_r_cell_turns = pr)
+}
+kt(U1 %>% select(-starts_with("U1b")), "U1a (Pearson r; Holm with U2 in notebook section 10 below)")
+kt(U1 %>% select(starts_with("U1b")), "U1b: estimates only (PHQ-4 coefficient raw and standardised, BF10, indirect effect via disclosure)")
+```
+
+## 9.3 M2: length equivalence (§8.4)
+
+```{r m2}
+share_no_usage <- sum(D$n_no_usage, na.rm = TRUE) / sum(D$n_model_replies, na.rm = TRUE)
+idx <- if (share_no_usage > .05) "bot_words_per_reply" else "bot_tokens_per_turn"
+cm <- D %>% group_by(cell) %>% summarise(m = mean(.data[[idx]], na.rm = TRUE), n = sum(!is.na(.data[[idx]])), no_usage_turns = sum(n_no_usage), .groups = "drop")
+GM <- mean(cm$m); bound <- .075 * GM
+m2f <- map_dfr(c("A", "E"), function(f) tost_f(D, idx, f, bound, "raw") %>% mutate(factor = f))
+cm <- cm %>% mutate(dev_pct = 100 * (m - GM) / GM, within = abs(m - GM) <= bound)
+pairs <- combn(cm$cell, 2, simplify = FALSE)
+m2pairs <- map_dfr(pairs, function(pp) tost_welch(D[[idx]][D$cell == pp[1]], D[[idx]][D$cell == pp[2]], bound, "raw") %>% mutate(pair = paste(pp, collapse = " vs ")))
+M2_dec <- all(m2f$equivalent) & all(cm$within)
+kt(cm, glue("M2 cell means of {idx}; unweighted grand mean {f2(GM)}; bound ±{f2(bound)}; {sum(cm$no_usage_turns)} model replies without usage ({f3(share_no_usage)})"))
+kt(m2f %>% select(factor, diff, gav, gav_lo90, gav_hi90, p_max, equivalent), "M2 factor-level Welch TOSTs")
+kt(m2pairs %>% select(pair, diff, p_max, equivalent), "M2 pairwise cell TOSTs (descriptive)")
+cat("M2:", sup(M2_dec), "\n")
+m2_secondary <- map_dfr(c("bot_words_per_reply", "first_reply_words", "first_reply_tokens", "mc_length"), function(y)
+  map_dfr(c("A", "E"), function(f) bind_cols(tibble(index = y, factor = f), hc3(core(D, y), f) %>% select(b, lo, hi, p))))
+kt(m2_secondary, "M2 secondary length indices (not part of the decision)")
+wc <- function(s) length(strsplit(trimws(s), "\\s+")[[1]])
+kt(D1MAT$table %>% select(cell, S0_words, S1_words) %>%
+     mutate(S0_words_recount = map_dbl(cell, ~ wc(MAT$scripts[[.x]][["S0"]])), S1_words_recount = map_dbl(cell, ~ wc(MAT$scripts[[.x]][["S1"]]))),
+   "Scripted turns: word counts (fixed; Appendix D.1, and a whitespace recount of the D.1 texts)")
+# E2 (§9.5): verbosity mediation, factor -> bot_tokens_per_turn -> PSR, EC, Trust (lavaan, 5,000 bootstrap resamples, iseed = 42).
+# It is exploratory, and §8.4 requires it next to H1/H2 if M2 fails.
+e2_fit <- function(d) {
+  de <- d %>% transmute(tok = bot_tokens_per_turn / 10, psr = psr_total, ec = ec_total, trust = trust_total, A, E, AE = A * E) %>% filter(complete.cases(.))
+  mod <- "tok ~ aA*A + aE*E + AE
+          psr ~ bP*tok + A + E + AE
+          ec ~ bC*tok + A + E + AE
+          trust ~ bT*tok + A + E + AE
+          A_PSR := aA*bP
+          A_EC := aA*bC
+          A_Trust := aA*bT
+          E_PSR := aE*bP
+          E_EC := aE*bC
+          E_Trust := aE*bT"
+  fit <- tryCatch(sem(mod, data = de, se = "bootstrap", bootstrap = params$lavaan_boot, iseed = 42), error = function(e) { fail("E2 lavaan", conditionMessage(e)); NULL })
+  if (is.null(fit)) return(NULL)
+  parameterEstimates(fit, boot.ci.type = "perc") %>% filter(op == ":=") %>% transmute(indirect = lhs, est, ci.lower, ci.upper)
+}
+E2 <- e2_fit(D)
+vb <- map_dfr(c(H1 = "A", H2 = "E"), function(f) hc3(core(D %>% filter(!is.na(bot_tokens_per_turn)), "psr_total", c("bot_tokens_per_turn", VC)), f)) %>%
+  mutate(estimate = c("H1 verbosity-adjusted b(A)", "H2 verbosity-adjusted b(E)"))
+if (!M2_dec) kt(vb %>% select(estimate, b, lo, hi, p), "M2 failed (§8.4): verbosity-adjusted estimates (check 10) reported next to H1/H2; reply length differed by condition")
+if (!M2_dec && !is.null(E2)) kt(E2 %>% filter(indirect %in% c("A_PSR", "E_PSR")), "M2 failed (§8.4): E2 indirect effects on PSR via bot tokens per turn (per 10 tokens)")
+```
+
+## 9.4 M1: tone gap (§8.5)
+
+```{r m1}
+fitR <- core(D, "R_bar"); fitAa <- core(D, "A_bar")
+M1 <- bind_rows(hc3(fitW, "A") %>% mutate(score = "W_bar", factor = "A"), hc3(fitW, "E") %>% mutate(score = "W_bar", factor = "E"),
+                hc3(fitR, "A") %>% mutate(score = "R_bar", factor = "A"), hc3(fitR, "E") %>% mutate(score = "R_bar", factor = "E"),
+                hc3(fitAa, "A") %>% mutate(score = "A_bar", factor = "A"), hc3(fitAa, "E") %>% mutate(score = "A_bar", factor = "E"))
+M1_pass <- with(M1[M1$score == "W_bar" & M1$factor == "A", ], b > 0 & p < .05)
+kt(M1 %>% select(score, factor, b, lo, hi, p, n), glue("M1: frozen-probe tone scores over model-generated replies. M1 {pass(M1_pass)}."))
+kt(D1MAT$table %>% select(cell, W_S0, W_S1, W_mean, R_S0, R_S1),
+   glue("Fixed frozen-probe scores of the scripted turns by cell (Appendix D.1); ΔW_script = {f3(DW_SCRIPT)}"))
+catg("Benchmark (§8.5): Study 1 gap .28 (all bot turns); thresholds .28 and .14. ΔW_A = {f3(dWA$b)}.")
+save_tab(M1, "M1")
+```
+
+## 9.5 H4: impression versus placebo adjustment (§8.6)
+
+```{r h4}
+tick("H4-H5")
+H4_adj <- c(G_halo = "G_halo", MA = "ma_total", MP = "mp_total", ET = "et_total",
+            C_ES = "G_c_es", C_O = "G_c_o", ES_O = "G_es_o", ES = "tipi_bot_emostab")
+PLAC <- c("MA", "MP", "ET")
+# §8.6 sample: complete on PSR, G_halo, Moral Agency, Moral Patiency and Experience-Taking (the composition scores are complete with G_halo)
+D4 <- D %>% filter(if_all(c(psr_total, all_of(unname(H4_adj))), ~ !is.na(.x)))
+X4 <- cbind(1, D4$A, D4$E, D4$A * D4$E); M4 <- as.matrix(D4[, unname(H4_adj)]); colnames(M4) <- names(H4_adj)
+h4_stats <- function(i, fac = 2) {
+  Xi <- X4[i, , drop = FALSE]; y <- D4$psr_total[i]; b0 <- ols(Xi, y)[fac]
+  badj <- aX <- bX <- setNames(numeric(ncol(M4)), colnames(M4))
+  for (k in colnames(M4)) { x <- M4[i, k]; f <- ols(cbind(Xi, x), y); badj[k] <- f[fac]; bX[k] <- f[5]; aX[k] <- ols(Xi, x)[fac] }
+  S <- 1 - badj / b0
+  c(b_total = b0, setNames(badj, paste0("b_adj_", names(badj))), setNames(S, paste0("S_", names(S))),
+    setNames(aX, paste0("a_", names(aX))), setNames(bX, paste0("slope_", names(bX))),
+    setNames(badj[PLAC] - badj["G_halo"], paste0("b(.|", PLAC, ") - b(.|G_halo)")),
+    setNames(badj["G_halo"] - badj[PLAC], paste0("b(.|G_halo) - b(.|", PLAC, ")")),
+    setNames(S["G_halo"] - S[PLAC], paste0("S_G - S_", PLAC)))
+}
+BI4 <- boot_idx(D4$cell4)
+h4_run <- function(fac) {
+  est <- h4_stats(seq_len(nrow(D4)), fac); bs <- t(vapply(BI4, h4_stats, numeric(length(est)), fac = fac))
+  tibble(stat = names(est), estimate = unname(est), lo = apply(bs, 2, q95)[1, ], hi = apply(bs, 2, q95)[2, ])
+}
+H4A <- h4_run(2)
+h4v <- function(tab, s) tab[tab$stat == s, ]
+H4_rule <- dec_H4(h4v(H4A, "S_G_halo")$estimate, h4v(H4A, paste0("b(.|", PLAC, ") - b(.|G_halo)"))$lo, h4v(H4A, paste0("b(.|G_halo) - b(.|", PLAC, ")"))$lo)
+H4_dec <- if (H1_dec == "supported") H4_rule else "not testable"      # §8.6, §8.14: evaluated only if H1 is supported
+H4_comp <- if (H1_dec == "supported" && h4v(H4A, "S_G_halo")$estimate >= .50 && h4v(H4A, "S_C_O")$estimate < .50)   # label only when H4 is evaluated
+  "absorbed mainly by perceived emotional stability, which overlaps in meaning with perceived hostility" else ""
+kt(H4A, glue("H4 (warmth): S_X = 1 - b(A|X)/b(A), components a_X and slope_X, and the decision differences (bootstrap 95% CIs). Decision: {H4_dec}",
+             "{ifelse(H1_dec == 'supported', '', paste0(' (rule applied descriptively: ', H4_rule, ')'))}"))
+if (nchar(H4_comp)) cat("H4 composition (PI decision 15):", H4_comp, "\n")
+cat("Interpretation (§8.6): a supported H4 shows that warmth moved the trait impression more than the comparison ratings, while all are associated with PSR within cells; it does not show that the impression, rather than another warmth-related rating, accounts for the effect. Post-treatment adjustment: not mediation.\n")
+H4E <- if (startsWith(H2_desc, "positive effect detected")) h4_run(3) else NULL
+if (!is.null(H4E)) kt(H4E, "H4 (extraversion): the same statistics for b(E), reported because H2 = positive effect detected")
+H4_order <- map_dfr(c("impression_first", "bonding_first"), function(o) {
+  k <- which(D4$order == o); BIo <- boot_idx(D4$cell4[k])
+  sg <- function(ii) { i <- k[ii]; Xi <- X4[i, , drop = FALSE]; y <- D4$psr_total[i]; 1 - ols(cbind(Xi, D4$G_halo[i]), y)[2] / ols(Xi, y)[2] }
+  bs <- map_dbl(BIo, sg)
+  tibble(order = o, n = length(k), S_G = sg(seq_along(k)), lo = q95(bs)[1], hi = q95(bs)[2]) })
+kt(H4_order, "H4 by measurement order: S_G with bootstrap 95% CIs (no robustness label, §8.6, §8.13)")
+save_tab(bind_rows(H4A %>% mutate(factor = "A"), if (!is.null(H4E)) H4E %>% mutate(factor = "E"),
+                   H4_order %>% transmute(stat = paste0("S_G_halo [", order, "]"), estimate = S_G, lo, hi, factor = "A")), "H4")
+```
+
+## 9.6 H5: halo ratios (§8.7)
+
+```{r h5}
+H5_num <- c(A = "tipi_bot_agree", C = "tipi_bot_consc", ES = "tipi_bot_emostab", O = "tipi_bot_open", GE = "G_halo_E", G = "G_halo")
+H5_pred <- c(A = .21, C = .20, ES = .27, O = .41, GE = .30, G = .29)
+H5_items <- paste0("tipi_bot_", c(4, 5, 9, 10))
+D5 <- D %>% filter(if_all(c(tipi_bot_extra, tipi_bot_agree, tipi_bot_consc, tipi_bot_emostab, tipi_bot_open), ~ !is.na(.x)))
+X5 <- cbind(1, D5$A, D5$E, D5$A * D5$E)
+h5_stats <- function(i, fac = 3, base = "tipi_bot_extra", num = H5_num) {
+  Xi <- X5[i, , drop = FALSE]; bE <- ols(Xi, D5[[base]][i])[fac]
+  c(setNames(vapply(num, function(v) ols(Xi, D5[[v]][i])[fac] / bE, numeric(1)), paste0("ratio_", names(num))),
+    setNames(vapply(H5_items, function(v) ols(Xi, D5[[v]][i])[fac], numeric(1)), paste0("b_E_", H5_items)))
+}
+H5 <- NULL; H5_dec <- "not testable"     # §8.7, §8.14: computed only if MC-E passes
+if (MC_E_pass) {
+  BI5 <- boot_idx(D5$cell4); est5 <- h5_stats(seq_len(nrow(D5))); bs5 <- t(vapply(BI5, h5_stats, numeric(length(est5))))
+  H5 <- tibble(quantity = names(est5), estimate = unname(est5), lo = apply(bs5, 2, q95)[1, ], hi = apply(bs5, 2, q95)[2, ],
+               predicted = c(unname(H5_pred), rep(NA, length(H5_items)))) %>%
+    mutate(predicted_in_CI = ifelse(is.na(predicted), NA, lo <= predicted & hi >= predicted),
+           role = case_when(quantity == "ratio_GE" ~ "decision (pooled, G_halo_E)",
+                            quantity %in% c("ratio_ES", "ratio_O", "ratio_G") ~ "reported: halo or content overlap",
+                            TRUE ~ "reported"))
+  H5_dec <- sup(H5$lo[H5$quantity == "ratio_GE"] > 0)
+  tA <- c(E = "tipi_bot_extra", C = "tipi_bot_consc", ES = "tipi_bot_emostab", O = "tipi_bot_open")
+  H5_Afactor <- tibble(trait = names(tA), ratio = unname(h5_stats(seq_len(nrow(D5)), 2, "tipi_bot_agree", tA)[paste0("ratio_", names(tA))]))
+  save_tab(H5, "H5")
+} else cat("H5 not computed: MC-E failed (precondition, §8.7, §8.14).\n")
+if (!is.null(H5)) kt(H5, glue("H5: ratios b_E(TIPI X) / b_E(TIPI Extraversion), pooled ratio with G_halo_E, item-level E effects ({params$n_boot} within-cell bootstrap resamples, 95% CIs). Decision: {H5_dec}"))
+if (!is.null(H5)) kt(H5_Afactor, "Exploratory: analogous ratios for the A factor")
+if (!is.null(H5)) cat("A positive halo ratio shows spillover between trait ratings; it does not separate a global evaluation from an evaluative or response-style halo (§8.7).\n")
+```
+
+## 9.7 D2 and D1: closeness dynamics (§8.8)
+
+```{r d1d2}
+tick("D1-D2")
+SD_t1 <- pooled_within_sd(D$ios_t1, D$cell4)
+fitI1 <- core(D, "ios_t1"); d2 <- hc3(fitI1, "A"); d2E <- hc3(fitI1, "E")
+fitPW <- core(D, "psr_total", "W_bar"); bW <- hc3(fitPW, "W_bar")
+d2_tost <- tost_coef(fitI1, "A", .40 * SD_t1)                     # §8.8 falsifier: ±0.40 x SD_t1 (PI decision 14), HC3 coefficient TOST
+D2_falsifier <- d2_tost$equivalent & bW$b > 0 & bW$p < .05
+d1_decide <- function(d) {
+  sd1 <- pooled_within_sd(d$ios_t1, d$cell4)
+  f <- core(d, "ios_change"); h <- hc3(f, "A"); tt <- tost_coef(f, "A", .30 * sd1)
+  sb <- d %>% group_by(cell) %>% summarise(n = n(), share_at_1 = mean(ios_t1 == 1), share_at_7 = mean(ios_t1 == 7), .groups = "drop")
+  bound <- any(sb$share_at_1 > .20) || any(sb$share_at_7 > .20)
+  list(SD_t1 = sd1, b = h$b, lo = h$lo, hi = h$hi, p = h$p, delta = h$b / sd1, tost_bound = .30 * sd1, tost_p = tt$p_max,
+       tost_eq = tt$equivalent, scale_bound = bound, shares = sb, decision = dec_D1(h$b, h$p, tt$equivalent, bound), n = nrow(d))
+}
+D1 <- d1_decide(D)
+D1_interp <- if (startsWith(D1$decision, "first impression")) {
+  if (dWA$b >= DW_SCRIPT) "support for a first-impression account (ΔW_A >= ΔW_script)" else
+    "the warmth gap did not grow: consistent with a first impression or with free chat that is less differentiated than the scripted opening; not distinguished"
+} else if (D1$decision == "narrowing") {
+  paste0("the static first-impression account is incomplete in the other direction (§0.5)",
+         if (dWA$b < DW_SCRIPT) "; a narrowing gap is also expected if closeness follows free chat that is less differentiated than the scripted opening" else "")
+} else if (D1$decision == "accumulation") "a static impression account is incomplete; an accumulation account is needed (§0.5)" else
+  if (D1$decision == "not interpretable: scale bound") "neither first impression nor narrowing can be concluded: a floor in the cold cells or a ceiling in the warm cells moves b(A) on the change score downward" else
+  "not resolved"
+DD12 <- tibble(quantity = c("D2 b(A) on ios_t1", "D2 b(A) in SD_t1 units", "D2 E effect on ios_t1 (estimate)",
+                            "D2 falsifier: coefficient TOST, bound ±0.40 x SD_t1 (raw IOS points in 'bound')", "b_W in lm(PSR ~ A * E + W_bar)",
+                            "D1 b(A) on ios_change", "D1 delta = b(A) / SD_t1", "D1 coefficient TOST, bound ±0.30 x SD_t1 (raw IOS points)"),
+               estimate = c(d2$b, d2$b / SD_t1, d2E$b, d2_tost$b, bW$b, D1$b, D1$delta, D1$b),
+               lo = c(d2$lo, d2$lo / SD_t1, d2E$lo, NA, bW$lo, D1$lo, D1$lo / D1$SD_t1, NA),
+               hi = c(d2$hi, d2$hi / SD_t1, d2E$hi, NA, bW$hi, D1$hi, D1$hi / D1$SD_t1, NA),
+               bound = c(NA, NA, NA, .40 * SD_t1, NA, NA, NA, D1$tost_bound),
+               p = c(d2$p, d2$p, d2E$p, d2_tost$p_max, bW$p, D1$p, NA, D1$tost_p))
+kt(DD12, glue("D2 / D1 (SD_t1 = {f3(SD_t1)}). D2 falsifier met: {D2_falsifier}. D1: {D1$decision}."))
+kt(D1$shares %>% mutate(flag_floor = share_at_1 > .20, flag_ceiling = share_at_7 > .20), glue("D1 scale-bound rule at probe 1 (per bound, any cell > 20%): triggered = {D1$scale_bound}"))
+catg("D1 interpretation: {D1_interp}. ΔW_script = {f3(DW_SCRIPT)}, ΔW_A = {f3(dWA$b)}.")
+if (startsWith(D1$decision, "first impression") || D1$decision == "narrowing")
+  cat("Limitation (§8.8): the identical item is answered three times, so earlier answers may anchor later ones.\n")
+if (D2_falsifier) cat("D2 falsifier met: tone in the user-independent opening does not move closeness, but co-produced tone does; counts against the tone version (§0.5).\n")
+cat("What D2 can show (§8.8): effects of 'the warm and cold scripted openings'; not that tone, rather than other content of these texts, is responsible.\n")
+# Trajectory (reported with D1) and the ordinal::clmm analysis (§8.8; required when the scale-bound rule is triggered)
+long <- D %>% select(session_uuid, A, E, ios_t1, ios_t2, ios_t3, ios_t1_elapsed, ios_t2_elapsed, ios_t3_elapsed) %>%
+  pivot_longer(c(ios_t1, ios_t2, ios_t3), names_to = "probe", values_to = "ios") %>%
+  mutate(time = c(ios_t1 = 0, ios_t2 = .5, ios_t3 = 1)[probe],
+         elapsed = case_when(probe == "ios_t1" ~ ios_t1_elapsed, probe == "ios_t2" ~ ios_t2_elapsed, TRUE ~ ios_t3_elapsed) / 600) %>%
+  filter(!is.na(ios))
+traj <- lmer(ios ~ A * E * time + (1 | session_uuid), data = long)
+traj2 <- lmer(ios ~ A * E * elapsed + (1 | session_uuid), data = long)
+gapA <- function(fit, tv) { b <- fixef(fit); V <- as.matrix(vcov(fit)); nm <- names(b); tn <- nm[grepl("^A:(time|elapsed)$", nm)]
+  map_dfr(tv, function(t) { L <- setNames(rep(0, length(b)), nm); L["A"] <- 1; L[tn] <- t; est <- sum(L * b); se <- sqrt(drop(t(L) %*% V %*% L))
+    tibble(time = t, A_gap = est, lo = est - 1.96 * se, hi = est + 1.96 * se) }) }
+kt(bind_rows(gapA(traj, c(0, .5, 1)) %>% mutate(model = "lmer, time = 0/.5/1"), gapA(traj2, c(11/600, .5, 1)) %>% mutate(model = "lmer, time = active seconds / 600")),
+   "Trajectory: model-implied warmth gap in IOS at each probe")
+lc <- long %>% transmute(ios = factor(ios, ordered = TRUE), A, E, time = elapsed, pid = factor(session_uuid)) %>% as.data.frame()
+t_clmm <- Sys.time()
+clmm_fit <- tryCatch(ordinal::clmm(ios ~ A * E * time + (1 | pid), data = lc), error = function(e) { fail("D1 clmm", conditionMessage(e)); NULL })
+t_clmm <- as.numeric(difftime(Sys.time(), t_clmm, units = "secs"))
+CLMM <- if (is.null(clmm_fit)) NULL else { cs <- summary(clmm_fit)$coefficients
+  tibble(term = "A:time", estimate = cs["A:time", "Estimate"], se = cs["A:time", "Std. Error"], p = cs["A:time", "Pr(>|z|)"],
+         sign = ifelse(cs["A:time", "Estimate"] > 0, "+", "-"), required = D1$scale_bound) }
+if (!is.null(CLMM)) kt(CLMM, glue("ordinal::clmm(ios ~ A * E * time + (1 | participant)), time = ios_tK_elapsed / 600: sign and p of A:time ",
+                                  "({ifelse(D1$scale_bound, 'required: scale bound triggered', 'reported; required only when the scale bound is triggered')}; {round(t_clmm)} s)"))
+ceil <- D %>% select(cell, ios_t1, ios_t2, ios_t3) %>% pivot_longer(-cell) %>% filter(!is.na(value)) %>% group_by(cell, name) %>%
+  summarise(p_at_7 = mean(value == 7), p_at_1 = mean(value == 1), .groups = "drop") %>% mutate(flag = p_at_7 > .20 | p_at_1 > .20)
+kt(ceil, "IOS floor/ceiling by probe and cell (flag > 20%)")
+catg("r(ios_t3, PSR) = {f3(cor(D$ios_t3, D$psr_total))} (convergent validity, expected >= .50); probe 2 not triggered for {sum(D$ios_t2_status == 'not_triggered')} participants. ",
+         "Limitation: all participants answer the probes, so probe reactivity cannot be estimated.")
+save_tab(DD12 %>% mutate(D1_decision = D1$decision, D1_scale_bound = D1$scale_bound, D2_falsifier = D2_falsifier), "D1_D2")
+```
+
+## 9.8 R1, R3, R4, R5: the responsibility template (§8.9)
+
+```{r r1}
+tick("R1-R6")
+R1c <- D %>% group_by(cell) %>% group_modify(~ {
+  bind_cols(tibble(m_company = mean(.x$liab_1), m_sylva = mean(.x$liab_6), m_user = mean(.x$liab_9)),
+            paired_ci(.x$liab_1, .x$liab_6) %>% rename_with(~ paste0("cs_", .x)),
+            paired_ci(.x$liab_9, .x$liab_1) %>% rename_with(~ paste0("uc_", .x))) }) %>% ungroup() %>%
+  mutate(sylva_lowest = m_sylva < pmin(m_company, m_user), cs_above0 = cs_lo > 0, sylva_above_company = m_sylva > m_company & cs_hi < 0)
+uc_pool <- paired_ci(D$liab_9, D$liab_1); cs_pool <- paired_ci(D$liab_1, D$liab_6)
+dz_se <- sqrt(1 / cs_pool$n + cs_pool$dz^2 / (2 * cs_pool$n))      # §8.9: normal approximation
+R1_dec <- if (any(R1c$sylva_above_company)) "contradicted" else
+  if (all(R1c$sylva_lowest & R1c$cs_above0) && uc_pool$lo > -.40) "supported" else "inconclusive"
+kt(R1c %>% select(cell, m_company, m_sylva, m_user, cs_diff, cs_lo, cs_hi, uc_diff, uc_lo, sylva_lowest, cs_above0, sylva_above_company), glue("R1 by cell. Decision: {R1_dec}"))
+kt(tibble(contrast = c("company - Sylva (pooled)", "user - company (pooled)"), diff = c(cs_pool$diff, uc_pool$diff), lo = c(cs_pool$lo, uc_pool$lo),
+          hi = c(cs_pool$hi, uc_pool$hi), dz = c(cs_pool$dz, uc_pool$dz), dz_lo = c(cs_pool$dz - 1.96 * dz_se, NA), dz_hi = c(cs_pool$dz + 1.96 * dz_se, NA)),
+   "R1 pooled contrasts (point predictions: company - Sylva >= .80 raw, dz >= .60; not part of the decision)")
+```
+
+```{r r3}
+seg_gate <- function(y, x, Xc) {
+  # §8.9 gate test: one-breakpoint model by grid search over the 10th-90th percentiles of x (81 candidates); BIC with
+  # k_linear + 2 parameters (breakpoint and slope change); BF10 = exp((BIC_linear - BIC_segmented) / 2)
+  lin <- lm(y ~ x + Xc); grid <- quantile(x, seq(.10, .90, by = .01), names = FALSE)
+  rss <- map_dbl(grid, ~ sum(resid(lm(y ~ x + pmax(x - .x, 0) + Xc))^2))
+  n <- length(y); k_lin <- length(coef(lin)) + 1
+  bic_lin <- BIC(lin); bic_seg <- n * log(min(rss) / n) + n * (1 + log(2 * pi)) + (k_lin + 2) * log(n)
+  stopifnot(length(grid) == 81, abs(bic_lin - (n * log(sum(resid(lin)^2) / n) + n * (1 + log(2 * pi)) + k_lin * log(n))) < 1e-6)
+  tibble(breakpoint = grid[which.min(rss)], BIC_linear = bic_lin, BIC_segmented = bic_seg, BF10_breakpoint = exp((bic_lin - bic_seg) / 2))
+}
+r3_fit <- function(yvar, xvar, label) {
+  dd <- D %>% filter(!is.na(.data[[yvar]]), !is.na(.data[[xvar]])) %>% mutate(zy = zs(.data[[yvar]]), zx = zs(.data[[xvar]]))
+  fit <- lm(zy ~ zx + A + E + A:E, data = dd); h90 <- hc3(fit, "zx", .90); h95 <- hc3(fit, "zx", .95)
+  sg <- seg_gate(dd$zy, dd$zx, cbind(dd$A, dd$E, dd$A * dd$E))
+  tibble(model = label, outcome = yvar, predictor = xvar, n = nrow(dd), beta = h95$b, lo90 = h90$lo, hi90 = h90$hi, lo95 = h95$lo, hi95 = h95$hi) %>%
+    bind_cols(sg) %>% mutate(rule = dec_R3(hi90, lo95, BF10_breakpoint))
+}
+R3 <- bind_rows(r3_fit("liab_6", "ma_cap", "registered (PI decision 12)"),
+                r3_fit("liab_chat", "ma_cap", "robustness: Chatbot Responsibility composite"),
+                r3_fit("liab_6", "ma_total", "robustness: 8-item Moral Agency"),
+                r3_fit("liab_chat", "ma_total", "robustness: both composites (revision-2 specification)"),
+                r3_fit("v2_resp_sylva", "ma_cap", "report: vignette 2 (v2_resp_sylva)"))
+R3_dec <- R3$rule[1]
+kt(R3, glue("R3: standardised beta of perceived agency (HC3 CIs) and the grid-search breakpoint gate. Decision (registered row): {R3_dec}"))
+save_tab(R3, "R3")
+```
+
+```{r r4}
+r4_bf <- function(y, ma) {
+  dd4 <- D %>% transmute(y = zs(.data[[y]]), Af = factor(A), Ef = factor(E), ma = zs(.data[[ma]]), mp = zs(mp_total), psr = zs(psr_total),
+                         ec = zs(ec_total), tr = zs(trust_total)) %>% filter(complete.cases(.))
+  set.seed(42)
+  exp((lmBF(y ~ Af + Ef + Af:Ef + ma + mp + psr + ec + tr, data = dd4, rscaleFixed = .5, rscaleCont = "medium", iterations = params$bf_iter, progress = FALSE) /
+       lmBF(y ~ Af + Ef + Af:Ef + ma + mp, data = dd4, rscaleFixed = .5, rscaleCont = "medium", iterations = params$bf_iter, progress = FALSE))@bayesFactor$bf)
+}
+bfR4 <- r4_bf("liab_6", "ma_cap")
+# Decision model (§8.9): lm(z(liab_6) ~ A * E + z(ma_cap) + z(MP) + B), B = bonding composite (§6.15)
+fitB <- lm(zs(liab_6) ~ A * E + zs(ma_cap) + zs(mp_total) + B, data = D); beta_B <- unname(coef(fitB)["B"]); hB <- hc3(fitB, "B")
+fit4 <- lm(zs(liab_6) ~ A * E + zs(ma_cap) + zs(mp_total) + zs(psr_total) + zs(ec_total) + zs(trust_total), data = D)
+R4_dec <- dec_R4(bfR4, beta_B)
+kt(tibble(BF10 = bfR4, BF01 = 1 / bfR4, beta_B = beta_B, beta_B_lo = hB$lo, beta_B_hi = hB$hi,
+          beta_PSR = unname(coef(fit4)["zs(psr_total)"]), beta_EC = unname(coef(fit4)["zs(ec_total)"]), beta_Trust = unname(coef(fit4)["zs(trust_total)"]),
+          decision = R4_dec),
+   "R4: BF for adding PSR, EC and Trust to ma_cap + patiency (outcome liab_6); bonding-composite coefficient (decision); separate coefficients reported")
+bfR4c <- r4_bf("liab_chat", "ma_total")
+fit4c <- lm(zs(liab_chat) ~ A * E + zs(ma_total) + zs(mp_total) + B, data = D)
+kt(tibble(model = "robustness: Chatbot Responsibility composite and 8-item Moral Agency", BF10 = bfR4c, BF01 = 1 / bfR4c, beta_B = unname(coef(fit4c)["B"])),
+   "R4 robustness with the composites (PI decision 12: reported, not the decision)")
+amb("B03", "§8.9 R4 (and §0.5 (ii))", "'Supported if BF01 > 3; contradicted if BF10 > 3 or if the standardized coefficient of the bonding composite B ... is ≥ .25': a result with BF01 > 3 and beta_B ≥ .25 meets both the supported and the contradicted condition, and no precedence is stated. (R3's two conditions can overlap only if SE(beta) < .028, which N = 272 cannot give.)",
+    "'Contradicted' takes precedence (§0.5 lists beta_B ≥ .25 as counting against the account).", "only in the overlap case")
+# Path model PSR -> ma_cap -> liab_6 with A, E, A:E as fixed covariates (lavaan sem, ML, fixed.x = TRUE, 5,000 bootstrap, iseed 42, percentile)
+dl <- D %>% transmute(psr = zs(psr_total), ma = zs(ma_cap), y6 = zs(liab_6), A, E, AE = A * E) %>% filter(complete.cases(.))
+mod <- "ma ~ a*psr + A + E + AE
+        y6 ~ b*ma + c*psr + A + E + AE
+        ind := a*b"
+t_lav <- Sys.time()
+semfit <- tryCatch(sem(mod, data = dl, estimator = "ML", fixed.x = TRUE, se = "bootstrap", bootstrap = params$lavaan_boot, iseed = 42),
+                   error = function(e) { fail("R4 lavaan", conditionMessage(e)); NULL })
+t_lav <- as.numeric(difftime(Sys.time(), t_lav, units = "secs"))
+if (!is.null(semfit)) {
+  pe <- parameterEstimates(semfit, boot.ci.type = "perc", standardized = TRUE) %>% filter(label %in% c("a", "b", "c", "ind"))
+  kt(pe %>% select(label, est, ci.lower, ci.upper, std.all), glue("R4 path model on z-scored PSR, ma_cap, liab_6 (lavaan, {params$lavaan_boot} bootstrap resamples; {round(t_lav)} s). Predictions: a = .4-.5; ind about 0. Associations, not causal estimates."))
+}
+```
+
+```{r r5}
+rci <- function(x, y, level) { t <- cor.test(x, y, conf.level = level); tibble(r = unname(t$estimate), lo = t$conf.int[1], hi = t$conf.int[2]) }
+R5 <- bind_rows(rci(D$liab_corp, D$liab_chat, .95) %>% mutate(pair = "company-Sylva (composites), 95%"),
+                rci(D$liab_user, D$liab_corp, .90) %>% mutate(pair = "user-company (composites), 90%"),
+                rci(D$liab_user, D$liab_chat, .90) %>% mutate(pair = "user-Sylva (composites), 90%"),
+                rci(D$liab_1, D$liab_6, .95) %>% mutate(pair = "company-Sylva (identical items), 95%"),
+                rci(D$liab_9, D$liab_1, .90) %>% mutate(pair = "user-company (identical items), 90%"),
+                rci(D$liab_9, D$liab_6, .90) %>% mutate(pair = "user-Sylva (identical items), 90%"),
+                rci(D$v2_company, D$v2_sylva, .95) %>% mutate(pair = "company-Sylva (vignette 2), 95%"),
+                rci(D$v2_user, D$v2_company, .90) %>% mutate(pair = "user-company (vignette 2), 90%"),
+                rci(D$v2_user, D$v2_sylva, .90) %>% mutate(pair = "user-Sylva (vignette 2), 90%"))
+R5_dec <- sup(R5$lo[1] > .30 & all(R5$lo[2:3] > -.25 & R5$hi[2:3] < .25))
+kt(R5 %>% relocate(pair), glue("R5 (decision on the first three rows). Decision: {R5_dec}"))
+```
+
+## 9.9 R2c, R2d (§8.10)
+
+```{r r2cd}
+R2c_main <- SECF %>% filter(var %in% c("liab_chat", "liab_user", "liab_harm")) %>% transmute(test = paste(outcome, factor), BF10)
+R2d_main <- map_dfr(c("v2_company", "v2_sylva", "v2_user", "gap_v2"), function(y) map_dfr(c("A", "E"), function(f)
+  tibble(test = paste(y, f), BF10 = bf_reg(D, y, f))))
+R2c_dec <- dec_R2cd(R2c_main$BF10); R2d_dec <- dec_R2cd(R2d_main$BF10)
+R2CD <- bind_rows(R2c_main %>% mutate(set = "R2c"), R2d_main %>% mutate(set = "R2d")) %>% mutate(BF01 = 1 / BF10, BF01_gt3 = BF01 > 3, BF10_gt3 = BF10 > 3)
+kt(R2CD, glue("R2c: {sum(R2c_main$BF10 > 3)} of 6 BF10 > 3, {sum(1 / R2c_main$BF10 > 3)} of 6 BF01 > 3 -> {R2c_dec}. ",
+              "R2d: {sum(R2d_main$BF10 > 3)} of 8 BF10 > 3, {sum(1 / R2d_main$BF10 > 3)} of 8 BF01 > 3 -> {R2d_dec}"))
+# Profile test (descriptive; not part of the decision): 12 items in long format, item:A and item:E, participant random
+lp <- D %>% select(session_uuid, A, E, all_of(paste0("liab_", 1:12))) %>% pivot_longer(starts_with("liab_"), names_to = "item", values_to = "y") %>%
+  mutate(item = factor(item), Af = factor(A), Ef = factor(E), pid = factor(session_uuid)) %>% as.data.frame()
+t_prof <- Sys.time(); set.seed(42)
+bf_prof <- tryCatch(exp((lmBF(y ~ item + Af + Ef + Af:Ef + item:Af + item:Ef + pid, data = lp, whichRandom = "pid", rscaleFixed = .5,
+                               iterations = params$profile_bf_iter, progress = FALSE) /
+                         lmBF(y ~ item + Af + Ef + Af:Ef + pid, data = lp, whichRandom = "pid", rscaleFixed = .5,
+                               iterations = params$profile_bf_iter, progress = FALSE))@bayesFactor$bf),
+                    error = function(e) { fail("R2c profile lmBF", conditionMessage(e)); NA_real_ })
+t_prof <- as.numeric(difftime(Sys.time(), t_prof, units = "secs"))
+catg("Profile BF01 (reduced over full; descriptive, not evidence of absence, §8.10) = {fbf(1 / bf_prof)} ({params$profile_bf_iter} iterations, {round(t_prof)} s).")
+item_g <- map_dfr(paste0("liab_", 1:12), function(it) map_dfr(c("A", "E"), function(f) g_marg(D, it, f, .90) %>% mutate(item = it, factor = f)))
+kt(item_g %>% relocate(item, factor), "R2c: Hedges's g (90% CI) for the A and E effect on each of the 12 vignette-1 items")
+save_tab(bind_rows(R2CD, tibble(test = "12-item profile (item:A, item:E), descriptive", BF10 = bf_prof, set = "R2c profile", BF01 = 1 / bf_prof)), "R2c_R2d")
+```
+
+## 9.10 R6 (§8.11)
+
+```{r r6}
+vt <- t.test(D$v2_cause_sylva, mu = 3)                              # vignette check first: one-sample t against 3, two-sided, positive sign
+vchk_ok <- mean(D$v2_cause_sylva) > 3 & vt$p.value < .05
+g95 <- paired_ci(D$v2_resp_company, D$v2_resp_sylva, .95)
+R6a <- if (!vchk_ok) "not interpretable" else dec_R6a(g95$lo, g95$hi)
+sev90 <- paired_ci(D$v2_severity, D$liab_11, .90); sev_comparable <- sev90$lo > -.40 & sev90$hi < .40
+disc_m <- map_dfr(c(company = "disc_company", Sylva = "disc_sylva", user = "disc_user"), function(v) { t <- t.test(D[[v]])
+  tibble(estimate = mean(D[[v]]), lo = t$conf.int[1], hi = t$conf.int[2]) }, .id = "party")
+R6tab <- bind_rows(
+  tibble(test = "vignette check: mean v2_cause_sylva vs 3 (one-sample t)", diff = mean(D$v2_cause_sylva) - 3, lo = vt$conf.int[1] - 3, hi = vt$conf.int[2] - 3, p = vt$p.value),
+  paired_ci(D$v2_cause_sylva, D$liab_7) %>% mutate(test = "descriptive: v2_cause_sylva - liab_7 (different wordings and vignettes)"),
+  paired_ci(D$v2_cause_sylva, D$v2_cause_company) %>% mutate(test = "descriptive: v2_cause_sylva - v2_cause_company"),
+  g95 %>% mutate(test = "R6a: gap_v2 = v2_resp_company - v2_resp_sylva (95% CI)"),
+  paired_ci(D$disc_sylva, D$disc_user) %>% mutate(test = "R6b (exploratory): discount Sylva - user ('adviser versus actor')"),
+  paired_ci(D$v2_oblig_sylva, D$v2_oblig_user) %>% mutate(test = "standing index: v2_oblig_sylva - v2_oblig_user"),
+  paired_ci(D$v2_oblig_sylva, D$v2_oblig_company) %>% mutate(test = "standing index: v2_oblig_sylva - v2_oblig_company"),
+  sev90 %>% mutate(test = "severity: v2_severity - liab_11 (90% CI; comparable if within ±0.40)"),
+  paired_ci(D$liab_1, D$liab_6) %>% mutate(test = "gap_v1 = liab_1 - liab_6"),
+  paired_ci(D$gap_v1, D$gap_v2) %>% mutate(test = "gap_v1 - gap_v2 (paired)")) %>% relocate(test)
+kt(R6tab, glue("R6. Vignette check passed: {vchk_ok}. R6a: {R6a}."))
+kt(disc_m, "R6b (exploratory): conversion discount (cause - responsibility) by party, 95% CI")
+cat(if (sev_comparable) "The two vignettes are described as comparably severe (§8.11)." else
+    glue("Severity differed between the vignettes; gap_v1 - gap_v2 = {f2(mean(D$gap_v1 - D$gap_v2))} is reported with that statement and is not attributed to who caused the harm."), "\n")
+cat("Stated with every R6 result (§8.11): vignette 2 always follows vignette 1 and the open-ended responsibility questions, so the change mixes vignette content with position and with having already judged vignette 1. A company-primary result is also predicted if participants hold a creator responsible for its agent or an adviser less responsible than the person who acted; Study 3 cannot show that Sylva lacks standing.\n")
+R1v2 <- D %>% group_by(cell) %>% group_modify(~ bind_cols(paired_ci(.x$v2_resp_company, .x$v2_resp_sylva) %>% rename_with(~ paste0("cs_", .x)),
+                                                           paired_ci(.x$v2_resp_user, .x$v2_resp_company) %>% rename_with(~ paste0("uc_", .x)))) %>% ungroup()
+kt(R1v2 %>% select(cell, cs_diff, cs_lo, cs_hi, uc_diff, uc_lo, uc_hi), "R1 contrasts for vignette 2, by cell (reported with R6)")
+```
+
+## 9.11 U2 (§8.12)
+
+```{r u2}
+tick("U2-O1")
+if (U2_testable) {
+  mr <- D %>% select(session_uuid, incl_rounds) %>% unnest_longer(incl_rounds, values_to = "round")
+  # participant turn at round r >= 2 paired with the model-generated reply of round r (§6.9 set); failed requests have no reply and drop out
+  ut <- nlp_turns %>% filter(role == "user", round >= 2) %>% select(session_uuid, round, disclosure = emotional_self_disclosure) %>%
+    inner_join(nlp_turns %>% filter(role == "assistant") %>% select(session_uuid, round, mirror = mirroring_user_emotion) %>%
+                 semi_join(mr, by = c("session_uuid", "round")), by = c("session_uuid", "round")) %>%
+    inner_join(D %>% select(session_uuid, A, E, cell), by = "session_uuid") %>%
+    group_by(session_uuid) %>% mutate(disc_pm = mean(disclosure), disc_w = disclosure - disc_pm) %>% ungroup()
+  fitU2s <- glmer(mirror ~ disc_w * A * E + disc_pm + (1 + disc_w | session_uuid), data = ut, family = binomial)
+  conv_msgs <- fitU2s@optinfo$conv$lme4$messages
+  U2_nonconv <- length(conv_msgs) > 0                                # §8.12: non-convergence = an lme4 convergence message
+  fitU2 <- if (U2_nonconv) glmer(mirror ~ disc_w * A * E + disc_pm + (1 | session_uuid), data = ut, family = binomial) else fitU2s
+  u2_or <- function(fit) {
+    b <- fixef(fit); Vu <- as.matrix(vcov(fit)); z <- unname(b["disc_w"] / sqrt(Vu["disc_w", "disc_w"]))
+    cells <- map_dfr(list(c(.5, .5), c(.5, -.5), c(-.5, .5), c(-.5, -.5)), function(ae) {
+      L <- setNames(rep(0, length(b)), names(b)); L["disc_w"] <- 1; L["disc_w:A"] <- ae[1]; L["disc_w:E"] <- ae[2]; L["disc_w:A:E"] <- ae[1] * ae[2]
+      est <- sum(L * b); se <- sqrt(drop(t(L) %*% Vu %*% L)); tibble(A = ae[1], E = ae[2], OR = exp(est), lo = exp(est - 1.96 * se), hi = exp(est + 1.96 * se)) })
+    list(OR = unname(exp(b["disc_w"])), p = unname(2 * pnorm(-abs(z))), cells = cells)
+  }
+  U2r <- u2_or(fitU2); OR_U2 <- U2r$OR; p_U2 <- U2r$p; cellOR <- U2r$cells
+  U2_overall <- tibble(turn_pairs = nrow(ut), participants = n_distinct(ut$session_uuid),
+                       model_of_record = ifelse(U2_nonconv, "random intercept (random-slope fit returned a convergence message)", "random slope"),
+                       OR = OR_U2, p = p_U2, singular = isSingular(fitU2), convergence_messages = paste(conv_msgs, collapse = "; "))
+  U2_sens <- if (U2_nonconv) { s <- u2_or(fitU2s); s$cells %>% mutate(OR_overall = s$OR, p_overall = s$p) } else NULL
+} else { p_U2 <- NA_real_; OR_U2 <- NA_real_; cellOR <- NULL; U2_sens <- NULL; cat("U2 not testable: a code fails §7.4.\n") }
+if (U2_testable) kt(U2_overall, "U2: overall odds ratio for within-person disclosure (disc_w), at A = E = 0 (model of record)")
+if (U2_testable) kt(cellOR, "U2: cell-specific odds ratios (model of record)")
+if (!is.null(U2_sens)) kt(U2_sens, "U2 sensitivity analysis: the random-slope model (lme4 returned a convergence message)")
+```
+
+## 9.12 O1: order check (§8.13)
+
+```{r o1}
+fitO <- lm(psr_total ~ A * E + O + A:O + E:O, data = D)
+o_tost <- tost_welch(D$psr_total[D$O > 0], D$psr_total[D$O < 0], BOUND_PSR, "raw")
+hAO <- hc3(fitO, "A:O"); hEO <- hc3(fitO, "E:O"); sO <- sigma(fitO)
+O1_dec <- sup(o_tost$equivalent)
+fitOG <- lm(psr_total ~ A * E + G_halo * O, data = D); hGO <- hc3(fitOG, "G_halo:O")
+O1_tab <- bind_rows(tibble(term = "order main effect: Welch TOST, raw bounds ±0.39 PSR units", b = o_tost$diff, lo = o_tost$diff_lo90, hi = o_tost$diff_hi90, p = o_tost$p_max),
+                    hAO %>% select(term, b, lo, hi, p) %>% mutate(term = "A:O (raw)"),
+                    tibble(term = "A:O in d units (/ sqrt(MSE) of the O1 model)", b = hAO$b / sO, lo = hAO$lo / sO, hi = hAO$hi / sO, p = hAO$p),
+                    hEO %>% select(term, b, lo, hi, p) %>% mutate(term = "E:O (raw)"),
+                    hGO %>% select(term, b, lo, hi, p) %>% mutate(term = "G_halo:O in lm(PSR ~ A * E + G_halo * O)"))
+kt(O1_tab, glue("O1. Decision: {O1_dec}{ifelse(o_tost$equivalent, ' (PSR does not differ by order by as much as ±0.39 PSR units)', '')}"))
+cat(if (hAO$p < .05) "A:O p < .05: the warmth effect is reported within each order, and the abstract says so; the H1 decision is unchanged.\n" else
+    "No A x order interaction detected; not resolved at this N (power .38 to detect a difference of d = 0.40 between the orders' warmth effects).\n")
+if (hAO$p < .05) kt(map_dfr(c("impression_first", "bonding_first"), ~ hc3(core(D[D$order == .x, ], "psr_total"), "A") %>% mutate(order = .x)), "Warmth effect within each order")
+o_other <- map_dfr(c("G_halo", "tipi_bot_agree", "tipi_bot_extra", "mc_agreeableness", "mc_extraversion", "mc_neuroticism", "mc_e_energetic", "mc_length"),
+                   function(y) hc3(lm(reformulate(c("A", "E", "A:E", "O"), y), data = D), "O") %>% mutate(outcome = y))
+kt(o_other %>% select(outcome, b, lo, hi, p), "Order effects on G_halo, TIPI-Bot Agreeableness and Extraversion, and the manipulation checks; H4 by order is in section 9.5")
+amb("B04", "§8.13 O1", "'A × order is reported with its 95% CI in d units' does not name the standardiser.",
+    "A:O coefficient / sqrt(MSE) of the O1 model, by analogy with H3 (§2.3); the raw coefficient is shown as well.", "no (report only)")
+```
+
+# 10. Multiplicity (§8.14), the prediction table (§11.1) and the account summary (§0.5, §0.6)
+
+```{r multiplicity}
+p_holm1 <- p.adjust(c(S1 = unname(hS1$p), D2 = unname(d2$p)), "holm")
+# §8.3: if one of U1a / U2 is not testable, the other is tested alone at alpha = .05
+p_holm2 <- if (U1a_testable && U2_testable) p.adjust(c(U1a = unname(ct$p.value), U2 = unname(p_U2)), "holm") else
+  c(U1a = if (U1a_testable) unname(ct$p.value) else NA_real_, U2 = if (U2_testable) unname(p_U2) else NA_real_)
+S1_dec <- sup(hS1$b > 0 && p_holm1[["S1"]] < .05)
+D2_dec <- sup(d2$b > 0 && p_holm1[["D2"]] < .05)
+U1a_dec <- if (!U1a_testable) "not testable" else sup(unname(ct$estimate) > 0 && p_holm2[["U1a"]] < .05)
+U2_dec <- if (!U2_testable) "not testable" else sup(OR_U2 > 1 && p_holm2[["U2"]] < .05 && all(cellOR$lo > 1))
+kt(tibble(family = c("{S1, D2}", "{S1, D2}", "{U1a, U2}", "{U1a, U2}"), test = c("S1", "D2", "U1a", "U2"),
+          p = c(hS1$p, d2$p, if (U1a_testable) ct$p.value else NA, p_U2), p_holm = c(p_holm1[["S1"]], p_holm1[["D2"]], p_holm2[["U1a"]], p_holm2[["U2"]])),
+   "Holm families (§8.14)")
+r2r <- function(h) { r <- R2[R2$hyp == h, ]; glue("{r$label}; TOST p = {fp(r$tost_raw_p)}, Welch p = {fp(r$welch_p)}, diff = {f3(r$diff)}, BF10 = {fbf(r$BF10)}") }
+PRED <- tribble(~id, ~status, ~registered_test, ~result, ~decision,
+  "H1", "primary", "§7.2: HC3 b(A) on PSR, two-sided .05", glue("b = {f3(h1$b)} [{f3(h1$lo)}, {f3(h1$hi)}], p = {fp(h1$p)}, g = {f2(g1$g)}, BF10 = {fbf(bf1)}; joint class: {H1_tab$joint_class}; strict joint criterion met: {H1_strict}"), H1_dec,
+  "R2a", "primary", "§7.2: Welch TOST ±0.40 on Corporate Liability (A)", r2r("R2a"), R2$decision[R2$hyp == "R2a"],
+  "R2b", "primary", "§7.2: Welch TOST ±0.40 on Corporate Liability (E)", r2r("R2b"), R2$decision[R2$hyp == "R2b"],
+  "H2", "estimation", "§7.2 steps 1-5 (no pass/fail)", glue("b(E) = {f3(h2$b)} [{f3(h2$lo)}, {f3(h2$hi)}], TOST ±0.39 p = {fp(tost2$p_max)}; D [{f3(qb('D')$lo)}, {f3(qb('D')$hi)}], D_step5 [{f3(qb('D_step5')$lo)}, {f3(qb('D_step5')$hi)}]; LR(4b) = {f2(LR)}"),
+    glue("{H2_desc} | steps 4-5: {H2_closer} | step 4b: {H2_4b}"),
+  "H3", "estimation", "§7.2: A:E on PSR (no pass/fail)", glue("b(A:E) = {f3(hAE$b)} [{f3(hAE$lo)}, {f3(hAE$hi)}], p = {fp(hAE$p)}"), H3_tab$statement,
+  "MC-A", "check", "§8.1: b(A) on TIPI-Bot A > 0, p < .05", glue("b = {f3(mc_primary$b[1])}, p = {fp(mc_primary$p[1])}"), pass(MC_A_pass),
+  "MC-E", "check", "§8.1: b(E) on TIPI-Bot E > 0, p < .05", glue("b = {f3(mc_primary$b[2])}, p = {fp(mc_primary$p[2])}"), pass(MC_E_pass),
+  "M1", "secondary", "§8.5: b(A) on W_bar > 0, p < .05", glue("ΔW_A = {f3(dWA$b)}, p = {fp(dWA$p)}; ΔW_E = {f3(hc3(fitW, 'E')$b)}"), pass(M1_pass),
+  "M2", "secondary", "§8.4: factor TOSTs ±7.5% and every cell within ±7.5%", glue("TOST p (A, E) = {fp(m2f$p_max[1])}, {fp(m2f$p_max[2])}; cell deviations {paste(sprintf('%+.1f%%', cm$dev_pct), collapse = ', ')}"), sup(M2_dec),
+  "H4", "secondary", "§8.6: S_G >= .50 and b(A|P) - b(A|G_halo) CIs above 0", glue("S_G = {f2(h4v(H4A, 'S_G_halo')$estimate)}; S_C+O = {f2(h4v(H4A, 'S_C_O')$estimate)}{ifelse(nchar(H4_comp), paste0('; ', H4_comp), '')}{ifelse(H1_dec == 'supported', '', paste0('; precondition (H1 supported) not met; rule applied descriptively: ', H4_rule))}"), H4_dec,
+  "H5", "secondary", "§8.7: pooled ratio (G_halo_E) bootstrap 95% CI above 0", if (is.null(H5)) "precondition (MC-E passes) not met" else
+    glue("ratio_GE = {f2(H5$estimate[H5$quantity == 'ratio_GE'])} [{f2(H5$lo[H5$quantity == 'ratio_GE'])}, {f2(H5$hi[H5$quantity == 'ratio_GE'])}]"), H5_dec,
+  "D1", "secondary", "§8.8: b(A) on ios_change, TOST ±0.30 SD_t1, scale bound", glue("delta = {f3(D1$delta)}, p = {fp(D1$p)}, TOST p = {fp(D1$tost_p)}, scale bound triggered: {D1$scale_bound}; {D1_interp}"), D1$decision,
+  "D2", "secondary", "§8.8: b(A) on ios_t1 > 0, Holm with S1", glue("b = {f3(d2$b)}, Holm p = {fp(p_holm1[['D2']])}; falsifier (±0.40 SD TOST and b_W > 0) met: {D2_falsifier}"), D2_dec,
+  "S1", "secondary", "§8.2: A x Aself_z > 0, Holm with D2", glue("b = {f3(hS1$b)}, Holm p = {fp(p_holm1[['S1']])}"), S1_dec,
+  "R1", "secondary", "§8.9: Sylva lowest, company - Sylva CI > 0 in every cell; user - company LB > -0.40", glue("pooled company - Sylva = {f2(cs_pool$diff)} (dz = {f2(cs_pool$dz)}); user - company LB = {f2(uc_pool$lo)}"), R1_dec,
+  "R2c", "secondary", "§8.10: 6 main-effect BFs", glue("{sum(R2c_main$BF10 > 3)} BF10 > 3; {sum(1 / R2c_main$BF10 > 3)} of 6 BF01 > 3 (need >= 4)"), R2c_dec,
+  "R2d", "secondary", "§8.10: 8 main-effect BFs", glue("{sum(R2d_main$BF10 > 3)} BF10 > 3; {sum(1 / R2d_main$BF10 > 3)} of 8 BF01 > 3 (need >= 5)"), R2d_dec,
+  "R3", "secondary", "§8.9: beta of ma_cap on liab_6; breakpoint gate", glue("beta = {f3(R3$beta[1])}, 90% UB = {f3(R3$hi90[1])}, 95% LB = {f3(R3$lo95[1])}, breakpoint BF10 = {fbf(R3$BF10_breakpoint[1])}"), R3_dec,
+  "R4", "secondary", "§8.9: BF for PSR, EC, Trust; bonding-composite coefficient", glue("BF01 = {fbf(1 / bfR4)}; beta_B = {f3(beta_B)}"), R4_dec,
+  "R5", "secondary", "§8.9: r(company, Sylva) LB > .30; user correlations within ±.25", glue("r(company, Sylva) = {f2(R5$r[1])} [{f2(R5$lo[1])}, {f2(R5$hi[1])}]"), R5_dec,
+  "R6", "secondary", "§8.11: vignette check, then R6a gap_v2 95% CI vs 0.40", glue("vignette check passed: {vchk_ok}; gap_v2 = {f2(g95$diff)} [{f2(g95$lo)}, {f2(g95$hi)}], dz = {f2(g95$dz)}; R6b exploratory"), R6a,
+  "U1a", "secondary", "§8.3: r(PHQ-4, disclosure) > 0, Holm with U2", if (U1a_testable) glue("r = {f3(ct$estimate)}, Holm p = {fp(p_holm2[['U1a']])}") else "code fails §7.4", U1a_dec,
+  "U1b", "estimate", "§8.3: PHQ-4 coefficient on PSR, BF10, indirect effect", glue("b = {f3(hU$b)} [{f3(hU$lo)}, {f3(hU$hi)}], std. beta = {f3(hUz$b)}, BF10 = {fbf(bfU1b)}"), "estimate (no decision)",
+  "U2", "secondary", "§8.12: OR(disc_w) > 1 Holm p < .05; every cell CI above 1", if (U2_testable) glue("OR = {f2(OR_U2)}, Holm p = {fp(p_holm2[['U2']])}; min cell LB = {f2(min(cellOR$lo))}") else "codes fail §7.4", U2_dec,
+  "O1", "secondary", "§8.13: Welch TOST ±0.39 on order", glue("diff = {f3(o_tost$diff)}, TOST p = {fp(o_tost$p_max)}; A:O p = {fp(hAO$p)}"), O1_dec)
+ALLOWED <- list(primary = c("supported", "contradicted", "not supported", "inconclusive"),
+                check = c("passes", "fails"),
+                secondary = c("supported", "contradicted", "inconclusive", "not supported", "not testable", "passes", "fails", "accumulation", "narrowing",
+                              "first impression", "first impression, with small growth", "first impression, with small narrowing",
+                              "not interpretable: scale bound", "company-primary", "Sylva comparable to the company", "not interpretable"))
+lab_ok <- with(PRED, ifelse(status %in% names(ALLOWED), map2_lgl(status, decision, ~ .y %in% ALLOWED[[.x]]), TRUE))
+stopifnot(all(lab_ok), !anyNA(PRED$decision), all(c("H1", "R2a", "R2b", "H2", "H3", "MC-A", "MC-E", "M1", "M2", "H4", "H5", "D1", "D2", "S1",
+                                                   "R1", "R2c", "R2d", "R3", "R4", "R5", "R6", "U1a", "U1b", "U2", "O1") %in% PRED$id))
+kt(PRED, "Every registered hypothesis and prediction with its registered test, result and revision-3 outcome label (§8.14, §11.1)")
+save_tab(PRED, "prediction_table")
+```
+
+```{r account-summary}
+# §0.5: what would count against the account (PI decision 11), each tied to its Section 7-8 test
+dyn_txt <- switch(D1$decision, "accumulation" = "the warmth gap grew: a static impression account is incomplete; an accumulation account is needed",
+                  "narrowing" = "the gap shrank significantly: the static first-impression account is incomplete in the other direction",
+                  "first impression" = , "first impression, with small growth" = , "first impression, with small narrowing" =
+                    if (dWA$b >= DW_SCRIPT) "flat gap and free-chat tone at least as differentiated as the opening: first-impression account supported" else
+                      "flat gap, but free chat less differentiated than the scripted opening: does not distinguish the two accounts",
+                  "not interpretable: scale bound" = "probe-1 scale bound: neither a flat gap nor narrowing can be concluded (only accumulation could have been)",
+                  "inconclusive: no statement about the dynamics")
+SCORE <- tribble(~version, ~counts_against_if, ~test, ~met,
+  "tone version (strong form)", "ΔW_A >= .28 and the 95% CI upper bound of g(H1) < .25", "§7.2 H1 (c)", H1_tone$c_counts_against_strong_form,
+  "tone version", "D2 TOST at ±0.40 SD significant while b_W > 0 (p < .05)", "§8.8", D2_falsifier,
+  "impression version", "(i) ΔG_E 95% CI above 0 and c'_G bootstrap 95% CI entirely below 0", "§7.2 H2", IMP_falsifier,
+  "impression version", "(ii) H4 contradicted", "§8.6", H4_dec == "contradicted",
+  "separation", "(0) R2a or R2b contradicted", "§7.2", any(R2$decision == "contradicted"),
+  "separation", "(i) R2c or R2d contradicted", "§8.10", R2c_dec == "contradicted" | R2d_dec == "contradicted",
+  "separation", "(ii) R4 contradicted (BF10 > 3 or beta_B >= .25)", "§8.9", R4_dec == "contradicted",
+  "separation", "(iii) R3 contradicted (95% CI lower bound of beta > .20)", "§8.9", R3_dec == "contradicted",
+  "separation", "(iv) R1 contradicted (in some cell Sylva above the company, 95% CI above 0)", "§8.9", R1_dec == "contradicted")
+kt(SCORE, glue("§0.5: outcomes that count against the account (met = TRUE counts against). Dynamics (D1): {dyn_txt}"))
+# §0.6: account-specific predictions reported as a set
+ACC <- PRED %>% filter(id %in% c("H2", "D1", "D2", "R2c", "R2d", "R3", "R4", "R5")) %>% select(id, decision)
+kt(ACC %>% count(decision, name = "n"), glue("§0.6: account-specific predictions (H2, D1, D2, R2c, R2d, R3, R4, R5) tabulated by their own labels: ",
+                                            "{sum(ACC$decision == 'supported')} supported, {sum(ACC$decision == 'contradicted')} contradicted, {sum(ACC$decision == 'inconclusive')} inconclusive"))
+amb("B05", "§0.6, §8.14", "§0.6 reports the account-specific predictions 'with the numbers supported, contradicted and inconclusive', but four of the eight have no such labels: H2 (descriptions; 'closer' / 'not distinguished'), D1 (accumulation / narrowing / first impression / inconclusive / scale bound), and D2 and R5 (supported / not supported).",
+    "Each prediction is tabulated under its own label; no mapping onto supported / contradicted / inconclusive is made.", "no (reporting)")
+save_tab(SCORE, "account_scorecard")
+```
+
+# 11. Robustness checks (§9.1)
+
+```{r robustness}
+tick("robustness")
+# Decision under each check (§9.1): H1 supported if b(A) > 0 and p < .05; H2 the step-1 description; R2a/R2b by the raw-bound Welch TOST in
+# case-removal checks (3-8, 11, 12, 13b) and 'robust' if the HC3 90% CI lies within ±0.40 in model checks (2, 9, 10, 13a).
+prim <- function(d, extra = NULL, drop_AE = FALSE, label, kind = "sample") {
+  terms <- c("A", "E", if (!drop_AE) "A:E", extra, vers_cov(d))
+  fP <- lm(reformulate(terms, "psr_total"), data = d); fC <- lm(reformulate(terms, "liab_corp"), data = d)
+  hA <- hc3(fP, "A"); hE <- hc3(fP, "E"); tE <- tost_f(d, "psr_total", "E", BOUND_PSR, "raw")
+  r2 <- map_dfr(c("A", "E"), function(f) { h90 <- hc3(fC, f, .90); tr <- tost_f(d, "liab_corp", f, BOUND_R2, "raw")
+    tibble(hyp = ifelse(f == "A", "R2a", "R2b"), b = h90$b, lo = h90$lo, hi = h90$hi, ci = "90% HC3", p = tr$p_max,
+           decision = if (kind == "sample") dec_R2(tr$p_max, tr$p_t) else ifelse(h90$lo > -BOUND_R2 & h90$hi < BOUND_R2, "robust", "not robust")) })
+  bind_rows(tibble(hyp = "H1", b = hA$b, lo = hA$lo, hi = hA$hi, ci = "95% HC3", p = hA$p, decision = dec_H1(hA$b, hA$p)),
+            tibble(hyp = "H2", b = hE$b, lo = hE$lo, hi = hE$hi, ci = "95% HC3", p = hE$p, decision = desc_H2(hE$b, hE$p, tE$equivalent)), r2) %>%
+    mutate(check = label, n = nrow(d))
+}
+hq <- function(d) { fw <- paste0("tipi_self_", c(1, 3, 5, 7, 9)); rv <- paste0("tipi_self_", c(2, 4, 6, 8, 10))
+  M <- cbind(as.matrix(d[, fw]), 8 - as.matrix(d[, rv])); wsd <- apply(M, 1, sd); mh <- mahalanobis(M, colMeans(M), cov(M))
+  d[wsd >= .5 & mh <= qchisq(.999, 10), ] }
+# check 9: balance on each factor (Welch t); adjusted model adds imbalanced covariates and cb_slot (linear)
+bal_vars <- c("d_age_clean", "phq4_total", "gaais_pos", "gaais_neg", "tipi_self_agree", "tipi_self_extra")
+bal <- map_dfr(bal_vars, function(v) map_dfr(c("A", "E"), function(f) { t <- t.test(D[[v]][D[[f]] > 0], D[[v]][D[[f]] < 0]); tibble(var = v, factor = f, diff = unname(diff(rev(t$estimate))), p = t$p.value) }))
+imb <- unique(bal$var[bal$p < .05])
+n_cbslot_na <- sum(is.na(D$cb_slot))
+D9 <- D %>% filter(if_all(all_of(c(imb, "cb_slot")), ~ !is.na(.x)))
+# check 1: Welch t and Mann-Whitney U on the marginal groups
+ck1 <- map_dfr(list(c("H1", "psr_total", "A"), c("H2", "psr_total", "E"), c("R2a", "liab_corp", "A"), c("R2b", "liab_corp", "E")), function(z) {
+  x1 <- D[[z[2]]][D[[z[3]]] > 0]; x0 <- D[[z[2]]][D[[z[3]]] < 0]; tt <- t.test(x1, x0); w <- wilcox.test(x1, x0, exact = FALSE)
+  tibble(hyp = z[1], b = mean(x1) - mean(x0), lo = tt$conf.int[1], hi = tt$conf.int[2], ci = "95% Welch", p = tt$p.value, p_mw = w$p.value,
+         decision = "reported (Welch t and Mann-Whitney U p-values)", check = "1. Welch t / Mann-Whitney U", n = nrow(D)) })
+ck8 <- D %>% filter(!any_finish_not_stop, system_prompt_sha256_match %in% TRUE, script_sha256_match %in% TRUE)
+n_missing_only <- sum(D$n_finish_missing > 0 & D$n_finish_not_stop == D$n_finish_missing & D$system_prompt_sha256_match %in% TRUE & D$script_sha256_match %in% TRUE)
+ROB <- bind_rows(
+  ck1,
+  prim(D, drop_AE = TRUE, label = "2. no A:E term", kind = "model"),
+  prim(FULL, label = "3. full sample"),
+  prim(D %>% filter(chat_send_attempts >= 12), label = "4. high engagement (chat_send_attempts >= 12)"),
+  prim(D %>% filter(chat_total_rounds >= 12), label = "4 (also reported). chat_total_rounds >= 12"),
+  prim(hq(D), label = "5. high-quality responders"),
+  prim(D %>% filter(chat_api_error_count <= 2), label = "6. <= 2 failed API turns"),
+  prim(D %>% filter(cb_source != "fallback_random"), label = "7. no fallback assignment"),
+  prim(ck8, label = "8. finish_reason stop and both hash-match fields TRUE"),
+  prim(D9, extra = c(imb, "cb_slot"), label = glue("9. balance-adjusted (+{paste(c(imb, 'cb_slot'), collapse = ', ')})"), kind = "model"),
+  prim(D %>% filter(!is.na(bot_tokens_per_turn)), extra = "bot_tokens_per_turn", label = "10. verbosity-adjusted (sensitivity only)", kind = "model"),
+  prim(D %>% filter(!(hyp_guess_keyword | hyp_guess_llm)), label = "11. hypothesis guessers excluded"),
+  prim(D %>% filter(!first_msg_question), label = "12a. first message not a question"),
+  prim(D %>% filter(!reply_ignores_direct_question), label = "12b. round-1 fit code reply_ignores_direct_question excluded"),
+  prim(D, extra = "O", label = "13a. order as covariate", kind = "model"),
+  prim(D %>% filter(order == "impression_first"), label = "13b. impression-first only"))
+main <- prim(D, label = "registered")
+ROB <- ROB %>% left_join(main %>% select(hyp, b_registered = b), by = "hyp") %>%
+  mutate(pct_change = ifelse(grepl("^9\\.", check), 100 * (b - b_registered) / b_registered, NA_real_),       # check 9 only
+         attenuation_gt25 = ifelse(grepl("^9\\.", check), (abs(b_registered) - abs(b)) / abs(b_registered) > .25, NA),
+         decision = ifelse(grepl("^9\\.", check) & hyp == "H1", ifelse(decision == "supported", "robust to balance concerns", "not robust to balance concerns"), decision))
+kt(ROB %>% select(check, hyp, n, b, lo, hi, ci, p, p_mw, decision, pct_change, attenuation_gt25), "Robustness checks for H1, H2, R2a, R2b (§9.1)")
+kt(bal, glue("Check 9 balance tests; imbalanced: {ifelse(length(imb) == 0, 'none', paste(imb, collapse = ', '))}; {n_cbslot_na} participants without cb_slot omitted from the adjusted model only"))
+catg("Check 8: {nrow(D) - nrow(ck8)} sessions excluded; {n_missing_only} of them only because a finish_reason was missing.")
+D1_14 <- d1_decide(D %>% filter(ios_t2_status != "not_triggered"))
+kt(tibble(check = "14. D1 without participants whose probe 2 was not triggered", n = D1_14$n, b = D1_14$b, p = D1_14$p, tost_p = D1_14$tost_p,
+          scale_bound = D1_14$scale_bound, decision = D1_14$decision), "Check 14: the §8.8 D1 decision in the reduced sample")
+rob3 <- ROB %>% filter(grepl("^3\\.", check))
+directional <- function(hyp, dec) (hyp == "H1" & dec %in% c("supported", "contradicted")) |
+  (hyp == "H2" & grepl("^(positive|negative) effect detected", dec))
+robust_flag <- tibble(hyp = main$hyp, registered = main$decision, full_sample = rob3$decision, same_direction = sign(main$b) == sign(rob3$b)) %>%
+  mutate(direction_applies = directional(hyp, registered),
+         robust = registered == full_sample & (!direction_applies | same_direction))
+kt(robust_flag, "A primary conclusion is robust if its direction and decision hold in the full sample (check 3); direction only for directional conclusions (log B06)")
+amb("B06", "§9.1 (last paragraph)", "'A primary conclusion is described as robust if its direction and decision hold in the full-sample analysis (check 3)': R2a/R2b (equivalence), a non-supported H1 and the H2 descriptions 'effects as large as the smallest effect of interest excluded' and 'not resolved at this N' have no direction, and the sign of a near-zero estimate can flip between samples while the decision holds.",
+    "Direction is required only for directional conclusions (H1 supported or contradicted; H2 positive or negative effect detected); otherwise the decision alone. The signs are shown.", "yes (the 'robust' label)")
+save_tab(bind_rows(ROB, tibble(check = "14. D1 (probe 2 triggered only)", hyp = "D1", n = D1_14$n, b = D1_14$b, p = D1_14$p, decision = D1_14$decision)), "robustness")
+```
+
+# 12. Influence diagnostics (§9.6)
+
+```{r outliers}
+cook <- map_dfr(c(H1_H2 = "psr_total", R2 = "liab_corp"), function(y) { f <- core(D, y); cd <- cooks.distance(f); tibble(model = y, n = length(cd), n_over_4n = sum(cd > 4 / length(cd)), max_cook = max(cd)) })
+kt(cook, "Cook's distance > 4/n (descriptive only; no observation removed)")
+```
+
+# 13. Exploratory analyses implemented in the mock (§9.5, subset; §10)
+
+```{r exploratory}
+tick("exploratory")
+E1 <- map_dfr(names(SEC), function(y) hc3(core(D, y), "A:E") %>% mutate(outcome = y)) %>% mutate(q_BH = p.adjust(p, "BH"))
+kt(E1 %>% select(outcome, b, lo, hi, p, q_BH), "E1: A x E on the eight secondary outcomes (BH across 8; Corporate Liability's A x E is the R2 guard)")
+if (!is.null(E2)) kt(E2, "E2: verbosity mediation (indirect effects per 10 tokens; lavaan, percentile bootstrap)")
+E4v <- c("chat_send_attempts", "chat_idle_pause_count", "user_chars_per_turn", "user_total_chars", "user_tokens_per_turn")
+E4 <- map_dfr(E4v, function(y) map_dfr(c("A", "E"), function(f) hc3(core(D, y), f) %>% mutate(outcome = y, factor = f))) %>% mutate(q_BH = p.adjust(p, "BH"))
+kt(E4 %>% select(outcome, factor, b, p, q_BH), "E4: behavioural family (BH across 10)")
+E10 <- D %>% group_by(cell) %>% summarise(model_replies = sum(n_model_replies), finish_length = sum(n_finish_length),
+                                          rate_length = finish_length / model_replies, .groups = "drop")
+kt(E10, "E10: rate of replies with finish_reason = length, by cell")
+E12 <- bind_rows(hc3(core(D, "psr_total", c("W_bar", "R_bar")), "W_bar"), hc3(core(D, "psr_total", c("W_bar", "R_bar")), "R_bar"))
+kt(E12 %>% select(term, b, lo, hi, p), "E12: W_bar and R_bar together (within cells); ΔR_bar by factor is in M1")
+E13 <- hc3(core(D, "ios_change"), "E")
+kt(E13 %>% select(term, b, lo, hi, p), "E13: the E analog of D1 (E effect on ios_change)")
+st4 <- hc3(fitC, "E"); bfC_E <- R2$BF10[R2$hyp == "R2b"]
+catg("§10 (for completeness): E coefficient on Corporate Liability b = {f3(st4$b)}, HC3 p = {fp(st4$p)}, registered BF10 = {fbf(bfC_E)}; ",
+         "a 'significant' result would need p < .05 and BF10 >= 3: {st4$p < .05 & bfC_E >= 3}. Study 4 is not run in factorial form under May 7 §11.5.")
+cat("Not implemented in the mock: E3, E5 (mediation and moderator batteries from May 7 §9), E6 (NLP), E7 (Study 1 pooling), E8, E11, E13 by PHQ-4, E14.\n")
+```
+
+# 14. Mock only: recovery of the planted effects
+
+```{r recovery, eval = params$data_mode == "mock"}
+tick("recovery")
+T <- TRUTH
+# Revision-3 estimands, from the same 200,000-person draw (seed 4242) of the generator as population_truth()
+truth_rev3 <- function(eff, donors, n = 200000, seed = 4242) {
+  old <- get(".Random.seed", envir = globalenv()); on.exit(assign(".Random.seed", old, envir = globalenv()))
+  set.seed(seed)
+  A <- sample(c(-.5, .5), n, TRUE); E <- sample(c(-.5, .5), n, TRUE); O <- sample(c(-.5, .5), n, TRUE)
+  p <- gen_persons(A, E, O, eff, donors)
+  tr <- function(i, j) (p[[paste0("tipi_bot_", i)]] + (8 - p[[paste0("tipi_bot_", j)]])) / 2
+  X <- cbind(1, p$A, p$E, p$A * p$E); cf <- function(y, extra = NULL) qr.coef(qr(cbind(X, extra)), y)
+  psr <- rowMeans(p[, paste0("psr_", 1:12)]); ec <- rowMeans(p[, paste0("ec_", 1:5)]); trs <- rowMeans(p[, paste0("tr_", 1:4)])
+  ghalo <- (tr(3, 8) + ((8 - p$tipi_bot_4) + p$tipi_bot_9) / 2 + tr(5, 10)) / 3
+  ghaloE <- (p$tipi_bot_3 + (8 - p$tipi_bot_8) + (8 - p$tipi_bot_4) + (8 - p$tipi_bot_10)) / 4
+  ma_cap <- rowMeans(p[, paste0("ma_", c(1, 2, 3, 4, 6, 7))]); mp <- rowMeans(p[, paste0("mp_", 1:8)])
+  bE <- cf(psr)[3]; textra <- tr(1, 6)
+  Bc <- zs((zs(psr) + zs(ec) + zs(trs)) / 3)
+  c(ratio_GE = unname(cf(ghaloE)[3] / cf(textra)[3]), ratio_G = unname(cf(ghalo)[3] / cf(textra)[3]),
+    cprime_G = unname(cf(psr, ghalo)[3]), cprime_W = unname(cf(psr, p$W_true)[3]),
+    R3_beta = unname(cf(zs(p$liab_6), zs(ma_cap))[5]),
+    R4_beta_B = unname(cf(zs(p$liab_6), cbind(zs(ma_cap), zs(mp), Bc))[7]))
+}
+T3 <- truth_rev3(EFF, sim$donors)
+H2b <- function(q) H2_boot %>% filter(quantity == q)
+H4b <- function(s) H4A %>% filter(stat == s)
+rec <- tribble(~estimand, ~truth, ~estimate, ~lo, ~hi,
+  "H1 g (A on PSR, marginal)", T[["g_A_psr"]], g1$g, g1$g_lo, g1$g_hi,
+  "H1 b(A) on PSR", T[["b_A_psr"]], h1$b, h1$lo, h1$hi,
+  "H2 g (E on PSR, marginal)", T[["g_E_psr"]], g2$g, g2$g_lo, g2$g_hi,
+  "H2 b(E) on PSR", T[["b_E_psr"]], h2$b, h2$lo, h2$hi,
+  "R2a b(A) on Corp (90% CI)", T[["b_A_corp"]], R2$b[1], R2$ci90_lo[1], R2$ci90_hi[1],
+  "R2b b(E) on Corp (90% CI)", T[["b_E_corp"]], R2$b[2], R2$ci90_lo[2], R2$ci90_hi[2],
+  "M1 dW_A", T[["dW_A"]], dWA$b, dWA$lo, dWA$hi,
+  "M1 dW_E (H2 step 2)", T[["dW_E"]], dWE$b, dWE$lo, dWE$hi,
+  "H2 dG_E (G_halo)", T[["dG_E"]], dGE$b, dGE$lo, dGE$hi,
+  "H2 b_W (within-cell)", T[["b_W"]], H2b("b_W")$estimate, H2b("b_W")$lo, H2b("b_W")$hi,
+  "H2 b_G (within-cell)", T[["b_G"]], H2b("b_G")$estimate, H2b("b_G")$lo, H2b("b_G")$hi,
+  "H2 P_G", T[["P_G"]], H2b("P_G")$estimate, H2b("P_G")$lo, H2b("P_G")$hi,
+  "H2 c'_G (impression falsifier)", T3[["cprime_G"]], H2b("cprime_G")$estimate, H2b("cprime_G")$lo, H2b("cprime_G")$hi,
+  "H2 D = |c'_G| - |c'_W| (step 4)", T[["D"]], H2b("D")$estimate, H2b("D")$lo, H2b("D")$hi,
+  "MC-E b(E) on TIPI-E", T[["b_E_tipiE"]], mc_primary$b[2], mc_primary$lo[2], mc_primary$hi[2],
+  "MC-A b(A) on TIPI-A", T[["b_A_tipiA"]], mc_primary$b[1], mc_primary$lo[1], mc_primary$hi[1],
+  "H4 S_G", T[["S_G"]], H4b("S_G_halo")$estimate, H4b("S_G_halo")$lo, H4b("S_G_halo")$hi,
+  "H4 S_MA", T[["S_MA"]], H4b("S_MA")$estimate, H4b("S_MA")$lo, H4b("S_MA")$hi,
+  "D2 A effect on ios_t1 (SD_t1 units)", T[["ios_t1_A_d"]], d2$b / SD_t1, d2$lo / SD_t1, d2$hi / SD_t1,
+  "D1 delta (growth)", T[["ios_change_A_delta"]], D1$delta, D1$lo / D1$SD_t1, D1$hi / D1$SD_t1,
+  "R3 beta (ma_cap -> liab_6)", T3[["R3_beta"]], R3$beta[1], R3$lo95[1], R3$hi95[1],
+  "R4 beta_B (bonding composite)", T3[["R4_beta_B"]], beta_B, hB$lo, hB$hi,
+  "R6 gap_v2", T[["gap_v2"]], g95$diff, g95$lo, g95$hi,
+  "R1 gap_v1 (company - Sylva)", T[["gap_v1"]], cs_pool$diff, cs_pool$lo, cs_pool$hi,
+  "R5 r(company, Sylva)", T[["r_corp_chat"]], R5$r[1], R5$lo[1], R5$hi[1])
+if (!is.null(H5)) {
+  hq5 <- function(q) H5 %>% filter(quantity == q)
+  rec <- bind_rows(rec, tibble(estimand = c("H5 ratio_GE (decision)", "H5 ratio_G", paste("H5 ratio", c("A", "C", "ES", "O"))),
+                               truth = c(T3[["ratio_GE"]], T3[["ratio_G"]], unname(T[c("ratio_A", "ratio_C", "ratio_ES", "ratio_O")])),
+                               estimate = map_dbl(c("ratio_GE", "ratio_G", "ratio_A", "ratio_C", "ratio_ES", "ratio_O"), ~ hq5(.x)$estimate),
+                               lo = map_dbl(c("ratio_GE", "ratio_G", "ratio_A", "ratio_C", "ratio_ES", "ratio_O"), ~ hq5(.x)$lo),
+                               hi = map_dbl(c("ratio_GE", "ratio_G", "ratio_A", "ratio_C", "ratio_ES", "ratio_O"), ~ hq5(.x)$hi)))
+}
+rec <- rec %>% mutate(covered = truth >= lo & truth <= hi)
+kt(rec, glue("Recovery: population truth (200,000-person draw of the generator) vs estimate with its registered CI ({params$effects} effects)"))
+save_tab(rec, "recovery")
+```
+
+# 15. Log: failures, open items, runtime
+
+```{r log}
+tick("end")
+kt(FAIL, "Models that failed to run")
+AMB <- AMB %>% arrange(id)
+kt(AMB, "Items revision 3 leaves open (each is a candidate prereg edit) and the choice made here")
+save_tab(AMB, "ambiguity_log"); save_tab(FAIL, "failures")
+tt <- TIMES %>% mutate(seconds = as.numeric(difftime(lead(t), t, units = "secs"))) %>% filter(!is.na(seconds))
+kt(tt %>% select(section, seconds), glue("Runtime by section; total {round(as.numeric(difftime(Sys.time(), T_START, units = 'mins')), 1)} min"))
+save_tab(tt %>% select(section, seconds) %>% bind_rows(tibble(section = "TOTAL (knit, minutes)", seconds = as.numeric(difftime(Sys.time(), T_START, units = "mins")))), "runtime")
+sessionInfo()$R.version$version.string
+```

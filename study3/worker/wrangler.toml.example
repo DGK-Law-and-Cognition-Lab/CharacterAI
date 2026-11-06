@@ -1,0 +1,25 @@
+# Copy to wrangler.toml before deploying (see README_worker.md). Nothing here is secret.
+# Deployed on 2026-10-29 as a NEW Worker on the PI's Cloudflare account, so the
+# URL is study3-counterbalance.dgkamper.workers.dev (prereg §3.3). The Studies 1-2 Worker
+# ("counterbalance", KV-backed) is a separate Worker and is left untouched.
+name = "study3-counterbalance"
+main = "counterbalance_worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "COUNTER"            # binding name used in the code (env.COUNTER)
+class_name = "CounterDO"    # Durable Object class exported by counterbalance_worker.js
+
+# SQLite-backed Durable Object (available on the Workers Free and Paid plans).
+# If the live Worker already declares migrations, keep its tags and append this one.
+[[migrations]]
+tag = "study3-v1"
+new_sqlite_classes = ["CounterDO"]
+
+[vars]
+ALLOWED_STUDIES = "1d,1d_test"
+# ALLOWED_ORIGINS = "https://run.pavlovia.org"   # optional: refuse /assign from other browser origins
+# COUNTER_EPOCH = ""                              # optional: change only to restart all counters at 0 before launch
+
+# Secret (never in this file):  wrangler secret put ADMIN_TOKEN

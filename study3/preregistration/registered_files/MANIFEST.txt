@@ -1,0 +1,6 @@
+Study 3 frozen tone probes (prereg §6.10.1, Appendix C28)
+tone_probes_frozen.json  SHA-256 a455c2b1fa929558f80efafa9050146e7519781bfb9d9861e1c47cf7f9251c59
+embedding model sentence-transformers/all-mpnet-base-v2 @ e8c3b32edf5434bc2275fc9bab85f82640a19130, normalize_embeddings=True
+check 1 (identical to the Study 1-2 modeling probes): {"W": {"n_compared": 2526, "max_abs_diff": 1.1102230246251565e-16}, "R": {"n_compared": 2526, "max_abs_diff": 9.8879238130678e-17}, "A": {"n_compared": 2569, "max_abs_diff": 1.1102230246251565e-16}}
+check 2 (embedding reproducibility on this machine): {"n": 200, "min_cosine": 0.9999999457165745, "mean_cosine": 1.0000000231971031}
+Post this file and its hash to OSF before the first participant session. Never refit on Study 3 data.

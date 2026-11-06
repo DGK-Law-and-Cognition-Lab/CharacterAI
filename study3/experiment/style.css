@@ -1,0 +1,69 @@
+/* Character AI Interaction Study — Study 1a */
+:root{--primary:#2c3e50;--accent:#3498db;--bg:#f8f9fa;--card:#fff;--border:#dee2e6;--text:#212529;--muted:#6c757d;--error:#dc3545}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Georgia','Times New Roman',serif;background:var(--bg);color:var(--text);line-height:1.7;min-height:100vh}
+.container{max-width:780px;margin:0 auto;padding:40px 24px}
+.page{display:none;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:40px 36px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.page.active{display:block}
+h1{font-size:1.5rem;color:var(--primary);margin-bottom:20px;border-bottom:2px solid var(--accent);padding-bottom:10px}
+h2{font-size:1.2rem;color:var(--primary);margin-bottom:16px}
+p{margin-bottom:14px}
+.sentence-display{background:#f0f4f8;border-left:4px solid #94a3b8;padding:18px 22px;margin:20px 0;font-size:1.05rem;line-height:1.8;border-radius:0 6px 6px 0}
+.question-text{font-weight:bold;margin-bottom:12px;color:var(--primary)}
+.radio-group{margin:16px 0}
+.radio-option{display:block;padding:12px 16px;margin:8px 0;border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all .15s;line-height:1.6}
+.radio-option:hover{background:#f0f4ff;border-color:var(--accent)}
+.radio-option.selected{background:#e8f0fe;border-color:var(--accent)}
+.radio-option input[type="radio"],.radio-option input[type="checkbox"]{margin-right:10px;transform:scale(1.1)}
+.scale-group{display:flex;justify-content:space-between;margin:20px 0;gap:6px}
+.scale-option{flex:1;text-align:center;padding:10px 4px;border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all .15s;font-size:.85rem}
+.scale-option:hover{background:#f0f4ff;border-color:var(--accent)}
+.scale-option.selected{background:#e8f0fe;border-color:var(--accent);font-weight:bold}
+.scale-option input{display:none}
+textarea,input[type="text"],input[type="number"]{width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:6px;font-family:inherit;font-size:1rem;line-height:1.6;resize:vertical;transition:border-color .15s}
+textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(52,152,219,.15)}
+textarea{min-height:120px}
+.btn{display:inline-block;padding:12px 32px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:1rem;cursor:pointer;transition:all .15s;margin-top:20px}
+.btn:hover{background:#2980b9}
+.btn:disabled{background:#bdc3c7;cursor:not-allowed}
+.btn-row{display:flex;justify-content:flex-end;margin-top:24px}
+.error-msg{color:var(--error);font-size:.9rem;margin-top:8px;display:none}
+.instruction-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:16px 20px;margin:16px 0;font-size:.95rem}
+.progress-bar{width:100%;height:6px;background:#e9ecef;border-radius:3px;margin-bottom:20px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width .3s ease}
+.form-group{margin-bottom:20px}
+.debrief-text{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:20px;margin:16px 0}
+.center-text{text-align:center}
+#loading-screen{position:fixed;top:0;left:0;width:100%;height:100%;background:#f8f9fa;display:flex;align-items:center;justify-content:center;z-index:9999;flex-direction:column;gap:16px}
+.spinner{width:40px;height:40px;border:4px solid #e9ecef;border-top-color:#3498db;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){.container{padding:16px 12px}.page{padding:24px 18px}.scale-group{flex-wrap:wrap}.scale-option{flex:0 0 calc(33% - 4px)}}
+/* Study 3 [C23]: in-chat closeness probe card (prereg §6.13, Appendix D.3). Rules above are unchanged. */
+.probe-card{background:#fff;border:2px solid var(--accent);border-radius:10px;padding:10px 10px 4px;margin:12px 0}
+.probe-q{font-weight:bold;color:var(--primary);margin-bottom:8px;font-size:.95rem;line-height:1.4}
+/* IOS layout: one row of 7 (about 73-78 px per picture) in windows 760 px wide or more, 4 + 3
+   from 440 to 759 px, 3 + 3 + 1 below 440 px (phones); always left to right, ascending. Fixed
+   breakpoints instead of auto-fit, which gave 6 + 1 or 5 + 2 rows in windows about 600-720 px wide. */
+.ios-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}
+@media(max-width:759px){.ios-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:439px){.ios-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.ios-opt{display:block;width:100%;background:#fff;border:1px solid var(--border);border-radius:6px;padding:2px;cursor:pointer;line-height:0;font:inherit;color:inherit}
+.ios-opt:hover{background:#f0f4ff;border-color:var(--accent)}
+.ios-opt.selected{background:#e8f0fe;border:2px solid var(--accent);padding:1px}
+.ios-opt svg{display:block;width:100%;height:auto}
+.probe-btn-row{display:flex;justify-content:flex-end}
+.probe-btn-row .btn{margin-top:8px;padding:8px 22px}
+.probe-slider-wrap{padding:8px 4px 0}
+.probe-slider{-webkit-appearance:none;appearance:none;width:100%;height:28px;margin:4px 0 0;background:transparent;cursor:pointer}
+.probe-slider:focus{outline:none}
+.probe-slider:focus-visible{outline:2px solid rgba(52,152,219,.45);outline-offset:2px}
+.probe-slider::-webkit-slider-runnable-track{height:6px;background:#dee2e6;border-radius:3px}
+.probe-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:18px;height:18px;margin-top:-6px;border-radius:50%;background:var(--accent);border:2px solid #fff;box-shadow:0 0 0 1px var(--accent)}
+.probe-slider::-moz-range-track{height:6px;background:#dee2e6;border-radius:3px}
+.probe-slider::-moz-range-progress{background:transparent}
+.probe-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid #fff}
+.probe-slider.unset::-webkit-slider-thumb{opacity:0}
+.probe-slider.unset::-moz-range-thumb{opacity:0}
+.probe-ticks,.probe-ends{display:flex;justify-content:space-between;font-size:.8rem;color:var(--muted);line-height:1.4}
+.probe-ticks{padding:0 5px}
+.probe-ends{margin-top:2px}

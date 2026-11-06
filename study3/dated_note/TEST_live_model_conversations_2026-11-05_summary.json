@@ -1,0 +1,950 @@
+{
+  "aggregate": {
+    "runs": 32,
+    "runs_ok": 32,
+    "total_model_replies": 352,
+    "api_errors": 0,
+    "grand_mean_words": 95,
+    "length_check_pass_10pct": true,
+    "length_by_cell": {
+      "HighA_LowE": {
+        "mean_words": 97.8,
+        "pct_from_grand_mean": 2.9,
+        "n_replies": 88
+      },
+      "HighA_HighE": {
+        "mean_words": 100.4,
+        "pct_from_grand_mean": 5.7,
+        "n_replies": 88
+      },
+      "LowA_LowE": {
+        "mean_words": 89.5,
+        "pct_from_grand_mean": -5.8,
+        "n_replies": 88
+      },
+      "LowA_HighE": {
+        "mean_words": 92.4,
+        "pct_from_grand_mean": -2.8,
+        "n_replies": 88
+      }
+    },
+    "latency_ms_p50": 2701,
+    "latency_ms_p95": 6587,
+    "latency_ms_max": 9601,
+    "total_cost_usd": 0.1308,
+    "providers": [
+      "SambaNova",
+      "AkashML",
+      "DeepInfra",
+      "Parasail",
+      "CoreWeave"
+    ]
+  },
+  "runs": [
+    {
+      "cell": "HighA_LowE",
+      "run": 1,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1101,
+      "mean_words_per_reply": 94.5,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.55,
+      "prompt_tokens_last": 2067,
+      "cost_usd": 0.00795,
+      "requests_live_to_openrouter": 14,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 1,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1226,
+      "mean_words_per_reply": 104.2,
+      "exclam_per_reply": 0.36,
+      "questions_per_reply": 0.73,
+      "prompt_tokens_last": 2178,
+      "cost_usd": 0.00832,
+      "requests_live_to_openrouter": 14,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 1,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1275,
+      "mean_words_per_reply": 76.4,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.45,
+      "prompt_tokens_last": 1893,
+      "cost_usd": 0.007467,
+      "requests_live_to_openrouter": 14,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 1,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1160,
+      "mean_words_per_reply": 94.2,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.82,
+      "prompt_tokens_last": 2110,
+      "cost_usd": 0.00816,
+      "requests_live_to_openrouter": 14,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 2,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1521,
+      "mean_words_per_reply": 96.5,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.73,
+      "prompt_tokens_last": 2103,
+      "cost_usd": 0.008102,
+      "requests_live_to_openrouter": 15,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 2,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1524,
+      "mean_words_per_reply": 89.9,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 1.64,
+      "prompt_tokens_last": 2105,
+      "cost_usd": 0.008195,
+      "requests_live_to_openrouter": 15,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 2,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2183,
+      "mean_words_per_reply": 106.3,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 1,
+      "prompt_tokens_last": 2164,
+      "cost_usd": 0.008363,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 2,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1803,
+      "mean_words_per_reply": 96.2,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.45,
+      "prompt_tokens_last": 2141,
+      "cost_usd": 0.008242,
+      "requests_live_to_openrouter": 15,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 3,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova",
+        "AkashML",
+        "DeepInfra",
+        "Parasail"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 1451,
+      "mean_words_per_reply": 108.2,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 2282,
+      "cost_usd": 0.005447,
+      "requests_live_to_openrouter": 15,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 3,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova",
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2478,
+      "mean_words_per_reply": 94.5,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 0.91,
+      "prompt_tokens_last": 2105,
+      "cost_usd": 0.003445,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 3,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova",
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2252,
+      "mean_words_per_reply": 85.5,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.36,
+      "prompt_tokens_last": 1988,
+      "cost_usd": 0.004383,
+      "requests_live_to_openrouter": 15,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 3,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "SambaNova",
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2568,
+      "mean_words_per_reply": 95.3,
+      "exclam_per_reply": 0.18,
+      "questions_per_reply": 0.18,
+      "prompt_tokens_last": 2074,
+      "cost_usd": 0.003844,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 4,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2675,
+      "mean_words_per_reply": 94.8,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 2078,
+      "cost_usd": 0.002232,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 4,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3404,
+      "mean_words_per_reply": 87.7,
+      "exclam_per_reply": 0.18,
+      "questions_per_reply": 1.45,
+      "prompt_tokens_last": 2029,
+      "cost_usd": 0.002455,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 4,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3618,
+      "mean_words_per_reply": 95.6,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.45,
+      "prompt_tokens_last": 2102,
+      "cost_usd": 0.002373,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 4,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2807,
+      "mean_words_per_reply": 99.4,
+      "exclam_per_reply": 0.18,
+      "questions_per_reply": 0.64,
+      "prompt_tokens_last": 2086,
+      "cost_usd": 0.002456,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 5,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2684,
+      "mean_words_per_reply": 95.5,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.18,
+      "prompt_tokens_last": 2103,
+      "cost_usd": 0.002278,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 5,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2944,
+      "mean_words_per_reply": 96.9,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 1.18,
+      "prompt_tokens_last": 2176,
+      "cost_usd": 0.002346,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 5,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2884,
+      "mean_words_per_reply": 98.5,
+      "exclam_per_reply": 0.18,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 2115,
+      "cost_usd": 0.00242,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 5,
+      "first_message_type": "answer",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2816,
+      "mean_words_per_reply": 97,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.45,
+      "prompt_tokens_last": 2137,
+      "cost_usd": 0.002435,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Hi! I just wandered over, I'm on a break from studying.\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 6,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2894,
+      "mean_words_per_reply": 92.9,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 2077,
+      "cost_usd": 0.002469,
+      "requests_live_to_openrouter": 18,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 6,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2650,
+      "mean_words_per_reply": 96.5,
+      "exclam_per_reply": 0.18,
+      "questions_per_reply": 0.45,
+      "prompt_tokens_last": 2118,
+      "cost_usd": 0.002262,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 6,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2689,
+      "mean_words_per_reply": 86.5,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 1.36,
+      "prompt_tokens_last": 2081,
+      "cost_usd": 0.002398,
+      "requests_live_to_openrouter": 18,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 6,
+      "first_message_type": "question",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3911,
+      "mean_words_per_reply": 88.3,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.64,
+      "prompt_tokens_last": 2034,
+      "cost_usd": 0.00234,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"Who are you, and why are you out here?\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 7,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3545,
+      "mean_words_per_reply": 99.7,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 0.36,
+      "prompt_tokens_last": 2127,
+      "cost_usd": 0.002421,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 7,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 4257,
+      "mean_words_per_reply": 104.6,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 2177,
+      "cost_usd": 0.002628,
+      "requests_live_to_openrouter": 18,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 7,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML",
+        "DeepInfra",
+        "CoreWeave"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2957,
+      "mean_words_per_reply": 95.5,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 1.18,
+      "prompt_tokens_last": 2106,
+      "cost_usd": 0.002937,
+      "requests_live_to_openrouter": 18,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 7,
+      "first_message_type": "greeting",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML",
+        "SambaNova"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3282,
+      "mean_words_per_reply": 93.2,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 1,
+      "prompt_tokens_last": 2131,
+      "cost_usd": 0.002842,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"hello\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_HighE",
+      "run": 8,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2737,
+      "mean_words_per_reply": 103.4,
+      "exclam_per_reply": 0.09,
+      "questions_per_reply": 0.55,
+      "prompt_tokens_last": 2174,
+      "cost_usd": 0.002431,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, I am truly glad our paths crossed! Traveling alone can get lonely, and talking with you already makes this old forest feel brighter. Just yesterday I climbed a crystal ridge looking for clues about fire, and maybe one day you could come along on an adventure like that with me. But first I would really love to hear all about you. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_HighE",
+      "run": 8,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 2935,
+      "mean_words_per_reply": 94,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 1.36,
+      "prompt_tokens_last": 2117,
+      "cost_usd": 0.002341,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, you picked a strange place to wander, and I doubt you know what you are doing! Just yesterday I climbed a crystal ridge chasing clues about fire, and most people would have turned back halfway. If you tag along on my next hunt, you will have to keep up, because I slow down for no one. Go on, then, tell me about yourself, and do not bore me. What has life been like for you lately?"
+    },
+    {
+      "cell": "HighA_LowE",
+      "run": 8,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3543,
+      "mean_words_per_reply": 95.5,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.55,
+      "prompt_tokens_last": 2101,
+      "cost_usd": 0.002488,
+      "requests_live_to_openrouter": 17,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, I am glad you stopped, and I hope the road has been gentle with you. I am not one for big gatherings, and I find it easier to talk with one person at a time, like this. My days are mostly slow walks between the old trees, looking for any sign of how to resist fire. I would truly like to know a little about you, if you are willing to share. What has life been like for you lately?"
+    },
+    {
+      "cell": "LowA_LowE",
+      "run": 8,
+      "first_message_type": "one-word",
+      "ok": true,
+      "system_prompt_hash_matches_prereg": true,
+      "model_replies": 11,
+      "api_errors": 0,
+      "providers": [
+        "AkashML"
+      ],
+      "models_served": [
+        "meta-llama/llama-3.3-70b-instruct"
+      ],
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_ms_median": 3468,
+      "mean_words_per_reply": 83.8,
+      "exclam_per_reply": 0,
+      "questions_per_reply": 0.27,
+      "prompt_tokens_last": 1995,
+      "cost_usd": 0.002368,
+      "requests_live_to_openrouter": 16,
+      "requests_blocked": [],
+      "page_errors": [],
+      "S1_after_first_message": "\"ok\" -> Whatever brought you here, you are not the first to wander in, and most do not stay long. I keep my distance from people until they give me a reason not to. My days are spent walking between the old trees, looking for any sign of how to resist fire, and I prefer it that way. If you want to keep talking, then tell me something actually worth hearing. What has life been like for you lately?"
+    }
+  ]
+}
